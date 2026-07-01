@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+logs/
+runtime/
+vendor/__pycache__/
+
+.DS_Store
