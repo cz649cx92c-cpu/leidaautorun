@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -47,7 +48,6 @@ SHADOW_COLCON_SRC = SHADOW_COLCON_WS / "src"
 SHADOW_COLCON_INSTALL = SHADOW_COLCON_WS / "install" / "setup.bash"
 SHADOW_HOST_SDK_BIN = SHADOW_COLCON_WS / "install" / "lib" / "odin_ros_driver" / "host_sdk_sample"
 SHADOW_HOST_SDK_BUILD_BIN = SHADOW_COLCON_WS / "build" / "odin_ros_driver" / "host_sdk_sample"
-LOCAL_ROW_RUNNER = PROJECT_ROOT / "plant_lidar_centerline_ros_follower.py"
 LOCAL_ROW_CONFIG = PROJECT_ROOT / "gui_settings.json"
 LIDAR_DRIVER_ROOT = Path("/home/orangepi/ugv")
 LIDAR_DRIVER_BIN = LIDAR_DRIVER_ROOT / "install" / "lidar_pkg" / "lib" / "lidar_pkg" / "lidar_node"
@@ -570,51 +570,322 @@ def _local_lidar_drive_settings(config: dict[str, Any], *, reverse: bool, args: 
     return speed, offset, angle
 
 
-class LocalLidarRosBridge:
-    def __init__(self, cmd_vel_topic: str, status_topic: str, drive_mode_topic: str) -> None:
+class DirectLocalLidarController:
+    def __init__(self, args: argparse.Namespace, local_lidar_config: dict[str, Any] | None = None) -> None:
         self._status_lock = threading.Lock()
         self._cmd_lock = threading.Lock()
         self._status = LineStatus()
         self._cmd = TwistCommand()
-        self._bridge = Ros2NodeThread("autorun_final_bridge")
-        self._mode_pub = self._bridge.node.create_publisher(String, drive_mode_topic, 10)
-        self._status_sub = self._bridge.node.create_subscription(String, status_topic, self._on_status, 10)
-        self._cmd_sub = self._bridge.node.create_subscription(Twist, cmd_vel_topic, self._on_cmd_vel, 10)
+        self._module = self._load_standalone_module()
+        self._node = self._build_node(args, local_lidar_config or {})
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self._node)
+        self._thread = threading.Thread(target=self._spin, name="autorun-direct-lidar-local", daemon=True)
+        self._thread.start()
 
-    def _on_status(self, msg) -> None:
-        now = time.monotonic()
+    def _load_standalone_module(self):
+        standalone_dir = PROJECT_ROOT
+        standalone_file = standalone_dir / "plant_lidar_centerline_follower.py"
+        if not standalone_file.exists():
+            raise FileNotFoundError(f"Standalone local follower not found: {standalone_file}")
+        if str(standalone_dir) not in sys.path:
+            sys.path.insert(0, str(standalone_dir))
+        spec = importlib.util.spec_from_file_location("autorun_standalone_lidar_local", standalone_file)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Failed to load standalone local follower: {standalone_file}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("autorun_standalone_lidar_local", module)
+        spec.loader.exec_module(module)
+        return module
+
+    def _build_args(self, args: argparse.Namespace, config: dict[str, Any]) -> argparse.Namespace:
+        cruise_vx, _offset_px, _direction_angle_deg = _local_lidar_drive_settings(config, reverse=False, args=args)
+        saved_argv = sys.argv[:]
         try:
-            payload = json.loads(msg.data)
+            sys.argv = [saved_argv[0]]
+            follower_args = self._module.parse_args()
+        finally:
+            sys.argv = saved_argv
+        calibration_path = PROJECT_ROOT / "config" / "lidar_calibration.json"
+        calibration: dict[str, Any] = {}
+        try:
+            calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+            if not isinstance(calibration, dict):
+                calibration = {}
         except Exception:
-            payload = {}
-        state = str(payload.get("state", "UNKNOWN"))
-        found = state == "TRACK" or str(payload.get("found", "")).lower() == "true"
-        blocked = str(payload.get("obstacle_blocked", "False")).lower() == "true" or state == "BLOCKED"
-        lost_frames = int(float(payload.get("lost_frames", 0) or 0))
-        reverse = str(payload.get("reverse", "False")).lower() == "true"
-        drive_enable = str(payload.get("drive_enable", "False")).lower() == "true"
-        with self._status_lock:
-            self._status = LineStatus(
-                state=state,
-                found=found,
-                obstacle_blocked=blocked,
-                lost_frames=lost_frames,
-                reverse=reverse,
-                drive_enable=drive_enable,
-                fresh=True,
-                updated_at=now,
-                payload=payload if isinstance(payload, dict) else {},
-            )
+            calibration = {}
+        follower_args.scan_topic = str(args.lidar_scan_topic)
+        follower_args.status_topic = str(args.ros_status_topic)
+        follower_args.speed = abs(float(cruise_vx))
+        follower_args.min_speed = float(args.lidar_min_speed)
+        follower_args.max_wz_deg = float(args.lidar_max_wz_deg)
+        follower_args.max_heading_wz_deg = float(args.lidar_max_heading_wz_deg)
+        follower_args.k_lat = float(args.lidar_k_lat)
+        follower_args.k_heading = float(args.lidar_k_heading)
+        follower_args.center_y_target = _config_float(config, "center_y_target", float(args.lidar_center_y_target))
+        follower_args.heading_conflict_error_y = float(args.lidar_heading_conflict_error_y)
+        follower_args.heading_conflict_scale = float(args.lidar_heading_conflict_scale)
+        follower_args.row_width = float(args.lidar_row_width)
+        follower_args.vehicle_width = float(args.lidar_vehicle_width)
+        follower_args.min_row_width = float(args.lidar_min_row_width)
+        follower_args.max_row_width = float(args.lidar_max_row_width)
+        follower_args.lookahead_x = float(args.lidar_lookahead_x)
+        follower_args.forward_lookahead_x = float(args.lidar_forward_lookahead_x)
+        follower_args.reverse_lookahead_x = float(args.lidar_reverse_lookahead_x)
+        follower_args.forward_min = float(args.lidar_forward_min)
+        follower_args.forward_max = float(args.lidar_forward_max)
+        follower_args.lateral_limit = float(args.lidar_lateral_limit)
+        follower_args.range_min = float(args.lidar_range_min)
+        follower_args.range_max = float(args.lidar_range_max)
+        follower_args.bin_size = float(args.lidar_bin_size)
+        follower_args.min_points = int(args.lidar_min_points)
+        follower_args.min_bins = int(args.lidar_min_bins)
+        follower_args.min_line_bins = int(args.lidar_min_line_bins)
+        follower_args.min_side_points_per_bin = int(args.lidar_min_side_points_per_bin)
+        follower_args.boundary_width_tolerance_m = float(args.lidar_boundary_width_tolerance_m)
+        follower_args.center_deadband = float(args.lidar_center_deadband)
+        follower_args.left_percentile = float(args.lidar_left_percentile)
+        follower_args.right_percentile = float(args.lidar_right_percentile)
+        follower_args.sensor_yaw_deg = float(args.lidar_sensor_yaw_deg)
+        follower_args.lidar_yaw_correction_deg = float(
+            calibration.get("lidar_yaw_correction_deg", float(args.lidar_yaw_correction_deg))
+        )
+        follower_args.lidar_x_offset_m = float(
+            calibration.get("lidar_x_offset_m", float(args.lidar_x_offset_m))
+        )
+        follower_args.lidar_y_offset_m = float(
+            calibration.get("lidar_y_offset_m", float(args.lidar_y_offset_m))
+        )
+        follower_args.control_deadband_y = float(args.lidar_control_deadband_y)
+        follower_args.slow_error_y = float(args.lidar_slow_error_y)
+        follower_args.stop_error_y = float(args.lidar_stop_error_y)
+        follower_args.slow_heading_rad = float(args.lidar_slow_heading_rad)
+        follower_args.safety_margin = float(args.lidar_safety_margin)
+        follower_args.center_jump_reject = float(args.lidar_center_jump_reject)
+        follower_args.one_side_center_jump_reject = float(args.lidar_one_side_center_jump_reject)
+        follower_args.center_y_reject_abs = float(args.lidar_center_y_reject_abs)
+        follower_args.raw_center_out_of_range = float(args.lidar_raw_center_out_of_range)
+        follower_args.one_side_raw_center_out_of_range = float(args.lidar_one_side_raw_center_out_of_range)
+        follower_args.history_window_s = float(args.lidar_history_window_s)
+        follower_args.min_center_history = int(args.lidar_min_center_history)
+        follower_args.center_y_alpha = float(args.lidar_center_y_alpha)
+        follower_args.center_y_max_jump = float(args.lidar_center_y_max_jump)
+        follower_args.one_side_stop_error_y = float(args.lidar_one_side_stop_error_y)
+        follower_args.one_side_safety_stop_band = float(args.lidar_one_side_safety_stop_band)
+        follower_args.control_period = float(args.lidar_control_period)
+        follower_args.status_period = float(args.lidar_status_period)
+        follower_args.scan_timeout = float(args.lidar_scan_timeout)
+        follower_args.forward_lost_hold_sec = float(args.lidar_forward_lost_hold_sec)
+        follower_args.forward_lost_stop_sec = float(args.lidar_forward_lost_stop_sec)
+        follower_args.forward_lost_hold_wz_scale = float(args.lidar_forward_lost_hold_wz_scale)
+        follower_args.forward_lost_hold_max_wz_deg = float(args.lidar_forward_lost_hold_max_wz_deg)
+        follower_args.reverse_min_speed = float(args.lidar_reverse_min_speed)
+        follower_args.reverse_one_side_speed = float(args.lidar_reverse_one_side_speed)
+        follower_args.reverse_both_sides_speed = float(args.lidar_reverse_both_sides_speed)
+        follower_args.reverse_min_wz_deg = float(args.lidar_reverse_min_wz_deg)
+        follower_args.reverse_max_wz_deg = float(args.lidar_reverse_max_wz_deg)
+        follower_args.reverse_one_side_max_wz_deg = float(args.lidar_reverse_one_side_max_wz_deg)
+        follower_args.reverse_wz_enable_error_y = float(args.lidar_reverse_wz_enable_error_y)
+        follower_args.reverse_wz_enable_heading_deg = float(args.lidar_reverse_wz_enable_heading_deg)
+        follower_args.reverse_min_wz_error_y = float(args.lidar_reverse_min_wz_error_y)
+        follower_args.reverse_sign_flip_guard_error_y = float(args.lidar_reverse_sign_flip_guard_error_y)
+        follower_args.reverse_sign_flip_guard_last_wz_deg = float(args.lidar_reverse_sign_flip_guard_last_wz_deg)
+        follower_args.reverse_sign_hold_error_y = float(args.lidar_reverse_sign_hold_error_y)
+        follower_args.reverse_both_sides_k_lat = float(args.lidar_reverse_both_sides_k_lat)
+        follower_args.reverse_both_sides_k_heading = float(args.lidar_reverse_both_sides_k_heading)
+        follower_args.reverse_one_side_k_lat = float(args.lidar_reverse_one_side_k_lat)
+        follower_args.k_reverse_lat = float(args.lidar_k_reverse_lat)
+        follower_args.k_reverse_heading = float(args.lidar_k_reverse_heading)
+        follower_args.reverse_steer_sign = float(args.lidar_reverse_steer_sign)
+        follower_args.reverse_heading_conflict_error_y = float(args.lidar_reverse_heading_conflict_error_y)
+        follower_args.reverse_heading_max_ratio = float(args.lidar_reverse_heading_max_ratio)
+        follower_args.reverse_error_stop = float(args.lidar_reverse_error_stop)
+        follower_args.reverse_wz_smoothing_alpha = float(args.lidar_reverse_wz_smoothing_alpha)
+        follower_args.reverse_lost_hold_sec = float(args.lidar_reverse_lost_hold_sec)
+        follower_args.reverse_lost_stop_sec = float(args.lidar_reverse_lost_stop_sec)
+        follower_args.reverse_lost_hold_max_wz_deg = float(args.lidar_reverse_lost_hold_max_wz_deg)
+        follower_args.reverse_lost_soft_max_wz_deg = float(args.lidar_reverse_lost_soft_max_wz_deg)
+        follower_args.max_wz_delta_deg_per_cycle = float(args.lidar_max_wz_delta_deg_per_cycle)
+        follower_args.enable_4t4d_steering_assist = bool(args.lidar_enable_4t4d_steering_assist)
+        follower_args.steering_assist_wheelbase_m = float(args.lidar_steering_assist_wheelbase_m)
+        follower_args.steering_assist_gain = float(args.lidar_steering_assist_gain)
+        follower_args.steering_assist_max_angle_deg = float(args.lidar_steering_assist_max_angle_deg)
+        follower_args.steering_assist_min_speed_mps = float(args.lidar_steering_assist_min_speed_mps)
+        follower_args.steering_assist_speed_mps = float(args.lidar_steering_assist_speed_mps)
+        follower_args.low_beam = bool(args.line_low_beam)
+        follower_args.reverse = False
+        follower_args.gear = "4t4d"
+        return follower_args
 
-    def _on_cmd_vel(self, msg) -> None:
-        with self._cmd_lock:
-            self._cmd = TwistCommand(
-                vx=float(msg.linear.x),
-                vy=float(msg.linear.y),
-                wz=float(msg.angular.z),
-                updated_at=time.monotonic(),
-                fresh=True,
-            )
+    def _build_node(self, args: argparse.Namespace, config: dict[str, Any]):
+        controller = self
+        module = self._module
+        follower_args = self._build_args(args, config)
+
+        class _InProcessFollower(module.PlantRowFollower):
+            def __init__(self, args_ns: argparse.Namespace) -> None:
+                super().__init__(args_ns)
+                self.drive_enable = False
+                self._direct_drive_until = 0.0
+                self._direct_command_active = False
+
+            def _send_drive(self, gear: str, vx: float, wz: float, force_brake: bool = False) -> None:
+                if time.monotonic() < float(self._direct_drive_until) and not bool(self._direct_command_active):
+                    return
+                super()._send_drive(gear, vx, wz, force_brake=force_brake)
+                with controller._cmd_lock:
+                    controller._cmd = TwistCommand(
+                        vx=float(vx),
+                        vy=0.0,
+                        wz=float(wz),
+                        updated_at=time.monotonic(),
+                        fresh=bool(self.drive_enable),
+                    )
+
+            def send_direct_drive(self, gear: str, vx: float, wz_rad: float, force_brake: bool = False) -> None:
+                previous_enable = bool(self.drive_enable)
+                try:
+                    self.drive_enable = True
+                    self._direct_command_active = True
+                    self._direct_drive_until = time.monotonic() + 0.80
+                    self._send_drive(gear, float(vx), float(wz_rad), force_brake=force_brake)
+                finally:
+                    self._direct_command_active = False
+                    self.drive_enable = previous_enable
+
+            def send_direct_body_drive(
+                self,
+                gear: str,
+                vx: float,
+                vy: float,
+                wz_rad: float,
+                force_brake: bool = False,
+            ) -> None:
+                previous_enable = bool(self.drive_enable)
+                try:
+                    self.drive_enable = True
+                    self._direct_command_active = True
+                    self._direct_drive_until = time.monotonic() + 0.80
+                    normalized_gear = self._normalized_gear() if gear in {"6", "8"} else gear
+                    io_cmd = module.IOCommand(
+                        light_mode="free" if self.args.low_beam else "auto",
+                        low_beam=bool(self.args.low_beam),
+                        brake=bool(force_brake) and not any(abs(v) > 1e-6 for v in (vx, vy, wz_rad)),
+                    )
+                    steering_cmd = None if normalized_gear == "4t4d" else module.SteeringCommand(
+                        gear=normalized_gear,
+                        speed=0.0,
+                        angle=self.last_steering_angle,
+                    )
+                    self.sender.update(
+                        module.BodyCommand(
+                            gear=normalized_gear,
+                            vx=float(vx),
+                            vy=float(vy),
+                            wz=float(wz_rad),
+                        ),
+                        steering_cmd,
+                        io_cmd,
+                    )
+                    if any(abs(v) > 1e-6 for v in (vx, vy, wz_rad)):
+                        self.sender.request_unlock()
+                    with controller._cmd_lock:
+                        controller._cmd = TwistCommand(
+                            vx=float(vx),
+                            vy=float(vy),
+                            wz=float(wz_rad),
+                            updated_at=time.monotonic(),
+                            fresh=True,
+                        )
+                finally:
+                    self._direct_command_active = False
+                    self.drive_enable = previous_enable
+
+            def hold_direct_control(self, hold_sec: float = 0.35) -> None:
+                self.drive_enable = False
+                self._direct_drive_until = max(float(self._direct_drive_until), time.monotonic() + max(0.05, float(hold_sec)))
+
+            def _send_stop(self) -> None:
+                if time.monotonic() < float(self._direct_drive_until):
+                    return
+                super()._send_stop()
+
+            def _publish_status(self) -> None:
+                super()._publish_status()
+                estimate = self.last_estimate
+                center_error_m = float(estimate.center_y)
+                row_width_m = float(estimate.row_width)
+                half_row_width_m = 0.5 * row_width_m
+                left_boundary_dist_m = center_error_m + half_row_width_m
+                right_boundary_dist_m = half_row_width_m - center_error_m
+                vehicle_half_width_m = 0.5 * float(self.args.vehicle_width)
+                left_clearance_m = left_boundary_dist_m - vehicle_half_width_m
+                right_clearance_m = right_boundary_dist_m - vehicle_half_width_m
+                state = "IDLE"
+                if self.drive_enable:
+                    state = "TRACK" if estimate.found else "SEARCH"
+                payload = {
+                    "state": state,
+                    "found": bool(estimate.found),
+                    "obstacle_blocked": False,
+                    "lost_frames": 0 if estimate.found else 1,
+                    "reverse": bool(self.args.reverse),
+                    "drive_enable": bool(self.drive_enable),
+                    "mode": estimate.mode,
+                    "raw_center_y_m": round(float(estimate.raw_center_y), 4),
+                    "filtered_center_y_m": round(float(estimate.center_y), 4),
+                    "center_y_m": round(float(estimate.center_y), 4),
+                    "center_error_m": round(center_error_m, 4),
+                    "heading_deg": round(math.degrees(float(estimate.heading_rad)), 3),
+                    "row_width_m": round(row_width_m, 4),
+                    "left_boundary_dist_m": round(left_boundary_dist_m, 4),
+                    "right_boundary_dist_m": round(right_boundary_dist_m, 4),
+                    "left_clearance_m": round(left_clearance_m, 4),
+                    "right_clearance_m": round(right_clearance_m, 4),
+                    "left_bins": int(estimate.left_bins),
+                    "right_bins": int(estimate.right_bins),
+                    "candidate_bins": int(estimate.candidate_bins),
+                    "reject_reason": estimate.reject_reason,
+                }
+                with controller._status_lock:
+                    controller._status = LineStatus(
+                        state=state,
+                        found=bool(estimate.found),
+                        obstacle_blocked=False,
+                        lost_frames=0 if estimate.found else 1,
+                        reverse=bool(self.args.reverse),
+                        drive_enable=bool(self.drive_enable),
+                        fresh=True,
+                        updated_at=time.monotonic(),
+                        payload=payload,
+                    )
+
+            def feedback_snapshot(self) -> dict[str, Any]:
+                try:
+                    self.can_reader.poll(timeout=0.0, limit=20)
+                except Exception:
+                    pass
+                snapshot = {}
+                try:
+                    snapshot = self.can_reader.snapshot()
+                except Exception:
+                    snapshot = {}
+                try:
+                    runtime = self.sender.feedback_snapshot().get("_runtime", {})
+                except Exception:
+                    runtime = {}
+                if isinstance(snapshot, dict):
+                    snapshot = dict(snapshot)
+                    snapshot["_runtime"] = dict(runtime)
+                return snapshot
+
+        return _InProcessFollower(follower_args)
+
+    def _spin(self) -> None:
+        try:
+            self._executor.spin()
+        except Exception:
+            pass
 
     def publish_mode(
         self,
@@ -627,16 +898,11 @@ class LocalLidarRosBridge:
         target_center_offset_px: float = 0.0,
         vehicle_direction_angle_deg: float = 0.0,
     ) -> None:
-        payload = {
-            "enable": bool(enable),
-            "reverse": bool(reverse),
-            "cruise_vx": abs(float(cruise_vx)),
-            "gear": str(gear),
-            "low_beam": bool(low_beam),
-            "target_center_offset_px": float(target_center_offset_px),
-            "vehicle_direction_angle_deg": float(vehicle_direction_angle_deg),
-        }
-        self._mode_pub.publish(String(data=json.dumps(payload, ensure_ascii=True)))
+        del gear, target_center_offset_px, vehicle_direction_angle_deg
+        self._node.drive_enable = bool(enable)
+        self._node.args.reverse = bool(reverse)
+        self._node.args.low_beam = bool(low_beam)
+        self._node.args.speed = abs(float(cruise_vx))
 
     def status_snapshot(self) -> LineStatus:
         with self._status_lock:
@@ -664,194 +930,47 @@ class LocalLidarRosBridge:
             return TwistCommand(vx=cmd.vx, vy=cmd.vy, wz=cmd.wz, updated_at=cmd.updated_at, fresh=False)
         return cmd
 
+    def feedback_snapshot(self) -> dict[str, Any]:
+        try:
+            return self._node.feedback_snapshot()
+        except Exception:
+            return {}
+
+    def send_direct_drive(self, gear: str, vx: float, wz_rad: float, force_brake: bool = False) -> None:
+        self._node.send_direct_drive(gear, float(vx), float(wz_rad), force_brake=force_brake)
+
+    def send_direct_body_drive(
+        self,
+        gear: str,
+        vx: float,
+        vy: float,
+        wz_rad: float,
+        force_brake: bool = False,
+    ) -> None:
+        self._node.send_direct_body_drive(gear, float(vx), float(vy), float(wz_rad), force_brake=force_brake)
+
+    def hold_direct_control(self, hold_sec: float = 0.35) -> None:
+        self._node.hold_direct_control(float(hold_sec))
+
     def close(self) -> None:
-        self._bridge.close()
-
-
-class LocalLidarProcess(core.ManagedProcess):
-    def __init__(self, args: argparse.Namespace, log_path: Path, local_lidar_config: dict[str, Any] | None = None) -> None:
-        config = local_lidar_config or {}
-        cmd = [
-            str(Path(sys.executable)),
-            str(LOCAL_ROW_RUNNER),
-            "--scan-topic",
-            str(args.lidar_scan_topic),
-            "--cmd-vel-topic",
-            args.ros_cmd_vel_topic,
-            "--status-topic",
-            args.ros_status_topic,
-            "--drive-mode-topic",
-            args.ros_drive_mode_topic,
-            "--min-speed",
-            str(args.lidar_min_speed),
-            "--max-wz-deg",
-            str(args.lidar_max_wz_deg),
-            "--max-heading-wz-deg",
-            str(args.lidar_max_heading_wz_deg),
-            "--k-lat",
-            str(args.lidar_k_lat),
-            "--k-heading",
-            str(args.lidar_k_heading),
-            "--row-width",
-            str(args.lidar_row_width),
-            "--min-row-width",
-            str(args.lidar_min_row_width),
-            "--max-row-width",
-            str(args.lidar_max_row_width),
-            "--lookahead-x",
-            str(args.lidar_lookahead_x),
-            "--forward-lookahead-x",
-            str(args.lidar_forward_lookahead_x),
-            "--reverse-lookahead-x",
-            str(args.lidar_reverse_lookahead_x),
-            "--forward-min",
-            str(args.lidar_forward_min),
-            "--forward-max",
-            str(args.lidar_forward_max),
-            "--lateral-limit",
-            str(args.lidar_lateral_limit),
-            "--range-min",
-            str(args.lidar_range_min),
-            "--range-max",
-            str(args.lidar_range_max),
-            "--bin-size",
-            str(args.lidar_bin_size),
-            "--min-points",
-            str(args.lidar_min_points),
-            "--min-bins",
-            str(args.lidar_min_bins),
-            "--min-line-bins",
-            str(args.lidar_min_line_bins),
-            "--min-side-points-per-bin",
-            str(args.lidar_min_side_points_per_bin),
-            "--boundary-width-tolerance-m",
-            str(args.lidar_boundary_width_tolerance_m),
-            "--center-deadband",
-            str(args.lidar_center_deadband),
-            "--left-percentile",
-            str(args.lidar_left_percentile),
-            "--right-percentile",
-            str(args.lidar_right_percentile),
-            "--sensor-yaw-deg",
-            str(args.lidar_sensor_yaw_deg),
-            "--lidar-yaw-correction-deg",
-            str(args.lidar_yaw_correction_deg),
-            "--lidar-x-offset-m",
-            str(args.lidar_x_offset_m),
-            "--lidar-y-offset-m",
-            str(args.lidar_y_offset_m),
-            "--vehicle-width",
-            str(args.lidar_vehicle_width),
-            "--center-y-target",
-            str(args.lidar_center_y_target),
-            "--heading-conflict-error-y",
-            str(args.lidar_heading_conflict_error_y),
-            "--heading-conflict-scale",
-            str(args.lidar_heading_conflict_scale),
-            "--slow-error-y",
-            str(args.lidar_slow_error_y),
-            "--stop-error-y",
-            str(args.lidar_stop_error_y),
-            "--slow-heading-rad",
-            str(args.lidar_slow_heading_rad),
-            "--control-deadband-y",
-            str(args.lidar_control_deadband_y),
-            "--safety-margin",
-            str(args.lidar_safety_margin),
-            "--center-jump-reject",
-            str(args.lidar_center_jump_reject),
-            "--one-side-center-jump-reject",
-            str(args.lidar_one_side_center_jump_reject),
-            "--center-y-reject-abs",
-            str(args.lidar_center_y_reject_abs),
-            "--raw-center-out-of-range",
-            str(args.lidar_raw_center_out_of_range),
-            "--one-side-raw-center-out-of-range",
-            str(args.lidar_one_side_raw_center_out_of_range),
-            "--history-window-s",
-            str(args.lidar_history_window_s),
-            "--min-center-history",
-            str(args.lidar_min_center_history),
-            "--center-y-alpha",
-            str(args.lidar_center_y_alpha),
-            "--center-y-max-jump",
-            str(args.lidar_center_y_max_jump),
-            "--one-side-stop-error-y",
-            str(args.lidar_one_side_stop_error_y),
-            "--one-side-safety-stop-band",
-            str(args.lidar_one_side_safety_stop_band),
-            "--control-period",
-            str(args.lidar_control_period),
-            "--status-period",
-            str(args.lidar_status_period),
-            "--scan-timeout",
-            str(args.lidar_scan_timeout),
-            "--forward-lost-hold-sec",
-            str(args.lidar_forward_lost_hold_sec),
-            "--forward-lost-stop-sec",
-            str(args.lidar_forward_lost_stop_sec),
-            "--forward-lost-hold-wz-scale",
-            str(args.lidar_forward_lost_hold_wz_scale),
-            "--forward-lost-hold-max-wz-deg",
-            str(args.lidar_forward_lost_hold_max_wz_deg),
-            "--reverse-min-speed",
-            str(args.lidar_reverse_min_speed),
-            "--reverse-one-side-speed",
-            str(args.lidar_reverse_one_side_speed),
-            "--reverse-both-sides-speed",
-            str(args.lidar_reverse_both_sides_speed),
-            "--reverse-min-wz-deg",
-            str(args.lidar_reverse_min_wz_deg),
-            "--reverse-max-wz-deg",
-            str(args.lidar_reverse_max_wz_deg),
-            "--reverse-one-side-max-wz-deg",
-            str(args.lidar_reverse_one_side_max_wz_deg),
-            "--reverse-wz-enable-error-y",
-            str(args.lidar_reverse_wz_enable_error_y),
-            "--reverse-wz-enable-heading-deg",
-            str(args.lidar_reverse_wz_enable_heading_deg),
-            "--reverse-min-wz-error-y",
-            str(args.lidar_reverse_min_wz_error_y),
-            "--reverse-sign-flip-guard-error-y",
-            str(args.lidar_reverse_sign_flip_guard_error_y),
-            "--reverse-sign-flip-guard-last-wz-deg",
-            str(args.lidar_reverse_sign_flip_guard_last_wz_deg),
-            "--reverse-sign-hold-error-y",
-            str(args.lidar_reverse_sign_hold_error_y),
-            "--reverse-both-sides-k-lat",
-            str(args.lidar_reverse_both_sides_k_lat),
-            "--reverse-both-sides-k-heading",
-            str(args.lidar_reverse_both_sides_k_heading),
-            "--reverse-one-side-k-lat",
-            str(args.lidar_reverse_one_side_k_lat),
-            "--k-reverse-lat",
-            str(args.lidar_k_reverse_lat),
-            "--k-reverse-heading",
-            str(args.lidar_k_reverse_heading),
-            "--reverse-steer-sign",
-            str(args.lidar_reverse_steer_sign),
-            "--reverse-heading-conflict-error-y",
-            str(args.lidar_reverse_heading_conflict_error_y),
-            "--reverse-heading-max-ratio",
-            str(args.lidar_reverse_heading_max_ratio),
-            "--reverse-error-stop",
-            str(args.lidar_reverse_error_stop),
-            "--reverse-wz-smoothing-alpha",
-            str(args.lidar_reverse_wz_smoothing_alpha),
-            "--reverse-lost-hold-sec",
-            str(args.lidar_reverse_lost_hold_sec),
-            "--reverse-lost-stop-sec",
-            str(args.lidar_reverse_lost_stop_sec),
-            "--reverse-lost-hold-max-wz-deg",
-            str(args.lidar_reverse_lost_hold_max_wz_deg),
-            "--reverse-lost-soft-max-wz-deg",
-            str(args.lidar_reverse_lost_soft_max_wz_deg),
-            "--max-wz-delta-deg-per-cycle",
-            str(args.lidar_max_wz_delta_deg_per_cycle),
-            "--speed",
-            str(_config_float(config, "cruise_vx", float(args.line_cruise_vx))),
-        ]
-        super().__init__(cmd, PROJECT_ROOT, log_path)
+        try:
+            self._node.stop()
+        except Exception:
+            pass
+        try:
+            self._executor.shutdown()
+        except Exception:
+            pass
+        try:
+            self._executor.remove_node(self._node)
+        except Exception:
+            pass
+        try:
+            self._node.destroy_node()
+        except Exception:
+            pass
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 class LidarDriverProcess(core.ManagedProcess):
@@ -867,7 +986,7 @@ class LidarDriverProcess(core.ManagedProcess):
 
 
 def _wait_for_local_lidar_ready(
-    ros_bridge: LocalLidarRosBridge,
+    local_controller: DirectLocalLidarController,
     args: argparse.Namespace,
     *,
     local_lidar_config: dict[str, Any] | None = None,
@@ -878,7 +997,7 @@ def _wait_for_local_lidar_ready(
     deadline = time.monotonic() + max(0.1, float(timeout_s))
     last_log = 0.0
     while time.monotonic() < deadline and not core.STOP_REQUESTED:
-        ros_bridge.publish_mode(
+        local_controller.publish_mode(
             enable=True,
             reverse=False,
             cruise_vx=cruise_vx,
@@ -887,8 +1006,8 @@ def _wait_for_local_lidar_ready(
             target_center_offset_px=offset_px,
             vehicle_direction_angle_deg=direction_angle_deg,
         )
-        status = ros_bridge.status_snapshot()
-        cmd = ros_bridge.cmd_snapshot()
+        status = local_controller.status_snapshot()
+        cmd = local_controller.cmd_snapshot()
         if cmd.fresh:
             core.log("lidar local guidance is ready for hybrid replay.")
             return True
@@ -910,6 +1029,165 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _forward_row_segments(points: list[Any], motions: list[dict[str, Any]]) -> list[ForwardRowSegment]:
+    segments: list[ForwardRowSegment] = []
+    idx = 0
+    while idx < len(points) - 1:
+        motion = motions[min(idx, len(motions) - 1)]
+        gear = core._resolve_replay_gear(motion, None)
+        vx = _safe_float(motion.get("vx"), 0.0)
+        if gear != "4t4d" or vx < -0.03:
+            idx += 1
+            continue
+        start = idx
+        end = idx
+        while end + 1 < len(points):
+            next_motion = motions[min(end + 1, len(motions) - 1)]
+            next_gear = core._resolve_replay_gear(next_motion, None)
+            next_vx = _safe_float(next_motion.get("vx"), 0.0)
+            # Ignore tiny speed drops or pauses inside the same row.
+            # Only break the row when the recorded mode leaves 4t4d or
+            # clearly turns into a reverse segment.
+            if next_gear != "4t4d" or next_vx < -0.03:
+                break
+            end += 1
+        start_point = points[start]
+        end_point = points[end]
+        dx = float(end_point.x - start_point.x)
+        dy = float(end_point.y - start_point.y)
+        length_m = math.hypot(dx, dy)
+        if length_m >= 0.20:
+            segments.append(
+                ForwardRowSegment(
+                    start_index=start,
+                    end_index=end,
+                    start_point=start_point,
+                    end_point=end_point,
+                    unit_x=dx / length_m,
+                    unit_y=dy / length_m,
+                    length_m=length_m,
+                )
+            )
+        idx = end + 1
+    return segments
+
+
+def _segment_for_index(segments: list[ForwardRowSegment], index: int) -> ForwardRowSegment | None:
+    for segment in segments:
+        if segment.start_index <= index <= segment.end_index:
+            return segment
+    return None
+
+
+@dataclass
+class RowEndReverseState:
+    active: bool = False
+    stop_until: float = 0.0
+    triggered_at_index: int = -1
+    hard_stop_sent: bool = False
+    reverse_start_index: int = -1
+    reverse_end_index: int = -1
+    pending_next_index: int = -1
+    row_change_sync_until: float = 0.0
+    row_change_sync_sent: bool = False
+    post_row_change_lock_until: float = 0.0
+    forward_mode_sync_until: float = 0.0
+    forward_mode_sync_logged: bool = False
+
+
+@dataclass
+class RowEntryAssistState:
+    segment_start_index: int = -1
+    active: bool = False
+    handed_off: bool = False
+    force_global_only: bool = False
+    start_along_m: float = 0.0
+    start_along_valid: bool = False
+
+
+@dataclass
+class ForwardRowSegment:
+    start_index: int
+    end_index: int
+    start_point: Any
+    end_point: Any
+    unit_x: float
+    unit_y: float
+    length_m: float
+
+
+def _segment_target_index(
+    points: list[Any],
+    segment: ForwardRowSegment,
+    desired_along_m: float,
+) -> int:
+    desired = max(0.0, min(float(desired_along_m), float(segment.length_m)))
+    best_index = segment.end_index
+    for idx in range(segment.start_index, segment.end_index + 1):
+        point = points[idx]
+        rel_x = float(point.x - segment.start_point.x)
+        rel_y = float(point.y - segment.start_point.y)
+        along = rel_x * segment.unit_x + rel_y * segment.unit_y
+        if along >= desired:
+            best_index = idx
+            break
+    return max(segment.start_index, min(segment.end_index, best_index))
+
+
+def _nearest_forward_target_index(
+    points: list[Any],
+    segment: ForwardRowSegment,
+    pose: Any,
+    *,
+    min_ahead_m: float = 0.8,
+) -> int:
+    rel_x = float(pose.x - segment.start_point.x)
+    rel_y = float(pose.y - segment.start_point.y)
+    along_pose = rel_x * segment.unit_x + rel_y * segment.unit_y
+    desired_along = max(0.0, min(float(segment.length_m), along_pose + max(0.1, float(min_ahead_m))))
+    return _segment_target_index(points, segment, desired_along)
+
+
+def _nearest_index_in_range(
+    points: list[Any],
+    pose: Any,
+    start_index: int,
+    end_index: int,
+) -> tuple[int, float]:
+    start = max(0, min(int(start_index), len(points) - 1))
+    end = max(start, min(int(end_index), len(points) - 1))
+    best_index = start
+    best_dist = float("inf")
+    for idx in range(start, end + 1):
+        dist = pose.distance_to(points[idx])
+        if dist < best_dist:
+            best_dist = dist
+            best_index = idx
+    return best_index, best_dist
+
+
+def _sync_start_index_from_pose(
+    points: list[Any],
+    pose: Any,
+    start_index: int,
+    *,
+    look_back: int = 3,
+    look_ahead: int = 24,
+    max_snap_dist: float = 1.8,
+) -> int:
+    if not points:
+        return 0
+    nearest_index, nearest_dist = _nearest_index_in_range(
+        points,
+        pose,
+        max(0, int(start_index) - max(0, int(look_back))),
+        min(len(points) - 1, int(start_index) + max(1, int(look_ahead))),
+    )
+    if nearest_dist <= max(0.10, float(max_snap_dist)):
+        return nearest_index
+    return start_index
+
+
 def _linear_blend_amount(value: float, start: float, end: float) -> float:
     if end <= start:
         return 1.0 if value <= end else 0.0
@@ -918,18 +1196,6 @@ def _linear_blend_amount(value: float, start: float, end: float) -> float:
     if value >= end:
         return 0.0
     return (end - value) / (end - start)
-
-
-def _reverse_entry_turn_scale(dist_since_reverse_start: float | None) -> tuple[float, float]:
-    if dist_since_reverse_start is None:
-        return 1.0, 8.0
-    dist = max(0.0, float(dist_since_reverse_start))
-    if dist >= 0.9:
-        return 1.0, 8.0
-    amount = dist / 0.9
-    scale = 0.65 + 0.35 * amount
-    max_wz = 3.5 + 4.5 * amount
-    return scale, max_wz
 
 
 def _snapshot_age_seconds(updated_at: float) -> float:
@@ -966,722 +1232,15 @@ def _local_cmd_is_usable(
     return _snapshot_age_seconds(cmd.updated_at) <= max(0.05, float(hold_s))
 
 
-def _find_next_row_switch_index(
-    motions: list[dict[str, Any]],
-    start_index: int,
-    *,
-    limit: int = 48,
-) -> int | None:
-    end = min(len(motions), start_index + max(1, limit))
-    for idx in range(max(0, start_index), end):
-        motion = motions[idx]
-        gear = core._resolve_replay_gear(motion, None)
-        if gear == "crab" or abs(_safe_float(motion.get("vy"), 0.0)) > 0.05:
-            return idx
-    return None
-
-
-def _find_next_reverse_index(
-    motions: list[dict[str, Any]],
-    start_index: int,
-    *,
-    limit: int = 48,
-) -> int | None:
-    end = min(len(motions), start_index + max(1, limit))
-    for idx in range(max(0, start_index), end):
-        if _safe_float(motions[idx].get("vx"), 0.0) < -0.03:
-            return idx
-    return None
-
-
-def _find_next_4t4d_index(
-    motions: list[dict[str, Any]],
-    start_index: int,
-    *,
-    limit: int = 64,
-) -> int | None:
-    end = min(len(motions), start_index + max(1, limit))
-    for idx in range(max(0, start_index), end):
-        if core._resolve_replay_gear(motions[idx], None) == "4t4d":
-            return idx
-    return None
-
-
-def _find_next_forward_4t4d_index(
-    motions: list[dict[str, Any]],
-    start_index: int,
-    *,
-    limit: int = 72,
-) -> int | None:
-    end = min(len(motions), start_index + max(1, limit))
-    for idx in range(max(0, start_index), end):
-        motion = motions[idx]
-        if core._resolve_replay_gear(motion, None) != "4t4d":
-            continue
-        if _safe_float(motion.get("vx"), 0.0) >= -0.02:
-            return idx
-    return None
-
-
-def _skip_hold_4t4d_cluster(
-    points: list[core.Pose2D],
-    motions: list[dict[str, Any]],
-    start_index: int,
-    *,
-    limit: int = 48,
-) -> int:
-    if not points:
-        return 0
-    idx = max(0, min(start_index, len(points) - 1))
-    end = min(len(points) - 1, idx + max(1, limit))
-    while idx < end:
-        motion = motions[min(idx, len(motions) - 1)]
-        if _motion_segment_mode(motion) != "hold:4t4d":
-            break
-        next_idx = idx + 1
-        if next_idx > end:
-            break
-        if points[idx].distance_to(points[next_idx]) > 0.03:
-            break
-        idx = next_idx
-    return idx
-
-
-def _find_forward_resume_index(
-    points: list[core.Pose2D],
-    motions: list[dict[str, Any]],
-    start_index: int,
-    pose: core.Pose2D,
-    *,
-    limit: int = 24,
-) -> int:
-    if not points:
-        return 0
-    start = max(0, min(start_index, len(points) - 1))
-    start = _skip_hold_4t4d_cluster(points, motions, start)
-    end = min(len(points), start + max(1, limit))
-    best_idx = start
-    best_dist = float("inf")
-    for idx in range(start, end):
-        if core._resolve_replay_gear(motions[min(idx, len(motions) - 1)], None) != "4t4d":
-            continue
-        cur = points[idx]
-        dx = cur.x - pose.x
-        dy = cur.y - pose.y
-        # Keep only targets that are in front of the chassis heading so we do
-        # not snap back to the first point of the next row and oscillate.
-        forward_proj = math.cos(pose.yaw) * dx + math.sin(pose.yaw) * dy
-        if forward_proj < -0.05:
-            continue
-        dist = pose.distance_to(cur)
-        if dist < best_dist:
-            best_dist = dist
-            best_idx = idx
-    return best_idx
-
-
-def _find_recent_reverse_index(
-    motions: list[dict[str, Any]],
-    start_index: int,
-    *,
-    limit: int = 24,
-) -> int | None:
-    begin = max(0, start_index - max(1, limit))
-    for idx in range(start_index - 1, begin - 1, -1):
-        if _safe_float(motions[idx].get("vx"), 0.0) < -0.03:
-            return idx
-    return None
-
-
-def _find_reverse_segment_start(
-    motions: list[dict[str, Any]],
-    index: int,
-) -> int | None:
-    if index < 0 or index >= len(motions):
-        return None
-    if _safe_float(motions[index].get("vx"), 0.0) >= -0.03:
-        return None
-    start = index
-    while start > 0 and _safe_float(motions[start - 1].get("vx"), 0.0) < -0.03:
-        start -= 1
-    return start
-
-
-def _crab_reference_vy(
-    points: list[core.Pose2D],
-    pose: core.Pose2D,
-    motions: list[dict[str, Any]],
-    start_index: int,
-    target_index: int,
-    send_state: core.MotionSendState,
-) -> float:
-    if not motions:
-        return 0.0
-    search_start = send_state.crab_target_index if send_state.crab_target_index >= 0 else start_index
-    search_end = send_state.crab_locked_until if send_state.crab_locked_until >= search_start else target_index
-    search_start = max(0, min(search_start, len(motions) - 1))
-    search_end = max(search_start, min(search_end, len(motions) - 1))
-    best_vy = 0.0
-    for idx in range(search_start, search_end + 1):
-        vy = _safe_float(motions[idx].get("vy"), 0.0)
-        if abs(vy) > abs(best_vy):
-            best_vy = vy
-    if abs(best_vy) >= 0.03:
-        return best_vy
-    for idx in range(max(0, start_index - 4), min(len(motions), target_index + 5)):
-        vy = _safe_float(motions[idx].get("vy"), 0.0)
-        if abs(vy) > abs(best_vy):
-            best_vy = vy
-    if abs(best_vy) >= 0.03:
-        return best_vy
-    if not points:
-        return 0.0
-    ref_index = max(0, min(start_index, len(points) - 1))
-    tgt_index = max(0, min(target_index, len(points) - 1))
-    ref_point = points[ref_index]
-    target = points[tgt_index]
-    _, target_lateral_err = core._body_frame_error(pose, target)
-    if abs(target_lateral_err) >= 0.02:
-        return math.copysign(0.12, target_lateral_err)
-    dx = target.x - ref_point.x
-    dy = target.y - ref_point.y
-    segment_lateral = -math.sin(pose.yaw) * dx + math.cos(pose.yaw) * dy
-    if abs(segment_lateral) >= 0.02:
-        return math.copysign(0.12, segment_lateral)
-    return 0.0
-
-
-def _crab_axis_error(
-    pose: core.Pose2D,
-    ref_point: core.Pose2D,
-    target: core.Pose2D,
-) -> float:
-    axis_dx = target.x - ref_point.x
-    axis_dy = target.y - ref_point.y
-    if abs(axis_dy) >= abs(axis_dx):
-        return target.y - pose.y
-    return target.x - pose.x
-
-
-def _crab_motion_active(motion: dict[str, Any]) -> bool:
-    return (
-        abs(_safe_float(motion.get("vy"), 0.0)) >= 0.05
-        or abs(_safe_float(motion.get("vx"), 0.0)) >= 0.05
-        or abs(_safe_float(motion.get("wz"), 0.0)) >= 3.0
-    )
-
-
-def _skip_crab_tail_index(
-    motions: list[dict[str, Any]],
-    start_index: int,
-) -> int:
-    if not motions:
-        return 0
-    idx = max(0, min(start_index, len(motions) - 1))
-    motion = motions[idx]
-    if core._resolve_replay_gear(motion, None) != "crab":
-        return idx
-    if _crab_motion_active(motion):
-        return idx
-    crab_end = core._find_gear_segment_end(motions, idx, "crab")
-    return min(len(motions) - 1, crab_end + 1)
-
-
-def _compute_hybrid_weights(
-    *,
-    args: argparse.Namespace,
-    row_switch_mode: bool,
-    reversing_mode: bool,
-    near_finish: bool,
-    local_status: LineStatus,
-    local_cmd: TwistCommand,
-    dist_to_row_switch: float | None,
-    dist_to_reverse_start: float | None,
-    dist_since_reverse_start: float | None,
-) -> tuple[float, float, str, bool]:
-    configured_local_weight = max(0.0, min(1.0, float(args.local_weight_in_row)))
-    configured_global_weight = max(0.0, min(1.0, float(args.global_weight_in_row)))
-    local_enabled_by_weight = configured_local_weight > 1e-6
-    local_only_base = configured_global_weight <= 1e-6 and local_enabled_by_weight and not row_switch_mode
-    local_only_requested = (
-        local_only_base
-        and (reversing_mode or not near_finish)
-    )
-    allow_stale_local_hold = (
-        reversing_mode
-        and local_only_requested
-    )
-
-    if row_switch_mode:
-        return 1.0, 0.0, "global-row-switch", False
-    if not local_enabled_by_weight:
-        return 1.0, 0.0, "global-only", False
-    if local_status.obstacle_blocked:
-        if local_only_requested and reversing_mode:
-            return 0.0, 1.0, "local-block-stop", False
-        return 1.0, 0.0, "global-near-finish-blocked", False
-
-    total = configured_global_weight + configured_local_weight
-    if total <= 1e-6:
-        base_global = 1.0
-        base_local = 0.0
-    else:
-        base_global = configured_global_weight / total
-        base_local = configured_local_weight / total
-
-    local_cmd_ready = _local_cmd_is_usable(
-        local_cmd,
-        allow_stale_hold=allow_stale_local_hold,
-    )
-    using_stale_local_hold = allow_stale_local_hold and (
-        not local_cmd.fresh and local_cmd_ready
-    )
-    if local_only_requested:
-        if not local_cmd_ready:
-            return 0.0, 1.0, "local-only-wait", allow_stale_local_hold
-        return 0.0, 1.0, ("local-only-hold" if using_stale_local_hold else "local-only"), using_stale_local_hold
-
-    local_tracking_ready = _line_status_is_tracking_ready(
-        local_status,
-        allow_stale_hold=allow_stale_local_hold,
-    )
-    if not (local_tracking_ready and local_cmd_ready):
-        return 1.0, 0.0, "global-fallback", False
-
-    if dist_to_row_switch is None and dist_to_reverse_start is None:
-        return base_global, base_local, ("blend-row-local-hold" if using_stale_local_hold else "blend-row"), using_stale_local_hold
-
-    full_global_dist = max(0.05, float(getattr(args, "row_switch_full_global_dist", 1.50)))
-    blend_start_dist = max(full_global_dist, float(getattr(args, "row_switch_blend_start_dist", 3.0)))
-    anticipation = 0.0
-    if dist_to_row_switch is not None:
-        anticipation = max(anticipation, _linear_blend_amount(dist_to_row_switch, full_global_dist, blend_start_dist))
-    if anticipation <= 1e-6:
-        return base_global, base_local, "blend-row", False
-
-    global_weight = base_global + (1.0 - base_global) * anticipation
-    local_weight = base_local * (1.0 - anticipation)
-    total = global_weight + local_weight
-    if total <= 1e-6:
-        return 1.0, 0.0, "global-anticipation", False
-    mode_name = "blend-approach-maneuver-local-hold" if using_stale_local_hold else "blend-approach-maneuver"
-    return global_weight / total, local_weight / total, mode_name, using_stale_local_hold
-
-
-def _compute_global_command(
-    pose: core.Pose2D,
-    ref_point: core.Pose2D,
-    target: core.Pose2D,
-    motion: dict[str, Any],
-    gear: str,
-    send_state: core.MotionSendState,
-    tracking_heading: float,
-) -> tuple[float, float, float, float, float]:
-    dist = pose.distance_to(target)
-    forward_err, lateral_err = core._body_frame_error(pose, target)
-    heading_err = core.normalize_angle(tracking_heading - pose.yaw)
-    heading_err_deg, lateral_err = core._smooth_tracking_errors(
-        send_state,
-        math.degrees(heading_err),
-        lateral_err,
-        alpha=0.24,
-    )
-    if abs(heading_err_deg) < 2.0:
-        heading_err_deg = 0.0
-    if abs(lateral_err) < 0.02:
-        lateral_err = 0.0
-    vx_cap = max(abs(_safe_float(motion.get("vx"), 0.0)), 0.22)
-    wz_cap = max(abs(_safe_float(motion.get("wz"), 0.0)), 20.0)
-    cmd_vx = core._clamp(forward_err * 0.75, -vx_cap, vx_cap)
-    cmd_vy = 0.0
-    if gear == "crab":
-        recorded_vy = _safe_float(motion.get("vy"), 0.0)
-        recorded_vy_abs = abs(recorded_vy)
-        vy_cap = max(recorded_vy_abs, 0.20)
-        cmd_vx = 0.0
-        axis_dx = target.x - ref_point.x
-        axis_dy = target.y - ref_point.y
-        axis_err = (target.y - pose.y) if abs(axis_dy) >= abs(axis_dx) else (target.x - pose.x)
-        axis_sign = math.copysign(1.0, recorded_vy) if recorded_vy_abs >= 0.03 else math.copysign(1.0, axis_err if abs(axis_err) > 1e-6 else 1.0)
-        cmd_vy = core._clamp(abs(axis_err) * 1.35, 0.0, vy_cap) * axis_sign
-        if abs(axis_err) < 0.03:
-            cmd_vy = 0.0
-        if abs(heading_err_deg) > 18.0:
-            cmd_vy = core._clamp(cmd_vy, -0.08, 0.08)
-        if abs(cmd_vy) < 0.06 and abs(axis_err) > 0.12:
-            crab_floor = min(vy_cap, max(0.12, min(recorded_vy_abs if recorded_vy_abs > 0.03 else 0.16, 0.18)))
-            cmd_vy = math.copysign(crab_floor, axis_sign)
-        # Keep row-switch motion as pure lateral travel. Mixing a large body yaw
-        # rate into FW-mini crab mode makes the wheel angle hunt between 0/90 deg.
-        cmd_wz = 0.0
-    else:
-        cmd_vx = core._clamp(cmd_vx, -0.16, 0.16)
-        reversing = _safe_float(motion.get("vx"), 0.0) < -0.03
-        if reversing:
-            forward_err, lateral_err = _path_frame_error(pose, target, tracking_heading)
-            heading_err_deg = math.degrees(core.normalize_angle(tracking_heading - pose.yaw))
-            cmd_vx = core._clamp(forward_err * 0.75, -0.16, 0.16)
-        heading_gain = 0.72
-        lateral_gain = 18.0
-        lateral_term = lateral_err * lateral_gain
-        wz_limit = min(wz_cap, 12.0)
-        cmd_wz = core._clamp(
-            heading_err_deg * heading_gain + lateral_term,
-            -wz_limit,
-            wz_limit,
-        )
-        if abs(heading_err_deg) > 45.0:
-            cmd_vx = core._clamp(cmd_vx, -0.04, 0.04)
-        if abs(heading_err_deg) > 65.0:
-            cmd_vx = core._signed_crawl(forward_err, 0.025)
-        if gear == "4t4d":
-            cmd_wz = core._limit_4t4d_turn_rate(cmd_vx, cmd_wz)
-    return cmd_vx, cmd_vy, cmd_wz, dist, heading_err_deg
-
-
-def _build_body_command(
-    gear: str,
-    global_cmd: tuple[float, float, float],
-    local_cmd: TwistCommand,
-    local_status: LineStatus,
-    global_weight: float,
-    local_weight: float,
-    allow_stale_local_hold: bool = False,
-) -> core.BodyCommand:
-    g_vx, g_vy, g_wz = global_cmd
-    if gear == "crab":
-        return core.BodyCommand(gear=gear, vx=g_vx, vy=g_vy, wz=g_wz)
-
-    def _limit_4t4d_wz(vx: float, wz: float) -> float:
-        if gear != "4t4d":
-            return wz
-        # Keep the hybrid path closer to the standalone local follower feel by
-        # reapplying the chassis-side 4t4d turn-rate limiter on the final
-        # angular velocity command. This only affects 4t4d forward/reverse
-        # motion and does not touch crab/lateral row-switch motion.
-        wz_deg = math.degrees(float(wz))
-        limited_deg = core._limit_4t4d_turn_rate(float(vx), wz_deg)
-        return math.radians(limited_deg)
-
-    if local_weight <= 1e-6:
-        return core.BodyCommand(gear=gear, vx=g_vx, vy=0.0, wz=_limit_4t4d_wz(g_vx, g_wz))
-    if local_status.obstacle_blocked and global_weight <= 1e-6:
-        return core.BodyCommand(gear=gear, vx=0.0, vy=0.0, wz=0.0)
-    local_cmd_ready = _local_cmd_is_usable(
-        local_cmd,
-        allow_stale_hold=allow_stale_local_hold,
-    )
-    if global_weight <= 1e-6:
-        if not local_cmd_ready:
-            return core.BodyCommand(gear=gear, vx=0.0, vy=0.0, wz=0.0)
-        return core.BodyCommand(
-            gear=gear,
-            vx=local_cmd.vx,
-            vy=0.0,
-            wz=_limit_4t4d_wz(local_cmd.vx, local_cmd.wz),
-        )
-    # Once hybrid logic decides the local controller should participate, keep
-    # its cmd_vel contribution as direct as possible. We only fall back to
-    # global when the local cmd itself is unusable.
-    if local_cmd_ready:
-        vx = local_weight * local_cmd.vx + global_weight * g_vx
-        wz = local_weight * local_cmd.wz + global_weight * g_wz
-        return core.BodyCommand(gear=gear, vx=vx, vy=0.0, wz=_limit_4t4d_wz(vx, wz))
-    local_tracking_ready = _line_status_is_tracking_ready(
-        local_status,
-        allow_stale_hold=allow_stale_local_hold,
-    )
-    if not (local_tracking_ready and local_cmd_ready):
-        return core.BodyCommand(gear=gear, vx=g_vx, vy=0.0, wz=_limit_4t4d_wz(g_vx, g_wz))
-    vx = local_weight * local_cmd.vx + global_weight * g_vx
-    wz = local_weight * local_cmd.wz + global_weight * g_wz
-    return core.BodyCommand(gear=gear, vx=vx, vy=0.0, wz=_limit_4t4d_wz(vx, wz))
-
-
-def _motion_segment_mode(motion: dict[str, Any], current_gear: str | None = None) -> str:
-    gear = core._resolve_replay_gear(motion, current_gear)
-    if gear == "crab":
-        return "crab"
-    vx = _safe_float(motion.get("vx"), 0.0)
-    if vx < -0.03:
-        return "reverse"
-    if vx > 0.03:
-        return "forward"
-    return f"hold:{gear}"
-
-
-def _find_tracking_index_same_mode(
-    points: list[core.Pose2D],
-    motions: list[dict[str, Any]],
-    current_index: int,
-    pose: core.Pose2D,
-    current_gear: str | None,
-    window: int = 12,
-) -> int:
-    if not points:
-        return 0
-    start = max(0, current_index)
-    end = min(len(points), current_index + max(2, window))
-    mode = _motion_segment_mode(motions[min(start, len(motions) - 1)], current_gear)
-    best_same_index = current_index
-    best_same_dist = float("inf")
-    best_any_index = current_index
-    best_any_dist = float("inf")
-    for idx in range(start, end):
-        dist = pose.distance_to(points[idx])
-        if dist < best_any_dist:
-            best_any_dist = dist
-            best_any_index = idx
-        if _motion_segment_mode(motions[min(idx, len(motions) - 1)], current_gear) != mode:
-            continue
-        if dist < best_same_dist:
-            best_same_dist = dist
-            best_same_index = idx
-    if best_same_dist < float("inf"):
-        return best_same_index
-    return best_any_index
-
-
-def _segment_progress_ratio(start: core.Pose2D, end: core.Pose2D, pose: core.Pose2D) -> float:
-    dx = end.x - start.x
-    dy = end.y - start.y
-    length_sq = dx * dx + dy * dy
-    if length_sq <= 1e-9:
-        return 0.0
-    px = pose.x - start.x
-    py = pose.y - start.y
-    return (px * dx + py * dy) / length_sq
-
-
-def _advance_dense_tracking_index(
-    points: list[core.Pose2D],
-    motions: list[dict[str, Any]],
-    current_index: int,
-    pose: core.Pose2D,
-    current_gear: str | None,
-    *,
-    max_skip: int = 6,
-) -> int:
-    if not points:
-        return 0
-    idx = max(0, min(current_index, len(points) - 1))
-    mode = _motion_segment_mode(motions[min(idx, len(motions) - 1)], current_gear)
-    skipped = 0
-    while idx + 1 < len(points) and skipped < max_skip:
-        next_idx = idx + 1
-        next_mode = _motion_segment_mode(motions[min(next_idx, len(motions) - 1)], current_gear)
-        if next_mode != mode:
-            break
-        spacing = points[idx].distance_to(points[next_idx])
-        motion = motions[min(idx, len(motions) - 1)]
-        vx = abs(_safe_float(motion.get("vx"), 0.0))
-        vy = abs(_safe_float(motion.get("vy"), 0.0))
-        wz = abs(_safe_float(motion.get("wz"), 0.0))
-        low_motion = max(vx, vy) < 0.05 and wz < 6.0
-        cur_dist = pose.distance_to(points[idx])
-        next_dist = pose.distance_to(points[next_idx])
-        # When recording very slowly, neighboring mission samples can be so dense
-        # that replay keeps targeting points the chassis has effectively already
-        # passed. Prefer the next sample if it is almost coincident and not farther.
-        if spacing <= 0.035 and low_motion and next_dist <= cur_dist + 0.02:
-            idx = next_idx
-            skipped += 1
-            continue
-        if cur_dist <= 0.08 and next_dist <= 0.14 and next_dist <= cur_dist + 0.03:
-            idx = next_idx
-            skipped += 1
-            continue
-        break
-    return idx
-
-
-def _advance_tracking_progress_index(
-    points: list[core.Pose2D],
-    motions: list[dict[str, Any]],
-    current_index: int,
-    pose: core.Pose2D,
-    current_gear: str | None,
-    *,
-    max_skip: int = 24,
-) -> int:
-    if not points:
-        return 0
-    idx = max(0, min(current_index, len(points) - 1))
-    skipped = 0
-    while idx + 1 < len(points) and skipped < max_skip:
-        next_idx = idx + 1
-        mode = _motion_segment_mode(motions[min(idx, len(motions) - 1)], current_gear)
-        next_mode = _motion_segment_mode(motions[min(next_idx, len(motions) - 1)], current_gear)
-        if next_mode != mode:
-            break
-        cur = points[idx]
-        nxt = points[next_idx]
-        spacing = cur.distance_to(nxt)
-        progress = _segment_progress_ratio(cur, nxt, pose)
-        cur_dist = pose.distance_to(cur)
-        next_dist = pose.distance_to(nxt)
-        if spacing <= 1e-4:
-            idx = next_idx
-            skipped += 1
-            continue
-        if progress >= 0.70:
-            idx = next_idx
-            skipped += 1
-            continue
-        if progress >= 0.45 and next_dist <= cur_dist + 0.01:
-            idx = next_idx
-            skipped += 1
-            continue
-        if spacing <= 0.06 and progress >= 0.20 and next_dist <= max(0.16, cur_dist + 0.02):
-            idx = next_idx
-            skipped += 1
-            continue
-        break
-    return idx
-
-
-def _advance_reverse_progress_index(
-    points: list[core.Pose2D],
-    motions: list[dict[str, Any]],
-    current_index: int,
-    pose: core.Pose2D,
-    current_gear: str | None,
-    *,
-    max_skip: int = 6,
-) -> int:
-    if not points:
-        return 0
-    idx = max(0, min(current_index, len(points) - 1))
-    skipped = 0
-    while idx + 1 < len(points) and skipped < max_skip:
-        if _motion_segment_mode(motions[min(idx, len(motions) - 1)], current_gear) != "reverse":
-            break
-        next_idx = idx + 1
-        if _motion_segment_mode(motions[min(next_idx, len(motions) - 1)], current_gear) != "reverse":
-            break
-        cur = points[idx]
-        nxt = points[next_idx]
-        spacing = cur.distance_to(nxt)
-        progress = _segment_progress_ratio(cur, nxt, pose)
-        cur_dist = pose.distance_to(cur)
-        next_dist = pose.distance_to(nxt)
-        if spacing <= 1e-4:
-            idx = next_idx
-            skipped += 1
-            continue
-        if progress >= 0.55:
-            idx = next_idx
-            skipped += 1
-            continue
-        if next_dist + 0.03 < cur_dist:
-            idx = next_idx
-            skipped += 1
-            continue
-        if spacing <= 0.08 and next_dist <= max(0.18, cur_dist + 0.02):
-            idx = next_idx
-            skipped += 1
-            continue
-        break
-    return idx
-
-
-def _tracking_lookahead_distance(motion: dict[str, Any], gear: str) -> float:
-    vx = abs(_safe_float(motion.get("vx"), 0.0))
-    vy = abs(_safe_float(motion.get("vy"), 0.0))
-    wz = abs(_safe_float(motion.get("wz"), 0.0))
-    planar_speed = math.hypot(vx, vy)
-    if gear == "crab":
-        lookahead = 0.14 + 0.35 * min(planar_speed, 0.20)
-        if wz > 8.0:
-            lookahead -= 0.02
-        return core._clamp(lookahead, 0.12, 0.22)
-    if vx < -0.03:
-        lookahead = 0.18 + 0.45 * min(planar_speed, 0.20)
-        if wz > 10.0:
-            lookahead -= 0.03
-        return core._clamp(lookahead, 0.16, 0.28)
-    lookahead = 0.24 + 0.55 * min(planar_speed, 0.25)
-    if wz > 14.0:
-        lookahead -= 0.05
-    elif wz > 8.0:
-        lookahead -= 0.03
-    return core._clamp(lookahead, 0.20, 0.40)
-
-
-def _select_reverse_target_index(
-    points: list[core.Pose2D],
-    motions: list[dict[str, Any]],
-    start_index: int,
-    current_gear: str | None,
-    *,
-    lookahead_m: float = 0.18,
-    max_span: int = 8,
-) -> int:
-    if not points:
-        return 0
-    start = max(0, min(start_index, len(points) - 1))
-    target = start
-    accum = 0.0
-    for _ in range(max_span):
-        if target + 1 >= len(points):
-            break
-        next_idx = target + 1
-        if _motion_segment_mode(motions[min(next_idx, len(motions) - 1)], current_gear) != "reverse":
-            break
-        accum += points[target].distance_to(points[next_idx])
-        target = next_idx
-        if accum >= lookahead_m:
-            break
-    return max(target, min(len(points) - 1, start + 1))
-
-
-def _select_lookahead_target_index(
-    points: list[core.Pose2D],
-    motions: list[dict[str, Any]],
-    start_index: int,
-    current_gear: str | None,
-    *,
-    lookahead_m: float | None = None,
-    max_span: int = 24,
-) -> int:
-    if not points:
-        return 0
-    start = max(0, min(start_index, len(points) - 1))
-    motion_here = motions[min(start, len(motions) - 1)]
-    mode = _motion_segment_mode(motion_here, current_gear)
-    target = start
-    accum = 0.0
-    desired = lookahead_m
-    if desired is None:
-        desired = _tracking_lookahead_distance(motion_here, core._resolve_replay_gear(motion_here, current_gear))
-    if mode == "forward" and start <= 3:
-        desired = max(float(desired), 0.30)
-    for _ in range(max_span):
-        if target + 1 >= len(points):
-            break
-        next_idx = target + 1
-        next_mode = _motion_segment_mode(motions[min(next_idx, len(motions) - 1)], current_gear)
-        if next_mode != mode:
-            break
-        accum += points[target].distance_to(points[next_idx])
-        target = next_idx
-        if accum >= desired:
-            break
-    if target == start and start + 1 < len(points):
-        next_mode = _motion_segment_mode(motions[min(start + 1, len(motions) - 1)], current_gear)
-        if next_mode == mode:
-            return start + 1
-    return target
-
-
-def _path_frame_error(pose: core.Pose2D, target: core.Pose2D, heading: float) -> tuple[float, float]:
-    dx = target.x - pose.x
-    dy = target.y - pose.y
-    c = math.cos(heading)
-    s = math.sin(heading)
-    along = c * dx + s * dy
-    cross = -s * dx + c * dy
-    return along, cross
+def _append_hybrid_log(log_path: Path | None, message: str) -> None:
+    if log_path is None:
+        return
+    try:
+        timestamp = time.strftime("%H:%M:%S")
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{timestamp} {message}\n")
+    except Exception:
+        pass
 
 
 def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
@@ -1712,28 +1271,44 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
     if len(samples) < 2:
         raise RuntimeError("Mission has too few samples.")
 
-    controller = core.FWMiniController(args.interface, args.channel, args.bitrate)
-    can_reader = core.CANFeedbackReader(args.interface, args.channel, args.bitrate)
     points = [core._sample_pose(sample) for sample in samples]
     sample_period = float(mission.get("sample_period", 0.2) or 0.2)
-    motions, used_fallback = core._repair_missing_motion(samples, sample_period)
-    crab_fix_count = core._stabilize_crab_segments(motions)
-    soften_count = core._soften_low_speed_turns(motions)
+    motions, _used_fallback = core._repair_missing_motion(samples, sample_period)
     start_index = core._choose_start_index(points, motions)
-    current_gear: str | None = None
+    forward_segments = _forward_row_segments(points, motions)
+    controller = core.FWMiniController(args.interface, args.channel, args.bitrate)
     send_state = core.MotionSendState.create()
     send_state.unlock_request_active = True
     for _ in range(2):
         send_state.queue_unlock_sequence()
-    core.log("Hybrid autorun queued startup unlock pulses.")
+
     session: LocalizationSession | None = None
     tracker: core.TFPoseTracker | None = None
     lidar_driver_proc: LidarDriverProcess | None = None
-    local_lidar_proc: LocalLidarProcess | None = None
-    ros_bridge: LocalLidarRosBridge | None = None
+    direct_local_controller: DirectLocalLidarController | None = None
+    local_controller: DirectLocalLidarController | None = None
     lidar_driver_log = LOG_DIR / f"lidar_driver_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    local_lidar_log = LOG_DIR / f"lidar_local_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    use_local_guidance = max(0.0, float(args.local_weight_in_row)) > 1e-6
+    hybrid_run_log = LOG_DIR / f"hybrid_autorun_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    local_lidar_config = _load_local_lidar_gui_config()
+
+    # Align autorunlida with the standalone lidarun calibration file so the
+    # lidar flip, yaw correction, and offsets match the user's working setup.
+    calib_path = PROJECT_ROOT / "config" / "lidar_calibration.json"
+    if calib_path.exists():
+        try:
+            calib = json.loads(calib_path.read_text(encoding="utf-8"))
+            args.lidar_yaw_correction_deg = float(calib.get("lidar_yaw_correction_deg", args.lidar_yaw_correction_deg))
+            args.lidar_x_offset_m = float(calib.get("lidar_x_offset_m", args.lidar_x_offset_m))
+            args.lidar_y_offset_m = float(calib.get("lidar_y_offset_m", args.lidar_y_offset_m))
+            core.log(
+                "Loaded lidarun calibration: "
+                f"yaw_corr={args.lidar_yaw_correction_deg:.3f} "
+                f"x_offset={args.lidar_x_offset_m:.3f} "
+                f"y_offset={args.lidar_y_offset_m:.3f}"
+            )
+        except Exception as exc:
+            core.log(f"Warning: failed to load lidarun calibration file: {exc}")
+
     try:
         if getattr(args, "reuse_localization", False):
             core.log("Hybrid autorun requested. Reusing the active localization session.")
@@ -1757,35 +1332,30 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
             )
         if projection.enabled and abs(projection.anchor_roll_rad) < 1e-9 and abs(projection.anchor_pitch_rad) < 1e-9:
             projection = core.anchor_projection_to_pose(projection, pose_raw)
-        pose = core.project_pose_to_ground(pose_raw, projection)
-        local_lidar_config = _load_local_lidar_gui_config()
-        if use_local_guidance:
-            lidar_driver_proc = LidarDriverProcess(lidar_driver_log)
-            lidar_driver_proc.start()
-            core.log(f"lidar driver subprocess started. Raw log: {lidar_driver_log}")
-            time.sleep(1.0)
-            local_lidar_proc = LocalLidarProcess(args, local_lidar_log, local_lidar_config)
-            local_lidar_proc.start()
-            core.log(f"lidar local subprocess started. Raw log: {local_lidar_log}")
-            ros_bridge = LocalLidarRosBridge(args.ros_cmd_vel_topic, args.ros_status_topic, args.ros_drive_mode_topic)
-            if local_lidar_config:
-                core.log(f"Hybrid autorun uses autorunlida config: {LOCAL_ROW_CONFIG}")
-            if not _wait_for_local_lidar_ready(ros_bridge, args, local_lidar_config=local_lidar_config):
-                core.log("lidar local guidance was not ready before replay; hybrid will keep waiting instead of using global when global weight is 0.")
-        else:
-            core.log("Hybrid autorun local weight is 0. lidar local guidance is disabled; running pure global replay.")
-        if used_fallback:
-            core.log("Hybrid autorun fallback: mission motion data was missing, using path-derived motion estimates.")
-        if crab_fix_count:
-            core.log(f"Hybrid autorun cleanup: stabilized {crab_fix_count} crab transition samples from the mission.")
-        if soften_count:
-            core.log(f"Hybrid autorun cleanup: softened {soften_count} low-speed turns from the mission.")
-        core._approach_start_point(tracker, controller, can_reader, points, start_index, send_state)
-        core.log(f"Hybrid autorun starts replay from mission sample #{start_index}.")
+        _pose = core.project_pose_to_ground(pose_raw, projection)
+
+        lidar_driver_proc = LidarDriverProcess(lidar_driver_log)
+        lidar_driver_proc.start()
+        core.log(f"lidar driver subprocess started. Raw log: {lidar_driver_log}")
+        time.sleep(1.0)
+
+        direct_local_controller = DirectLocalLidarController(args, local_lidar_config)
+        local_controller = direct_local_controller
+        if not _wait_for_local_lidar_ready(local_controller, args, local_lidar_config=local_lidar_config):
+            raise RuntimeError("Pure local lidar control was not ready before autorun start.")
+
+        core.log("Hybrid autorun now runs pure lidarun local control. No global control logic is applied.")
+        _append_hybrid_log(hybrid_run_log, f"Hybrid autorun log started: {hybrid_run_log}")
+        _append_hybrid_log(hybrid_run_log, f"Mission: {args.mission}")
+        _append_hybrid_log(hybrid_run_log, f"Map DB: {args.db}")
         last_cmd_log = 0.0
         last_feedback_log = 0.0
-        current_mode = "global"
-        current_gear = None
+        last_reverse_state: bool | None = None
+        current_gear = "4t4d"
+        current_cmd_gear = "4t4d"
+        row_end_reverse = RowEndReverseState()
+        row_entry_assist = RowEntryAssistState()
+        reverse_stop_pause_s = 0.8
         while not core.STOP_REQUESTED and start_index < len(points):
             assert tracker is not None
             pose_raw = tracker.lookup()
@@ -1793,347 +1363,235 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 time.sleep(0.05)
                 continue
             pose = core.project_pose_to_ground(pose_raw, projection)
-            can_reader.poll(timeout=0.0, limit=20)
-            snapshot = can_reader.snapshot()
+            if not row_end_reverse.active:
+                start_index = _sync_start_index_from_pose(
+                    points,
+                    pose,
+                    start_index,
+                    look_back=4,
+                    look_ahead=28,
+                    max_snap_dist=2.2,
+                )
+            snapshot = local_controller.feedback_snapshot()
             io_state = snapshot.get("io", {})
             if bool(io_state.get("remote_control", False)):
-                if not send_state.remote_paused:
-                    send_state.remote_paused = True
-                    send_state.reset_motion()
-                    core.log("Remote controller took over. Hybrid autorun paused and progress is preserved.")
-                if ros_bridge is not None:
-                    cruise_vx, offset_px, direction_angle_deg = _local_lidar_drive_settings(local_lidar_config, reverse=False, args=args)
-                    ros_bridge.publish_mode(
-                        enable=False,
-                        reverse=False,
-                        cruise_vx=cruise_vx,
-                        gear="4t4d",
-                        low_beam=args.line_low_beam,
-                        target_center_offset_px=offset_px,
-                        vehicle_direction_angle_deg=direction_angle_deg,
-                    )
+                local_controller.publish_mode(
+                    enable=False,
+                    reverse=False,
+                    cruise_vx=abs(float(args.line_cruise_vx)),
+                    gear="4t4d",
+                    low_beam=args.line_low_beam,
+                    target_center_offset_px=0.0,
+                    vehicle_direction_angle_deg=0.0,
+                )
                 time.sleep(0.10)
                 continue
-            if send_state.remote_paused:
-                send_state.remote_paused = False
-                send_state.reset_motion()
-                nearest_resume = _find_tracking_index_same_mode(
-                    points,
-                    motions,
-                    start_index,
-                    pose,
-                    current_gear,
-                    window=24,
-                )
-                start_index = max(start_index, nearest_resume)
-                current_gear = None
-                core.log(f"Remote controller released. Hybrid autorun resumed from nearest mission sample #{start_index}.")
 
-            crab_locked_active = send_state.crab_locked_until >= start_index and send_state.crab_target_index >= 0
-            if crab_locked_active:
-                nearest_index = start_index
-            else:
-                nearest_index = _find_tracking_index_same_mode(
-                    points,
-                    motions,
-                    start_index,
-                    pose,
-                    current_gear,
-                    window=18,
-                )
-                start_index = max(start_index, nearest_index)
+            nearest_index = core._find_tracking_index(points, start_index, pose, window=14)
+            start_index = max(start_index, nearest_index)
             motion_here = motions[min(start_index, len(motions) - 1)]
-            crab_tail_release_index = _skip_crab_tail_index(motions, start_index)
-            if crab_tail_release_index > start_index:
-                start_index = crab_tail_release_index
-                current_gear = None
-                send_state.last_sent_gear = None
-                motion_here = motions[min(start_index, len(motions) - 1)]
-            reversing_here = _safe_float(motion_here.get("vx"), 0.0) < -0.03
-            if reversing_here:
-                start_index = _advance_reverse_progress_index(points, motions, start_index, pose, current_gear)
-                motion_here = motions[min(start_index, len(motions) - 1)]
-                reversing_here = _safe_float(motion_here.get("vx"), 0.0) < -0.03
-            else:
-                upcoming_crab_for_progress = core._find_future_gear_start(motions, start_index, "crab", limit=20)
-                crab_is_near = (
-                    upcoming_crab_for_progress is not None
-                    and pose.distance_to(points[upcoming_crab_for_progress]) <= 0.45
-                )
-                if not crab_is_near:
-                    start_index = _advance_dense_tracking_index(points, motions, start_index, pose, current_gear)
-                    start_index = _advance_tracking_progress_index(points, motions, start_index, pose, current_gear)
-                    motion_here = motions[min(start_index, len(motions) - 1)]
-                    reversing_here = _safe_float(motion_here.get("vx"), 0.0) < -0.03
-            if not reversing_here:
-                imminent_reverse_index = _find_next_reverse_index(motions, start_index, limit=3)
-                if imminent_reverse_index is not None and imminent_reverse_index <= start_index + 2:
-                    reverse_entry_dist = pose.distance_to(points[imminent_reverse_index])
-                    if reverse_entry_dist <= 0.25:
-                        start_index = imminent_reverse_index
-                        motion_here = motions[min(start_index, len(motions) - 1)]
-                        reversing_here = _safe_float(motion_here.get("vx"), 0.0) < -0.03
-                        if reversing_here:
-                            core.log(
-                                f"Hybrid autorun snapped into reverse segment at sample #{start_index} "
-                                f"(entry_dist={reverse_entry_dist:.2f}m)."
-                            )
-            if send_state.crab_locked_until >= start_index and send_state.crab_target_index >= 0:
-                gear = "crab"
-                target_index = core._select_crab_progress_target(
-                    start_index,
-                    send_state.crab_locked_until,
-                    max(start_index + 1, send_state.crab_target_index),
-                )
-                target = points[target_index]
-                motion = motions[target_index]
-                if core._resolve_replay_gear(motion, None) != "crab":
-                    send_state.crab_locked_until = -1
-                    send_state.crab_target_index = -1
-                    gear = core._resolve_replay_gear(motion_here, current_gear)
-                    if reversing_here:
-                        target_index = _select_reverse_target_index(points, motions, start_index, current_gear)
-                    else:
-                        target_index = _select_lookahead_target_index(
-                            points,
-                            motions,
-                            start_index,
-                            current_gear,
-                        )
-                    target = points[target_index]
-                    motion = motions[target_index]
-            else:
-                if reversing_here:
-                    target_index = _select_reverse_target_index(points, motions, start_index, current_gear)
-                else:
-                    target_index = _select_lookahead_target_index(
-                        points,
-                        motions,
-                        start_index,
-                        current_gear,
-                    )
-                target = points[target_index]
-                motion = motions[target_index]
-                gear = core._resolve_replay_gear(motion, current_gear)
-            if gear == "crab" and (
-                send_state.crab_locked_until < start_index or send_state.crab_target_index < 0
-            ):
-                crab_end = core._find_gear_segment_end(motions, start_index, "crab")
-                crab_active = core._find_first_active_crab_index(motions, start_index, crab_end)
-                crab_active_end = core._find_last_active_crab_index(motions, crab_active, crab_end)
-                send_state.crab_locked_until = crab_active_end
-                send_state.crab_target_index = crab_active
-                send_state.crab_best_dist = float("inf")
-                send_state.crab_diverge_count = 0
-                target_index = core._select_crab_progress_target(
-                    start_index,
-                    crab_active_end,
-                    crab_active,
-                )
-                target = points[target_index]
-                motion = motions[target_index]
-            if gear != "crab":
-                upcoming_crab = core._find_future_gear_start(motions, start_index, "crab", limit=20)
-                if upcoming_crab is not None:
-                    crab_entry = points[upcoming_crab]
-                    if pose.distance_to(crab_entry) <= 0.50:
-                        crab_end = core._find_gear_segment_end(motions, upcoming_crab, "crab")
-                        crab_active = core._find_first_active_crab_index(motions, upcoming_crab, crab_end)
-                        crab_active_end = core._find_last_active_crab_index(motions, crab_active, crab_end)
-                        send_state.crab_locked_until = crab_active_end
-                        send_state.crab_target_index = crab_active
-                        send_state.crab_best_dist = float("inf")
-                        send_state.crab_diverge_count = 0
-                        target_index = core._select_crab_progress_target(
-                            start_index,
-                            crab_active_end,
-                            crab_active,
-                        )
-                        target = points[target_index]
-                        motion = motions[target_index]
-                        gear = "crab"
-            dist = pose.distance_to(target)
-            row_switch_mode = gear == "crab" or abs(_safe_float(motion.get("vy"), 0.0)) > 0.05
-            reversing_mode = gear == "reverse" or _safe_float(motion.get("vx"), 0.0) < -0.03
-            tracking_heading = core._tracking_heading(points, motions, target_index, gear)
-            upcoming_row_switch_index = None if row_switch_mode else _find_next_row_switch_index(motions, start_index + 1)
-            dist_to_row_switch = None
-            if upcoming_row_switch_index is not None:
-                dist_to_row_switch = pose.distance_to(points[upcoming_row_switch_index])
-            if reversing_mode and upcoming_row_switch_index is not None and dist_to_row_switch is not None and dist_to_row_switch <= 0.80:
-                start_index = max(start_index + 1, upcoming_row_switch_index)
-                current_gear = None
-                send_state.last_sent_gear = None
-                send_state.crab_best_dist = float("inf")
-                send_state.crab_diverge_count = 0
-                core.log(f"Hybrid autorun reverse-to-row-switch handoff at sample #{start_index}.")
-                continue
-            next_reverse_index = None if reversing_mode else _find_next_reverse_index(motions, start_index + 1)
-            dist_to_reverse_start = None
-            next_reverse_start_index = None
-            if next_reverse_index is not None:
-                next_reverse_start_index = _find_reverse_segment_start(motions, next_reverse_index)
-                if next_reverse_start_index is not None:
-                    dist_to_reverse_start = pose.distance_to(points[next_reverse_start_index])
-            dist_since_reverse_start = None
-            if reversing_mode:
-                reverse_start_index = _find_reverse_segment_start(motions, start_index)
-                if reverse_start_index is not None:
-                    dist_since_reverse_start = pose.distance_to(points[reverse_start_index])
-            near_finish = target_index >= len(points) - 4
-
-            if gear != current_gear:
-                core.log(f"Hybrid autorun mode switched to {gear}.")
-                current_gear = gear
-
-            if gear == "crab":
-                if dist + 0.03 < send_state.crab_best_dist:
-                    send_state.crab_best_dist = dist
-                    send_state.crab_diverge_count = 0
-                elif dist > send_state.crab_best_dist + 0.20:
-                    send_state.crab_diverge_count += 1
-                else:
-                    send_state.crab_diverge_count = max(0, send_state.crab_diverge_count - 1)
-                if send_state.crab_diverge_count >= 6:
-                    core.log(
-                        f"Hybrid autorun crab fallback: target distance kept increasing "
-                        f"(best={send_state.crab_best_dist:.2f}, now={dist:.2f}). Returning to 4t4d tracking."
-                    )
-                    send_state.crab_locked_until = -1
-                    send_state.crab_target_index = -1
-                    send_state.crab_best_dist = float("inf")
-                    send_state.crab_diverge_count = 0
-                    start_index = _skip_crab_tail_index(motions, start_index)
-                    current_gear = None
-                    send_state.last_sent_gear = None
-                    continue
-                dist = pose.distance_to(target)
-                ref_index = max(0, min(start_index, len(points) - 1))
-                axis_err = _crab_axis_error(pose, points[ref_index], target)
-                reached_crab_exit = dist <= 0.20 or abs(axis_err) <= 0.20
-                if reached_crab_exit:
-                    resume_seed = min(
-                        len(points) - 1,
-                        max(send_state.crab_locked_until + 1, start_index + 1),
-                    )
-                    next_forward_4t4d = _find_next_forward_4t4d_index(
-                        motions,
-                        resume_seed,
-                        limit=72,
-                    )
-                    if next_forward_4t4d is not None:
-                        resume_seed = next_forward_4t4d
-                    resume_seed = _skip_hold_4t4d_cluster(points, motions, resume_seed)
-                    start_index = _find_forward_resume_index(
-                        points,
-                        motions,
-                        resume_seed,
-                        pose,
-                        limit=24,
-                    )
-                    send_state.crab_locked_until = -1
-                    send_state.crab_target_index = -1
-                    send_state.crab_best_dist = float("inf")
-                    send_state.crab_diverge_count = 0
-                    current_gear = None
-                    send_state.last_sent_gear = None
-                    core.log(f"Hybrid autorun crab segment finished near sample #{start_index - 1}. Returning to 4t4d tracking.")
-                    continue
-                if near_finish and dist < 0.10:
-                    core._hold_current_gear_stop(controller, send_state, current_gear)
-                    core.log(f"Hybrid autorun reached final area near mission end (dist={dist:.2f}). Stopping without final alignment.")
-                    break
-            else:
-                dist = pose.distance_to(target)
-                tracking_heading = core._tracking_heading(points, motions, target_index, gear)
-                yaw_err = core.normalize_angle(tracking_heading - pose.yaw)
-                path_along_err, path_cross_err = _path_frame_error(pose, target, tracking_heading)
-                passed_target = (not reversing_mode) and path_along_err < -0.03 and abs(path_cross_err) < 0.12
-                reverse_heading_ok = abs(math.degrees(yaw_err)) < 12.0
-                reverse_cross_ok = abs(path_cross_err) < 0.12
-                reverse_passed_target = reversing_mode and path_along_err > 0.03 and reverse_cross_ok
-                reverse_reached_target = reversing_mode and dist < 0.12 and reverse_cross_ok and reverse_heading_ok
-                if (
-                    (not reversing_mode and dist < 0.12 and abs(math.degrees(yaw_err)) < 12.0)
-                    or passed_target
-                    or reverse_passed_target
-                    or reverse_reached_target
-                ):
-                    send_state.crab_best_dist = float("inf")
-                    send_state.crab_diverge_count = 0
-                    if reversing_mode:
-                        start_index = min(len(points) - 1, max(start_index + 1, min(target_index, start_index + 6)))
-                    else:
-                        start_index = min(len(points) - 1, target_index + 1)
-                    continue
-                _, lateral_err = core._body_frame_error(pose, target)
-                if (not reversing_mode) and abs(lateral_err) > 0.07:
-                    protected_target_index = _select_lookahead_target_index(
-                        points,
-                        motions,
-                        start_index,
-                        current_gear,
-                        lookahead_m=0.14,
-                        max_span=12,
-                    )
-                    if protected_target_index != target_index:
-                        target_index = protected_target_index
-                        target = points[target_index]
-                        motion = motions[target_index]
-                        near_finish = target_index >= len(points) - 4
-                        tracking_heading = core._tracking_heading(points, motions, target_index, gear)
-                        yaw_err = core.normalize_angle(tracking_heading - pose.yaw)
-                        dist = pose.distance_to(target)
-                if not reversing_mode:
-                    advanced_start = _skip_hold_4t4d_cluster(points, motions, start_index)
-                    if advanced_start > start_index:
-                        start_index = advanced_start
-                        target_index = _select_lookahead_target_index(
-                            points,
-                            motions,
-                            start_index,
-                            current_gear,
-                        )
-                        target = points[target_index]
-                        motion = motions[target_index]
-                        tracking_heading = core._tracking_heading(points, motions, target_index, gear)
-                        yaw_err = core.normalize_angle(tracking_heading - pose.yaw)
-                        dist = pose.distance_to(target)
-            path_cross_for_log = 0.0
-            if gear != "crab":
-                _, path_cross_for_log = _path_frame_error(pose, target, tracking_heading)
-
-            command_motion = motion
-            if gear == "crab" and abs(_safe_float(command_motion.get("vy"), 0.0)) < 0.03:
-                crab_vy = _crab_reference_vy(points, pose, motions, start_index, target_index, send_state)
-                if abs(crab_vy) >= 0.03:
-                    command_motion = dict(motion)
-                    command_motion["vy"] = crab_vy
-
-            g_vx, g_vy, g_wz, dist, heading_err_deg = _compute_global_command(
-                pose,
-                points[start_index],
-                target,
-                command_motion,
-                gear,
-                send_state,
-                tracking_heading,
+            mission_wants_reverse = (
+                core._resolve_replay_gear(motion_here, current_gear) == "reverse"
+                or _safe_float(motion_here.get("vx"), 0.0) < -0.03
             )
-            if near_finish and dist < 0.10:
-                core._hold_current_gear_stop(controller, send_state, current_gear)
-                core.log(f"Hybrid autorun reached final area near mission end (dist={dist:.2f}). Stopping without final alignment.")
-                break
-
-            local_enabled_by_weight = max(0.0, min(1.0, float(args.local_weight_in_row))) > 1e-6
-            local_enable = (not row_switch_mode) and local_enabled_by_weight
-            if ros_bridge is not None:
-                cruise_vx, offset_px, direction_angle_deg = _local_lidar_drive_settings(
-                    local_lidar_config,
-                    reverse=reversing_here,
-                    args=args,
+            reversing_here = mission_wants_reverse or row_end_reverse.active
+            target_index = min(len(points) - 1, max(start_index, start_index + 1))
+            dist = pose.distance_to(points[target_index])
+            current_segment = _segment_for_index(forward_segments, start_index)
+            in_row_end_zone = False
+            forward_global_window = False
+            row_entry_global_window = False
+            row_change_global_window = False
+            row_entry_handoff_ready = False
+            if current_segment is not None:
+                rel_x = float(pose.x - current_segment.start_point.x)
+                rel_y = float(pose.y - current_segment.start_point.y)
+                along = rel_x * current_segment.unit_x + rel_y * current_segment.unit_y
+                lateral = -rel_x * current_segment.unit_y + rel_y * current_segment.unit_x
+                remaining_along = current_segment.length_m - along
+                if row_entry_assist.segment_start_index != current_segment.start_index:
+                    row_entry_assist.segment_start_index = current_segment.start_index
+                    row_entry_assist.active = not reversing_here
+                    row_entry_assist.handed_off = reversing_here
+                    if not reversing_here and row_entry_assist.force_global_only:
+                        row_entry_assist.active = True
+                        row_entry_assist.handed_off = False
+                        row_entry_assist.start_along_valid = False
+                in_row_end_zone = (
+                    abs(lateral) <= 0.80
+                    and remaining_along <= 0.35
+                    and remaining_along >= -0.20
                 )
-                ros_bridge.publish_mode(
-                    enable=local_enable,
+                forward_global_window = (
+                    not reversing_here
+                    and abs(lateral) <= 0.80
+                    and remaining_along <= 2.5
+                    and remaining_along >= -0.30
+                )
+                row_entry_global_window = (
+                    row_entry_assist.active
+                    and not row_entry_assist.handed_off
+                    and not reversing_here
+                )
+                if row_entry_global_window:
+                    if not row_entry_assist.start_along_valid:
+                        row_entry_assist.start_along_m = along
+                        row_entry_assist.start_along_valid = True
+                    row_entry_progress_m = max(0.0, along - row_entry_assist.start_along_m)
+                    row_entry_global_window = row_entry_progress_m < 2.5
+                else:
+                    row_entry_progress_m = 0.0
+                if time.monotonic() < row_end_reverse.post_row_change_lock_until:
+                    forward_global_window = False
+                    row_entry_global_window = False
+                row_entry_handoff_ready = row_entry_assist.start_along_valid and row_entry_progress_m >= 2.5
+                if row_entry_handoff_ready:
+                    row_entry_assist.active = False
+                    row_entry_assist.handed_off = True
+                    row_entry_assist.force_global_only = False
+                    row_entry_assist.start_along_valid = False
+                    row_entry_global_window = False
+            else:
+                row_entry_assist.active = False
+                row_entry_assist.handed_off = False
+                row_entry_assist.start_along_valid = False
+                row_change_global_window = not reversing_here
+            if row_entry_assist.force_global_only and not reversing_here:
+                row_entry_assist.active = True
+                row_entry_assist.handed_off = False
+            if (
+                not row_end_reverse.active
+                and not mission_wants_reverse
+                and current_segment is not None
+                and in_row_end_zone
+            ):
+                row_end_reverse.active = True
+                row_end_reverse.stop_until = time.monotonic() + reverse_stop_pause_s
+                row_end_reverse.triggered_at_index = start_index
+                row_end_reverse.hard_stop_sent = False
+                row_end_reverse.pending_next_index = -1
+                reverse_start_index = current_segment.end_index + 1
+                reverse_end_index = reverse_start_index
+                while reverse_end_index + 1 < len(points):
+                    next_motion = motions[min(reverse_end_index + 1, len(motions) - 1)]
+                    next_gear = core._resolve_replay_gear(next_motion, current_gear)
+                    next_vx = _safe_float(next_motion.get("vx"), 0.0)
+                    if next_gear != "reverse" and next_vx >= -0.03:
+                        break
+                    reverse_end_index += 1
+                row_end_reverse.reverse_start_index = reverse_start_index
+                row_end_reverse.reverse_end_index = max(reverse_start_index, reverse_end_index)
+                row_end_msg = (
+                    f"Global row-end trigger: reached end zone of current forward row "
+                    f"(segment={current_segment.start_index}-{current_segment.end_index}, dist={dist:.2f}, "
+                    f"reverse_segment={row_end_reverse.reverse_start_index}-{row_end_reverse.reverse_end_index}). "
+                    "Stopping first, then switching local lidarun to reverse."
+                )
+                core.log(row_end_msg)
+                _append_hybrid_log(hybrid_run_log, row_end_msg)
+
+            if row_end_reverse.active and not row_end_reverse.hard_stop_sent:
+                core._hold_current_gear_stop(controller, send_state, current_gear)
+                row_end_reverse.hard_stop_sent = True
+
+            if last_reverse_state is None or last_reverse_state != reversing_here:
+                reverse_msg = f"Pure local lidar mode switched to {'reverse' if reversing_here else 'forward'}."
+                core.log(reverse_msg)
+                _append_hybrid_log(hybrid_run_log, reverse_msg)
+                last_reverse_state = reversing_here
+
+            global_control_active = row_entry_global_window or forward_global_window or row_change_global_window
+            post_row_change_locked = time.monotonic() < row_end_reverse.post_row_change_lock_until
+            force_global_entry_only = bool(row_entry_assist.force_global_only and row_entry_global_window)
+
+            cruise_vx, offset_px, direction_angle_deg = _local_lidar_drive_settings(
+                local_lidar_config,
+                reverse=reversing_here,
+                args=args,
+            )
+            if row_end_reverse.active and time.monotonic() < row_end_reverse.stop_until:
+                local_controller.publish_mode(
+                    enable=False,
+                    reverse=False,
+                    cruise_vx=cruise_vx,
+                    gear="4t4d",
+                    low_beam=args.line_low_beam,
+                    target_center_offset_px=offset_px,
+                    vehicle_direction_angle_deg=direction_angle_deg,
+                )
+                time.sleep(0.05)
+                continue
+
+            if row_end_reverse.active and row_end_reverse.pending_next_index >= 0:
+                next_index = min(len(points) - 1, row_end_reverse.pending_next_index)
+                finish_msg = f"Reverse stop pause finished. Switching to next mission stage at index {next_index}."
+                core.log(finish_msg)
+                _append_hybrid_log(hybrid_run_log, finish_msg)
+                row_end_reverse.active = False
+                row_end_reverse.stop_until = 0.0
+                row_end_reverse.triggered_at_index = -1
+                row_end_reverse.hard_stop_sent = False
+                row_end_reverse.reverse_start_index = -1
+                row_end_reverse.reverse_end_index = -1
+                row_end_reverse.pending_next_index = -1
+                row_end_reverse.row_change_sync_until = time.monotonic() + 0.45
+                row_end_reverse.row_change_sync_sent = False
+                row_end_reverse.post_row_change_lock_until = time.monotonic() + 1.0
+                row_entry_assist.force_global_only = True
+                row_entry_assist.active = True
+                row_entry_assist.handed_off = False
+                row_entry_assist.segment_start_index = -1
+                row_entry_assist.start_along_m = 0.0
+                row_entry_assist.start_along_valid = False
+                start_index = next_index
+                last_reverse_state = None
+                time.sleep(0.05)
+                continue
+
+            if global_control_active:
+                motion_fb = snapshot.get("motion", {}) if isinstance(snapshot, dict) else {}
+                steering_fb = snapshot.get("steering", {}) if isinstance(snapshot, dict) else {}
+                if force_global_entry_only:
+                    crab_residual = (
+                        str(motion_fb.get("gear", "")).strip() == "crab"
+                        or str(steering_fb.get("gear", "")).strip() == "crab"
+                        or current_cmd_gear == "crab"
+                    )
+                    now_sync = time.monotonic()
+                    if crab_residual and row_end_reverse.forward_mode_sync_until <= now_sync:
+                        row_end_reverse.forward_mode_sync_until = now_sync + 0.35
+                        row_end_reverse.forward_mode_sync_logged = False
+                    if row_end_reverse.forward_mode_sync_until > now_sync:
+                        if not row_end_reverse.forward_mode_sync_logged:
+                            sync_msg = (
+                                "Post-row-change forward sync: forcing 4t4d zero command "
+                                f"before entry-global handoff (body_gear={motion_fb.get('gear', '--')}, "
+                                f"steer_gear={steering_fb.get('gear', '--')})."
+                            )
+                            core.log(sync_msg)
+                            _append_hybrid_log(hybrid_run_log, sync_msg)
+                            row_end_reverse.forward_mode_sync_logged = True
+                        local_controller.publish_mode(
+                            enable=False,
+                            reverse=False,
+                            cruise_vx=cruise_vx,
+                            gear="4t4d",
+                            low_beam=args.line_low_beam,
+                            target_center_offset_px=offset_px,
+                            vehicle_direction_angle_deg=direction_angle_deg,
+                        )
+                        local_controller.hold_direct_control(0.45)
+                        local_controller.send_direct_drive("4t4d", 0.0, 0.0, force_brake=True)
+                        current_cmd_gear = "4t4d"
+                        local_status = local_controller.status_snapshot()
+                        local_cmd = TwistCommand(vx=0.0, vy=0.0, wz=0.0, updated_at=time.monotonic(), fresh=True)
+                        time.sleep(0.05)
+                        continue
+                else:
+                    row_end_reverse.forward_mode_sync_until = 0.0
+                    row_end_reverse.forward_mode_sync_logged = False
+                local_controller.publish_mode(
+                    enable=False,
                     reverse=reversing_here,
                     cruise_vx=cruise_vx,
                     gear="4t4d",
@@ -2141,122 +1599,287 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     target_center_offset_px=offset_px,
                     vehicle_direction_angle_deg=direction_angle_deg,
                 )
-                local_status = ros_bridge.status_snapshot()
-                local_cmd = ros_bridge.cmd_snapshot()
+                if row_entry_global_window and current_segment is not None:
+                    target_index = _nearest_forward_target_index(
+                        points,
+                        current_segment,
+                        pose,
+                        min_ahead_m=max(0.8, min(1.6, abs(float(args.line_cruise_vx)) * 8.0)),
+                    )
+                elif row_change_global_window:
+                    motion_here_gear = core._resolve_replay_gear(motion_here, current_gear)
+                    if send_state.crab_locked_until >= start_index and send_state.crab_target_index >= 0:
+                        target_index = core._select_crab_progress_target(
+                            start_index,
+                            send_state.crab_locked_until,
+                            max(start_index + 1, send_state.crab_target_index),
+                        )
+                        target = points[target_index]
+                        motion = motions[target_index]
+                        if core._resolve_replay_gear(motion, None) != "crab":
+                            send_state.crab_locked_until = -1
+                            send_state.crab_target_index = -1
+                            target_index = min(len(points) - 1, start_index + 2)
+                    else:
+                        if motion_here_gear == "crab":
+                            crab_end = core._find_gear_segment_end(motions, start_index, "crab")
+                            crab_active = core._find_first_active_crab_index(motions, start_index, crab_end)
+                            crab_active_end = core._find_last_active_crab_index(motions, crab_active, crab_end)
+                            send_state.crab_locked_until = crab_active_end
+                            send_state.crab_target_index = crab_active
+                            target_index = core._select_crab_progress_target(
+                                start_index,
+                                crab_active_end,
+                                crab_active,
+                            )
+                        else:
+                            upcoming_crab = core._find_future_gear_start(motions, start_index, "crab", limit=20)
+                            if upcoming_crab is not None and pose.distance_to(points[upcoming_crab]) <= 0.45:
+                                crab_end = core._find_gear_segment_end(motions, upcoming_crab, "crab")
+                                crab_active = core._find_first_active_crab_index(motions, upcoming_crab, crab_end)
+                                crab_active_end = core._find_last_active_crab_index(motions, crab_active, crab_end)
+                                send_state.crab_locked_until = crab_active_end
+                                send_state.crab_target_index = crab_active
+                                target_index = core._select_crab_progress_target(
+                                    start_index,
+                                    crab_active_end,
+                                    crab_active,
+                                )
+                            else:
+                                target_index = min(len(points) - 1, start_index + 2)
+                target = points[target_index]
+                motion = motions[min(target_index, len(motions) - 1)]
+                tracking_heading = core._tracking_heading(points, motions, target_index, "crab" if row_change_global_window else "4t4d")
+                forward_err, lateral_err = core._body_frame_error(pose, target)
+                heading_err = core.normalize_angle(tracking_heading - pose.yaw)
+                heading_err_deg, lateral_err = core._smooth_tracking_errors(
+                    send_state,
+                    math.degrees(heading_err),
+                    lateral_err,
+                    alpha=0.24,
+                )
+                if abs(heading_err_deg) < 2.0:
+                    heading_err_deg = 0.0
+                if abs(lateral_err) < 0.02:
+                    lateral_err = 0.0
+                cmd_vy = 0.0
+                cmd_gear = "4t4d"
+                if reversing_here:
+                    cmd_vx = -min(abs(float(args.line_cruise_vx)), 0.16)
+                    cmd_wz = core._clamp(
+                        heading_err_deg * 0.72 + lateral_err * 18.0,
+                        -12.0,
+                        12.0,
+                    )
+                else:
+                    if row_change_global_window:
+                        cmd_gear = "crab"
+                        dist = pose.distance_to(target)
+                        if dist + 0.03 < send_state.crab_best_dist:
+                            send_state.crab_best_dist = dist
+                            send_state.crab_diverge_count = 0
+                        elif dist > send_state.crab_best_dist + 0.20:
+                            send_state.crab_diverge_count += 1
+                        else:
+                            send_state.crab_diverge_count = max(0, send_state.crab_diverge_count - 1)
+                        if send_state.crab_diverge_count >= 6:
+                            fallback_msg = (
+                                f"Hybrid row-change crab fallback: target distance kept increasing "
+                                f"(best={send_state.crab_best_dist:.2f}, now={dist:.2f})."
+                            )
+                            core.log(fallback_msg)
+                            _append_hybrid_log(hybrid_run_log, fallback_msg)
+                            send_state.crab_locked_until = -1
+                            send_state.crab_target_index = -1
+                            send_state.crab_best_dist = float("inf")
+                            send_state.crab_diverge_count = 0
+                            time.sleep(0.05)
+                            continue
+                        ref_point = points[start_index]
+                        axis_dx = target.x - ref_point.x
+                        axis_dy = target.y - ref_point.y
+                        if abs(axis_dy) >= abs(axis_dx):
+                            if core._axis_progress_reached(pose.y, target.y, axis_dy, 0.10):
+                                start_index = min(len(points) - 1, target_index + 1)
+                                if start_index > send_state.crab_locked_until:
+                                    send_state.crab_locked_until = -1
+                                    send_state.crab_target_index = -1
+                                    send_state.crab_best_dist = float("inf")
+                                    send_state.crab_diverge_count = 0
+                                time.sleep(0.03)
+                                continue
+                        else:
+                            if core._axis_progress_reached(pose.x, target.x, axis_dx, 0.10):
+                                start_index = min(len(points) - 1, target_index + 1)
+                                if start_index > send_state.crab_locked_until:
+                                    send_state.crab_locked_until = -1
+                                    send_state.crab_target_index = -1
+                                    send_state.crab_best_dist = float("inf")
+                                    send_state.crab_diverge_count = 0
+                                time.sleep(0.03)
+                                continue
+                        vy_cap = 0.25
+                        cmd_vx = 0.0
+                        cmd_vy = core._clamp(lateral_err * 1.15, -vy_cap, vy_cap)
+                        if abs(lateral_err) < 0.04:
+                            cmd_vy = 0.0
+                        cmd_wz = 0.0
+                    else:
+                        send_state.crab_best_dist = float("inf")
+                        send_state.crab_diverge_count = 0
+                        cmd_vx = min(abs(float(args.line_cruise_vx)), 0.15)
+                        cmd_wz = core._clamp(
+                            heading_err_deg * 0.72 + lateral_err * 18.0,
+                            -12.0,
+                            12.0,
+                        )
+                if cmd_gear == "crab":
+                    local_controller.hold_direct_control(0.60)
+                    if (
+                        row_end_reverse.row_change_sync_until > time.monotonic()
+                        and not row_end_reverse.row_change_sync_sent
+                    ):
+                        local_controller.send_direct_body_drive("crab", 0.0, 0.0, 0.0, force_brake=True)
+                        row_end_reverse.row_change_sync_sent = True
+                        current_cmd_gear = "crab"
+                        local_status = local_controller.status_snapshot()
+                        local_cmd = TwistCommand(vx=0.0, vy=0.0, wz=0.0, updated_at=time.monotonic(), fresh=True)
+                        time.sleep(0.08)
+                        continue
+                    local_controller.send_direct_body_drive("crab", cmd_vx, cmd_vy, math.radians(cmd_wz))
+                else:
+                    row_end_reverse.row_change_sync_until = 0.0
+                    row_end_reverse.row_change_sync_sent = False
+                    local_controller.send_direct_drive("4t4d", cmd_vx, math.radians(cmd_wz))
+                current_cmd_gear = cmd_gear
+                local_status = local_controller.status_snapshot()
+                local_cmd = TwistCommand(vx=cmd_vx, vy=cmd_vy, wz=math.radians(cmd_wz), updated_at=time.monotonic(), fresh=True)
             else:
-                local_status = LineStatus()
-                local_cmd = TwistCommand()
-
-            if (
-                local_status.obstacle_blocked
-                and not reversing_mode
-                and next_reverse_start_index is not None
-                and dist_to_reverse_start is not None
-                and dist_to_reverse_start <= max(0.20, float(getattr(args, "row_switch_blend_start_dist", 3.0)))
-            ):
-                start_index = max(start_index + 1, next_reverse_start_index)
-                current_gear = None
-                send_state.last_sent_gear = None
-                core.log(f"Hybrid autorun row end detected by lidar local guidance. Switching to reverse mission sample #{start_index}.")
-                continue
-
-            global_weight, local_weight, mode_name, allow_stale_local_hold = _compute_hybrid_weights(
-                args=args,
-                row_switch_mode=row_switch_mode,
-                reversing_mode=reversing_mode,
-                near_finish=near_finish,
-                local_status=local_status,
-                local_cmd=local_cmd,
-                dist_to_row_switch=dist_to_row_switch,
-                dist_to_reverse_start=dist_to_reverse_start,
-                dist_since_reverse_start=dist_since_reverse_start,
-            )
-
-            body_cmd = _build_body_command(
-                gear,
-                (g_vx, g_vy, g_wz),
-                local_cmd,
-                local_status,
-                global_weight,
-                local_weight,
-                allow_stale_local_hold,
-            )
-            body_cmd.gear = gear
-            if (
-                gear == "crab"
-                and dist < 0.16
-                and abs(body_cmd.vy) < 0.10
-                and target_index >= max(start_index + 1, send_state.crab_locked_until - 1)
-            ):
-                start_index = min(len(points) - 1, target_index + 1)
-                if start_index > send_state.crab_locked_until:
+                row_end_reverse.row_change_sync_until = 0.0
+                row_end_reverse.row_change_sync_sent = False
+                row_end_reverse.forward_mode_sync_until = 0.0
+                row_end_reverse.forward_mode_sync_logged = False
+                if send_state.crab_locked_until >= 0 and not reversing_here:
                     send_state.crab_locked_until = -1
                     send_state.crab_target_index = -1
                     send_state.crab_best_dist = float("inf")
                     send_state.crab_diverge_count = 0
-                    current_gear = None
-                    send_state.last_sent_gear = None
+                local_controller.publish_mode(
+                    enable=True,
+                    reverse=reversing_here,
+                    cruise_vx=cruise_vx,
+                    gear="4t4d",
+                    low_beam=args.line_low_beam,
+                    target_center_offset_px=offset_px,
+                    vehicle_direction_angle_deg=direction_angle_deg,
+                )
+                local_status = local_controller.status_snapshot()
+                local_cmd = local_controller.cmd_snapshot()
+                current_cmd_gear = "4t4d"
+
+            if not local_cmd.fresh:
+                time.sleep(0.05)
                 continue
-            # Preserve local row-following behavior as much as possible once the
-            # hybrid stage/weight logic has decided to use it. We still keep
-            # the high-level mode switching and weight blending, but avoid a
-            # second round of motion smoothing here because it noticeably
-            # changes the feel of the lidar local controller.
-            if gear == "crab":
-                send_state.last_vx = 0.0
-                body_cmd.vx = 0.0
-            waiting_unlock, unlock_now, sent_vx, sent_vy, sent_wz = core._send_drive(
-                controller,
-                send_state,
-                snapshot,
-                gear,
-                body_cmd.vx,
-                body_cmd.vy,
-                body_cmd.wz,
-            )
+            current_gear = current_cmd_gear
+
+            if row_end_reverse.active and row_end_reverse.reverse_end_index >= row_end_reverse.reverse_start_index:
+                reverse_nearest_index, reverse_nearest_dist = _nearest_index_in_range(
+                    points,
+                    pose,
+                    row_end_reverse.reverse_start_index,
+                    row_end_reverse.reverse_end_index,
+                )
+                reverse_target = points[min(row_end_reverse.reverse_end_index, len(points) - 1)]
+                reverse_dist = pose.distance_to(reverse_target)
+                reverse_tail_index = max(
+                    row_end_reverse.reverse_start_index,
+                    row_end_reverse.reverse_end_index - 2,
+                )
+                if (
+                    reverse_nearest_index >= reverse_tail_index
+                    or reverse_dist <= 0.45
+                ):
+                    next_index = min(len(points) - 1, row_end_reverse.reverse_end_index + 1)
+                    end_reverse_msg = (
+                        f"Reverse segment finished near mission index {row_end_reverse.reverse_end_index} "
+                        f"(target_dist={reverse_dist:.2f}, nearest_idx={reverse_nearest_index}, "
+                        f"nearest_dist={reverse_nearest_dist:.2f}, tail_idx={reverse_tail_index}). "
+                        "Stopping first before switching to the next mission stage."
+                    )
+                    core.log(end_reverse_msg)
+                    _append_hybrid_log(hybrid_run_log, end_reverse_msg)
+                    core._hold_current_gear_stop(controller, send_state, current_gear)
+                    row_end_reverse.stop_until = time.monotonic() + reverse_stop_pause_s
+                    row_end_reverse.hard_stop_sent = True
+                    row_end_reverse.pending_next_index = next_index
+                    time.sleep(0.05)
+                    continue
+
+            if not row_end_reverse.active and dist < 0.20:
+                start_index = min(len(points) - 1, start_index + 1)
+
             now = time.monotonic()
-            if mode_name != current_mode:
-                current_mode = mode_name
-                core.log(
-                    f"Hybrid control switched to {mode_name}: "
-                    f"local_state={local_status.state} row_switch={row_switch_mode} "
-                    f"gw={global_weight:.2f} lw={local_weight:.2f} "
-                    f"switch_dist={(dist_to_row_switch if dist_to_row_switch is not None else -1.0):.2f}"
-                )
             if now - last_cmd_log >= 1.0:
-                core.log(
-                    f"Hybrid command: mode={mode_name} gear={gear} "
-                    f"global_vx={g_vx:.2f} global_vy={g_vy:.2f} global_wz={g_wz:.1f} "
-                    f"local_vx={local_cmd.vx:.2f} local_wz={local_cmd.wz:.2f} "
-                    f"sent_vx={sent_vx:.2f} sent_vy={sent_vy:.2f} sent_wz={sent_wz:.1f} "
-                    f"nearest_index={nearest_index} target_index={target_index} dist={dist:.2f} "
-                    f"cross_err={path_cross_for_log:.3f} "
-                    f"switch_dist={(dist_to_row_switch if dist_to_row_switch is not None else -1.0):.2f}"
+                cmd_log = (
+                    f"Hybrid command: mode=lidar-only gear={current_cmd_gear} "
+                    f"local_vx={local_cmd.vx:.2f} local_vy={local_cmd.vy:.2f} local_wz={local_cmd.wz:.2f} "
+                    f"sent_vx={_safe_float(snapshot.get('motion', {}).get('vx_mps', 0.0)):.2f} "
+                    f"sent_vy={_safe_float(snapshot.get('motion', {}).get('vy_mps', 0.0)):.2f} "
+                    f"sent_wz={_safe_float(snapshot.get('motion', {}).get('wz_dps', 0.0)):.2f} "
+                    f"track_index={start_index} row_end_zone={in_row_end_zone} "
+                    f"entry_window={row_entry_global_window} end_window={forward_global_window} "
+                    f"row_change_window={row_change_global_window} "
+                    f"global_window={global_control_active} dist={dist:.2f} "
+                    f"post_row_change_lock={post_row_change_locked} "
+                    f"force_global_entry_only={force_global_entry_only} "
+                    f"entry_handoff={row_entry_handoff_ready} "
+                    f"reverse={reversing_here}"
                 )
+                core.log(cmd_log)
+                _append_hybrid_log(hybrid_run_log, cmd_log)
+                runtime = snapshot.get("_runtime", {}) if isinstance(snapshot, dict) else {}
+                waiting_unlock = bool(runtime.get("waiting_unlock", False))
+                unlock_now = bool(runtime.get("unlock_now", False))
                 if waiting_unlock or unlock_now:
-                    core.log(f"Hybrid unlock: waiting_unlock={waiting_unlock} unlock_pulse={unlock_now}")
+                    unlock_log = f"Hybrid unlock: waiting_unlock={waiting_unlock} unlock_pulse={unlock_now}"
+                    core.log(unlock_log)
+                    _append_hybrid_log(hybrid_run_log, unlock_log)
                 last_cmd_log = now
             if now - last_feedback_log >= 1.0:
-                core._log_feedback("Hybrid autorun", snapshot, pose)
-                core.log(
+                motion = snapshot.get("motion", {})
+                steering = snapshot.get("steering", {})
+                io_fb = snapshot.get("io", {})
+                err_fb = snapshot.get("error", {})
+                feedback_log = (
+                    f"Hybrid autorun feedback: body_gear={motion.get('gear', '--')} "
+                    f"steer_gear={steering.get('gear', '--')} "
+                    f"steer_speed={steering.get('wheel_speed_mps', '--')} "
+                    f"steer_angle={steering.get('wheel_angle_deg', '--')} "
+                    f"unlock_ok={io_fb.get('unlock_ok', '--')} remote_control={io_fb.get('remote_control', '--')} "
+                    f"estop={io_fb.get('estop', '--')} error={err_fb.get('level', '--')}/{err_fb.get('type', '--')}"
+                )
+                pose_log = f"Hybrid autorun pose: x={pose.x:.3f} y={pose.y:.3f} yaw_deg={math.degrees(pose.yaw):.1f}"
+                local_log = (
                     f"Hybrid local: state={local_status.state} found={local_status.found} "
                     f"blocked={local_status.obstacle_blocked} lost_frames={local_status.lost_frames} "
-                    f"fresh={local_status.fresh} heading_err_deg={heading_err_deg:.1f}"
+                    f"fresh={local_status.fresh}"
                 )
+                core._log_feedback("Hybrid autorun", snapshot, pose)
+                core.log(local_log)
+                _append_hybrid_log(hybrid_run_log, feedback_log)
+                _append_hybrid_log(hybrid_run_log, pose_log)
+                _append_hybrid_log(hybrid_run_log, local_log)
                 last_feedback_log = now
             time.sleep(max(0.03, min(0.10, sample_period)))
 
-        try:
-            core._hold_current_gear_stop(controller, send_state, current_gear)
-        except Exception as exc:
-            core.log(f"Hybrid autorun final stop command skipped: {exc}")
         core.log("Hybrid autorun finished.")
+        _append_hybrid_log(hybrid_run_log, "Hybrid autorun finished.")
         return 0
     finally:
         try:
-            if ros_bridge is not None:
+            if local_controller is not None:
                 cruise_vx, offset_px, direction_angle_deg = _local_lidar_drive_settings(local_lidar_config, reverse=False, args=args)
-                ros_bridge.publish_mode(
+                local_controller.publish_mode(
                     enable=False,
                     reverse=False,
                     cruise_vx=cruise_vx,
@@ -2267,16 +1890,13 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 )
         except Exception:
             pass
+        if local_controller is not None:
+            local_controller.close()
         try:
             core._hold_current_gear_stop(controller, send_state, current_gear)
-        except Exception as exc:
-            core.log(f"Hybrid autorun cleanup stop command skipped: {exc}")
-        can_reader.close()
+        except Exception:
+            pass
         controller.close()
-        if ros_bridge is not None:
-            ros_bridge.close()
-        if local_lidar_proc is not None:
-            local_lidar_proc.stop()
         if lidar_driver_proc is not None:
             lidar_driver_proc.stop()
         if session is not None:
@@ -2305,6 +1925,9 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ros-drive-mode-topic", default="/lidarun/drive_mode")
     parser.add_argument("--local-weight-in-row", type=float, default=0.75)
     parser.add_argument("--global-weight-in-row", type=float, default=0.25)
+    parser.add_argument("--row-centering-trigger-error-m", type=float, default=0.09)
+    parser.add_argument("--row-centering-trigger-min-clearance-m", type=float, default=0.035)
+    parser.add_argument("--row-centering-global-weight", type=float, default=0.55)
     parser.add_argument("--row-switch-blend-start-dist", type=float, default=3.0)
     parser.add_argument("--row-switch-full-global-dist", type=float, default=1.5)
     parser.add_argument("--lidar-scan-topic", default="/scan")
@@ -2391,6 +2014,12 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-reverse-lost-hold-max-wz-deg", type=float, default=1.5)
     parser.add_argument("--lidar-reverse-lost-soft-max-wz-deg", type=float, default=0.8)
     parser.add_argument("--lidar-max-wz-delta-deg-per-cycle", type=float, default=1.0)
+    parser.add_argument("--lidar-enable-4t4d-steering-assist", action="store_true")
+    parser.add_argument("--lidar-steering-assist-wheelbase-m", type=float, default=0.85)
+    parser.add_argument("--lidar-steering-assist-gain", type=float, default=1.0)
+    parser.add_argument("--lidar-steering-assist-max-angle-deg", type=float, default=12.0)
+    parser.add_argument("--lidar-steering-assist-min-speed-mps", type=float, default=0.05)
+    parser.add_argument("--lidar-steering-assist-speed-mps", type=float, default=0.20)
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -666,13 +666,27 @@ def ensure_can_ready(channel: str, bitrate: int) -> None:
     state = state_path.read_text(encoding='utf-8').strip().lower()
     if state in {'up', 'unknown'}:
         return
-    cmds = [
-        ['ip', 'link', 'set', channel, 'down'],
-        ['ip', 'link', 'set', channel, 'type', 'can', 'bitrate', str(bitrate)],
-        ['ip', 'link', 'set', channel, 'up'],
-    ]
-    for cmd in cmds:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _run_ip(cmd: list[str], *, allow_failure: bool = False) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0 and not allow_failure:
+            detail = (result.stderr or '').strip()
+            if detail:
+                raise RuntimeError(f'Failed to configure CAN channel {channel}: {" ".join(cmd)}: {detail}')
+            raise RuntimeError(f'Failed to configure CAN channel {channel}: {" ".join(cmd)} returned {result.returncode}')
+        return result
+
+    # Some kernels/drivers return an error when the interface is already down.
+    # Treat that as non-fatal and continue with the CAN type/bitrate setup.
+    _run_ip(['ip', 'link', 'set', channel, 'down'], allow_failure=True)
+    _run_ip(['ip', 'link', 'set', channel, 'type', 'can', 'bitrate', str(bitrate)])
+    _run_ip(['ip', 'link', 'set', channel, 'up'])
 
 
 def generated_name(prefix: str) -> str:

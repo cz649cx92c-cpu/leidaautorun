@@ -1,0 +1,5 @@
+{
+  "lidar_yaw_correction_deg": -3.0,
+  "lidar_x_offset_m": 0.0,
+  "lidar_y_offset_m": 0.035
+}

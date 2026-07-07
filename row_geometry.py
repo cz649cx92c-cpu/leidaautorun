@@ -422,6 +422,8 @@ def estimate_row_from_points(
                     left_reject_reason = "width_mismatch"
                     left_line = None
 
+    # If strict dual-side validation rejects both sides, but one side is still geometrically
+    # usable, degrade to a single-side solution instead of forcing a full stop.
     if not left_valid and not right_valid:
         left_soft_ok = _soft_side_ok(left_points, left_reject_reason, left_residual_median, left_consecutive_bins)
         right_soft_ok = _soft_side_ok(right_points, right_reject_reason, right_residual_median, right_consecutive_bins)
@@ -511,6 +513,7 @@ def estimate_row_from_points(
         center_fit_points = virtual_center_points
     else:
         center_fit_points = np.empty((0, 2), dtype=np.float64)
+    candidates = np.asarray(candidate_centers, dtype=np.float64) if candidate_centers else np.empty((0, 4), dtype=np.float64)
     center_line = _fit_line(center_fit_points)
     if effective_mode == "left_only" and left_line is not None:
         center_line = (left_line[0], left_line[1] - 0.5 * row_width)
@@ -518,27 +521,136 @@ def estimate_row_from_points(
     elif effective_mode == "right_only" and right_line is not None:
         center_line = (right_line[0], right_line[1] + 0.5 * row_width)
         left_line = (right_line[0], right_line[1] + row_width)
-
-    if center_line is not None:
-        reference_x = max(float(cfg.forward_min), min(float(cfg.forward_max), float(cfg.lookahead_x)))
-        center_y = float(center_line[0] * reference_x + center_line[1])
-        heading_rad = float(math.atan(center_line[0]))
+    center_points = center_fit_points
+    if center_line is not None and len(center_points) == 0:
+        sample_xs = np.linspace(max(float(cfg.forward_min), 0.3), min(float(cfg.forward_max), 1.1), num=4)
+        center_points = np.asarray(
+            [[x, center_line[0] * x + center_line[1]] for x in sample_xs],
+            dtype=np.float64,
+        )
+    if len(center_points) > 0:
+        raw_center_y = _weighted_median(center_points[:, 1], np.ones(len(center_points), dtype=np.float64))
     else:
-        candidates = np.asarray(candidate_centers, dtype=np.float64)
-        center_values = candidates[:, 1]
-        row_width_values = candidates[:, 2]
-        weights = candidates[:, 3]
-        center_y = _weighted_median(center_values, weights)
-        row_width = _weighted_median(row_width_values, weights)
-        heading_rad = _fit_heading(candidates[:, :2]) if len(candidates) >= int(cfg.min_line_bins) else 0.0
+        raw_center_y = 0.0
+    heading_rad = float(math.atan(center_line[0])) if center_line is not None else 0.0
+    # Control should use the centerline offset at the vehicle frame origin (x=0),
+    # not a lookahead point. This keeps lateral distance and heading separated:
+    # distance is the intercept b, heading is atan(a).
+    reference_x = 0.0
+    center_y_ref = float(center_line[1]) if center_line is not None else raw_center_y
 
-    center_points = center_fit_points if len(center_fit_points) else (
-        np.asarray(candidate_centers, dtype=np.float64)[:, :2] if candidate_centers else np.empty((0, 2), dtype=np.float64)
-    )
+    if effective_mode == "reject" or center_line is None:
+        debug = RowDebugData(
+            raw_points=raw_points,
+            web_points=web_points,
+            points=points,
+            left_points=left_points,
+            right_points=right_points,
+            center_points=center_points,
+            virtual_left_points=virtual_left_points,
+            virtual_right_points=virtual_right_points,
+            virtual_center_points=virtual_center_points,
+            left_line=left_line if left_valid else None,
+            right_line=right_line if right_valid else None,
+            center_line=None,
+            candidate_left_line=candidate_left_line,
+            candidate_right_line=candidate_right_line,
+        )
+        return (
+            RowEstimate(
+                found=False,
+                raw_center_y=center_y_ref,
+                row_width=row_width,
+                left_bins=left_bins,
+                right_bins=right_bins,
+                candidate_bins=len(candidate_centers),
+                mode="reject",
+                reject_reason="no_valid_boundary",
+                warning="reject",
+                center_points=center_points,
+                effective_mode="reject",
+                left_line=left_line if left_valid else None,
+                right_line=right_line if right_valid else None,
+                center_line=None,
+                raw_points_count=int(len(raw_points)),
+                filtered_points_count=int(len(points)),
+                left_points_count=int(len(left_points)),
+                right_points_count=int(len(right_points)),
+                left_valid=left_valid,
+                right_valid=right_valid,
+                left_reject_reason=left_reject_reason,
+                right_reject_reason=right_reject_reason,
+                parallel_angle_diff_deg=parallel_angle_diff_deg,
+                width_error_m=width_error_m,
+                left_residual_median=left_residual_median if np.isfinite(left_residual_median) else 0.0,
+                right_residual_median=right_residual_median if np.isfinite(right_residual_median) else 0.0,
+                left_consecutive_bins=left_consecutive_bins,
+                right_consecutive_bins=right_consecutive_bins,
+                boundary_source="reject",
+            ),
+            debug,
+        )
+
+    jump_limit = float(cfg.center_jump_reject if effective_mode == "both_sides" else cfg.one_side_center_jump_reject)
+    warning = ""
+    if effective_mode != "both_sides" and abs(raw_center_y) > float(cfg.center_jump_reject):
+        warning = "large_one_side_center"
+    if abs(raw_center_y) > jump_limit:
+        debug = RowDebugData(
+            raw_points=raw_points,
+            web_points=web_points,
+            points=points,
+            left_points=left_points,
+            right_points=right_points,
+            center_points=center_points,
+            virtual_left_points=virtual_left_points,
+            virtual_right_points=virtual_right_points,
+            virtual_center_points=virtual_center_points,
+            left_line=left_line,
+            right_line=right_line,
+            center_line=center_line,
+            candidate_left_line=candidate_left_line,
+            candidate_right_line=candidate_right_line,
+        )
+        return (
+            RowEstimate(
+                found=False,
+                raw_center_y=center_y_ref,
+                row_width=row_width,
+                left_bins=left_bins,
+                right_bins=right_bins,
+                candidate_bins=len(candidate_centers),
+                mode="jump_reject",
+                reject_reason="center_jump_too_large",
+                warning=warning,
+                center_points=candidates[:, :2],
+                effective_mode=effective_mode,
+                left_line=left_line,
+                right_line=right_line,
+                center_line=center_line,
+                raw_points_count=int(len(raw_points)),
+                filtered_points_count=int(len(points)),
+                left_points_count=int(len(left_points)),
+                right_points_count=int(len(right_points)),
+                left_valid=left_valid,
+                right_valid=right_valid,
+                left_reject_reason=left_reject_reason,
+                right_reject_reason=right_reject_reason,
+                parallel_angle_diff_deg=parallel_angle_diff_deg,
+                width_error_m=width_error_m,
+                left_residual_median=left_residual_median if np.isfinite(left_residual_median) else 0.0,
+                right_residual_median=right_residual_median if np.isfinite(right_residual_median) else 0.0,
+                left_consecutive_bins=left_consecutive_bins,
+                right_consecutive_bins=right_consecutive_bins,
+                boundary_source=effective_mode,
+            ),
+            debug,
+        )
+
     estimate = RowEstimate(
         found=True,
-        center_y=center_y,
-        raw_center_y=center_y,
+        center_y=center_y_ref,
+        raw_center_y=center_y_ref,
         heading_rad=heading_rad,
         row_width=row_width,
         left_bins=left_bins,
@@ -546,7 +658,7 @@ def estimate_row_from_points(
         candidate_bins=len(candidate_centers),
         mode=mode,
         reject_reason="",
-        warning="",
+        warning=warning,
         center_points=center_points,
         effective_mode=effective_mode,
         left_line=left_line,
@@ -568,18 +680,22 @@ def estimate_row_from_points(
         right_consecutive_bins=right_consecutive_bins,
         boundary_source=effective_mode,
     )
-    debug = _empty_debug(raw_points, web_points, points)
-    debug.left_points = left_points
-    debug.right_points = right_points
-    debug.center_points = center_points
-    debug.virtual_left_points = virtual_left_points
-    debug.virtual_right_points = virtual_right_points
-    debug.virtual_center_points = virtual_center_points
-    debug.left_line = left_line
-    debug.right_line = right_line
-    debug.center_line = center_line
-    debug.candidate_left_line = candidate_left_line
-    debug.candidate_right_line = candidate_right_line
+    debug = RowDebugData(
+        raw_points=raw_points,
+        web_points=web_points,
+        points=points,
+        left_points=left_points,
+        right_points=right_points,
+        center_points=center_points,
+        virtual_left_points=virtual_left_points,
+        virtual_right_points=virtual_right_points,
+        virtual_center_points=virtual_center_points,
+        left_line=left_line,
+        right_line=right_line,
+        center_line=center_line,
+        candidate_left_line=candidate_left_line,
+        candidate_right_line=candidate_right_line,
+    )
     return estimate, debug
 
 

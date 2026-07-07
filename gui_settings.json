@@ -6,14 +6,14 @@
   "body_y_offset_m": "-0.1",
   "roll_gain": "0.80",
   "pitch_gain": "1.0",
-  "line_cruise_vx": "0.10",
+  "line_cruise_vx": "0.15",
   "line_target_center_offset_px": "0",
   "line_vehicle_direction_angle_deg": "0.0",
   "line_steer_sign": "-1.0",
   "line_kp_offset": "7.0",
   "line_kp_heading": "0.08",
   "line_max_wz": "1.6",
-  "local_weight_in_row": "0.99999",
-  "global_weight_in_row": "0.00001",
+  "local_weight_in_row": "1",
+  "global_weight_in_row": "0",
   "mapping_recorddata": false
 }

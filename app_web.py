@@ -755,6 +755,27 @@ HTML_PAGE = """<!doctype html>
       display: grid;
       gap: 16px;
     }
+    .tuning-layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .tuning-main-stack {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 16px;
+      align-content: start;
+      width: 100%;
+    }
+    .tuning-main-stack > .panel {
+      height: 100%;
+    }
+    .tuning-notes {
+      grid-column: 1 / -1;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-items: stretch;
+    }
+    .tuning-notes .note {
+      height: 100%;
+    }
     .subpanel {
       padding: 16px;
       border-radius: var(--radius-lg);
@@ -786,6 +807,8 @@ HTML_PAGE = """<!doctype html>
     @media (max-width: 1240px) {
       .shell, .dashboard-layout, .settings-layout { grid-template-columns: 1fr; }
       .hero-stats, .workflow-board { grid-template-columns: 1fr 1fr; }
+      .tuning-main-stack { grid-template-columns: 1fr; }
+      .tuning-notes { grid-template-columns: 1fr; }
     }
     @media (max-width: 860px) {
       .page { padding: 14px; }
@@ -1638,7 +1661,7 @@ HTML_PAGE = """<!doctype html>
 
         <section id="tab-settings" class="tab-panel">
           <div class="settings-layout tuning-layout">
-            <div class="settings-group">
+            <div class="tuning-main-stack">
               <div class="panel">
                 <div class="panel-head tight">
                   <div>
@@ -1684,20 +1707,8 @@ HTML_PAGE = """<!doctype html>
                   </div>
                 </div>
               </div>
-            </div>
 
-            <div class="settings-group">
-              <div class="panel">
-                <div class="panel-head tight">
-                  <div>
-                    <h2>Projection Debug</h2>
-                    <div class="panel-sub">Verify roll and pitch compensation against the anchor.</div>
-                  </div>
-                </div>
-                <div class="properties" id="projectionDebug"></div>
-              </div>
-
-              <div class="notes-grid">
+              <div class="notes-grid tuning-notes">
                 <div class="note">Fields remain editable while background refresh runs. Unsaved values are preserved until you press <code>Save Tuning</code>.</div>
                 <div class="note">Saved values are written into <code>gui_settings.json</code> and reused by mapping, recording, and hybrid drive.</div>
               </div>
@@ -1827,6 +1838,7 @@ HTML_PAGE = """<!doctype html>
 
     function updateProjectionDebug(debug) {
       const root = document.getElementById('projectionDebug');
+      if (!root) return;
       const entries = [
         ['Monitor', debug?.monitor_status ?? '--'],
         ['Raw Pose', debug?.raw_xy ?? '--'],
@@ -1935,6 +1947,8 @@ HTML_PAGE = """<!doctype html>
       );
       const selectedMission = (data.missions || []).find(item => item.id === data.selected_mission_id);
       document.getElementById('workflowGateSummary').textContent = ready ? 'Ready for record or drive' : 'Waiting for map lock';
+      const workflowGateTuning = document.getElementById('workflowGateTuning');
+      if (workflowGateTuning) workflowGateTuning.textContent = ready ? 'Ready for record or drive' : 'Waiting for map lock';
       document.getElementById('recordDependency').innerHTML = ready
         ? '<strong>Localization ready</strong><br>You can record on the current localized map.'
         : '<strong>Needs localization</strong><br>Start relocalization first, then record on the same map.';
@@ -1987,6 +2001,10 @@ HTML_PAGE = """<!doctype html>
       document.getElementById('previewSource').textContent = data.preview_source || 'Waiting';
       document.getElementById('previewSourceDashboard').textContent = data.preview_source || 'Waiting';
       document.getElementById('previewModeBadge').textContent = String(data.preview_source || 'Preview');
+      const previewSourceTuning = document.getElementById('previewSourceTuning');
+      if (previewSourceTuning) previewSourceTuning.textContent = data.preview_source || 'Waiting for preview stream';
+      const previewModeBadgeTuning = document.getElementById('previewModeBadgeTuning');
+      if (previewModeBadgeTuning) previewModeBadgeTuning.textContent = String(data.preview_source || 'Preview');
       document.getElementById('canStateSummary').textContent = data.can_status || 'Unknown';
 
       setOptions('recordMap', data.maps || [], activeLocalizationMapId || data.selected_record_map_id);
@@ -2010,11 +2028,20 @@ HTML_PAGE = """<!doctype html>
       const guidanceBlendText = 'local ' + (data.settings.local_weight_in_row || '--') + ' / global ' + (data.settings.global_weight_in_row || '--');
       document.getElementById('guidanceBlendSummary').textContent = guidanceBlendText;
       document.getElementById('guidanceBlendTaskSummary').textContent = guidanceBlendText;
+      const guidanceBlendSummaryTuning = document.getElementById('guidanceBlendSummaryTuning');
+      if (guidanceBlendSummaryTuning) guidanceBlendSummaryTuning.textContent = guidanceBlendText;
 
       document.getElementById('projectionSummary').textContent =
         'h=' + (data.settings.sensor_height_m || '--') +
         ', x=' + (data.settings.body_x_offset_m || '--') +
         ', y=' + (data.settings.body_y_offset_m || '--');
+      const projectionSummaryTuning = document.getElementById('projectionSummaryTuning');
+      if (projectionSummaryTuning) {
+        projectionSummaryTuning.textContent =
+          'h=' + (data.settings.sensor_height_m || '--') +
+          ', x=' + (data.settings.body_x_offset_m || '--') +
+          ', y=' + (data.settings.body_y_offset_m || '--');
+      }
 
       updateFieldIfClean('mapName', data.mapping_name || '');
       updateFieldIfClean('missionName', data.mission_name || '');
