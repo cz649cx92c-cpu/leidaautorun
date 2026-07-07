@@ -805,6 +805,9 @@ class DirectLocalLidarController:
                 self.drive_enable = False
                 self._direct_drive_until = max(float(self._direct_drive_until), time.monotonic() + max(0.05, float(hold_sec)))
 
+            def clear_motion_history(self) -> None:
+                super().clear_motion_history()
+
             def _send_stop(self) -> None:
                 if time.monotonic() < float(self._direct_drive_until):
                     return
@@ -952,6 +955,9 @@ class DirectLocalLidarController:
     def hold_direct_control(self, hold_sec: float = 0.35) -> None:
         self._node.hold_direct_control(float(hold_sec))
 
+    def clear_motion_history(self) -> None:
+        self._node.clear_motion_history()
+
     def close(self) -> None:
         try:
             self._node.stop()
@@ -1079,6 +1085,30 @@ def _segment_for_index(segments: list[ForwardRowSegment], index: int) -> Forward
     return None
 
 
+def _next_forward_segment(
+    segments: list[ForwardRowSegment],
+    index: int,
+) -> ForwardRowSegment | None:
+    for segment in segments:
+        if segment.end_index < index:
+            continue
+        if segment.start_index >= index or segment.start_index <= index <= segment.end_index:
+            return segment
+    return None
+
+
+def _choose_start_index_from_offset(
+    points: list[Any],
+    motions: list[dict[str, Any]],
+    start_index: int,
+) -> int:
+    if not points:
+        return 0
+    start = max(0, min(int(start_index), len(points) - 1))
+    rel_index = core._choose_start_index(points[start:], motions[start:])
+    return max(start, min(len(points) - 1, start + int(rel_index)))
+
+
 @dataclass
 class RowEndReverseState:
     active: bool = False
@@ -1093,6 +1123,8 @@ class RowEndReverseState:
     post_row_change_lock_until: float = 0.0
     forward_mode_sync_until: float = 0.0
     forward_mode_sync_logged: bool = False
+    force_global_only: bool = False
+    start_index_floor: int = 0
 
 
 @dataclass
@@ -1103,6 +1135,7 @@ class RowEntryAssistState:
     force_global_only: bool = False
     start_along_m: float = 0.0
     start_along_valid: bool = False
+    fresh_start_reset_done: bool = False
 
 
 @dataclass
@@ -1372,6 +1405,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     look_ahead=28,
                     max_snap_dist=2.2,
                 )
+            start_index = max(int(start_index), int(row_end_reverse.start_index_floor))
             snapshot = local_controller.feedback_snapshot()
             io_state = snapshot.get("io", {})
             if bool(io_state.get("remote_control", False)):
@@ -1389,6 +1423,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
 
             nearest_index = core._find_tracking_index(points, start_index, pose, window=14)
             start_index = max(start_index, nearest_index)
+            start_index = max(int(start_index), int(row_end_reverse.start_index_floor))
             motion_here = motions[min(start_index, len(motions) - 1)]
             mission_wants_reverse = (
                 core._resolve_replay_gear(motion_here, current_gear) == "reverse"
@@ -1398,6 +1433,9 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
             target_index = min(len(points) - 1, max(start_index, start_index + 1))
             dist = pose.distance_to(points[target_index])
             current_segment = _segment_for_index(forward_segments, start_index)
+            if current_segment is None and not reversing_here and row_entry_assist.force_global_only:
+                start_index = _choose_start_index_from_offset(points, motions, start_index)
+                current_segment = _segment_for_index(forward_segments, start_index)
             in_row_end_zone = False
             forward_global_window = False
             row_entry_global_window = False
@@ -1413,10 +1451,12 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     row_entry_assist.segment_start_index = current_segment.start_index
                     row_entry_assist.active = not reversing_here
                     row_entry_assist.handed_off = reversing_here
+                    row_entry_assist.fresh_start_reset_done = False
                     if not reversing_here and row_entry_assist.force_global_only:
                         row_entry_assist.active = True
                         row_entry_assist.handed_off = False
                         row_entry_assist.start_along_valid = False
+                        row_entry_assist.fresh_start_reset_done = False
                 in_row_end_zone = (
                     abs(lateral) <= 0.80
                     and remaining_along <= 0.35
@@ -1450,11 +1490,13 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     row_entry_assist.handed_off = True
                     row_entry_assist.force_global_only = False
                     row_entry_assist.start_along_valid = False
+                    row_entry_assist.fresh_start_reset_done = False
                     row_entry_global_window = False
             else:
                 row_entry_assist.active = False
                 row_entry_assist.handed_off = False
                 row_entry_assist.start_along_valid = False
+                row_entry_assist.fresh_start_reset_done = False
                 row_change_global_window = not reversing_here
             if row_entry_assist.force_global_only and not reversing_here:
                 row_entry_assist.active = True
@@ -1470,6 +1512,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_end_reverse.triggered_at_index = start_index
                 row_end_reverse.hard_stop_sent = False
                 row_end_reverse.pending_next_index = -1
+                row_end_reverse.force_global_only = True
                 reverse_start_index = current_segment.end_index + 1
                 reverse_end_index = reverse_start_index
                 while reverse_end_index + 1 < len(points):
@@ -1500,7 +1543,26 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 _append_hybrid_log(hybrid_run_log, reverse_msg)
                 last_reverse_state = reversing_here
 
-            global_control_active = row_entry_global_window or forward_global_window or row_change_global_window
+            reverse_row_global_window = False
+            if (
+                row_end_reverse.active
+                and row_end_reverse.force_global_only
+                and row_end_reverse.pending_next_index < 0
+                and time.monotonic() >= row_end_reverse.stop_until
+                and row_end_reverse.reverse_start_index >= 0
+                and row_end_reverse.reverse_start_index < len(points)
+            ):
+                reverse_origin = points[row_end_reverse.reverse_start_index]
+                reverse_progress_m = pose.distance_to(reverse_origin)
+                reverse_row_global_window = reverse_progress_m < 2.5
+                if not reverse_row_global_window:
+                    row_end_reverse.force_global_only = False
+            global_control_active = (
+                row_entry_global_window
+                or forward_global_window
+                or row_change_global_window
+                or reverse_row_global_window
+            )
             post_row_change_locked = time.monotonic() < row_end_reverse.post_row_change_lock_until
             force_global_entry_only = bool(row_entry_assist.force_global_only and row_entry_global_window)
 
@@ -1527,6 +1589,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 finish_msg = f"Reverse stop pause finished. Switching to next mission stage at index {next_index}."
                 core.log(finish_msg)
                 _append_hybrid_log(hybrid_run_log, finish_msg)
+                local_controller.clear_motion_history()
                 row_end_reverse.active = False
                 row_end_reverse.stop_until = 0.0
                 row_end_reverse.triggered_at_index = -1
@@ -1534,6 +1597,8 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_end_reverse.reverse_start_index = -1
                 row_end_reverse.reverse_end_index = -1
                 row_end_reverse.pending_next_index = -1
+                row_end_reverse.force_global_only = False
+                row_end_reverse.start_index_floor = max(int(row_end_reverse.start_index_floor), int(next_index))
                 row_end_reverse.row_change_sync_until = time.monotonic() + 0.45
                 row_end_reverse.row_change_sync_sent = False
                 row_end_reverse.post_row_change_lock_until = time.monotonic() + 1.0
@@ -1543,7 +1608,8 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_entry_assist.segment_start_index = -1
                 row_entry_assist.start_along_m = 0.0
                 row_entry_assist.start_along_valid = False
-                start_index = next_index
+                row_entry_assist.fresh_start_reset_done = False
+                start_index = _choose_start_index_from_offset(points, motions, next_index)
                 last_reverse_state = None
                 time.sleep(0.05)
                 continue
@@ -1551,45 +1617,8 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
             if global_control_active:
                 motion_fb = snapshot.get("motion", {}) if isinstance(snapshot, dict) else {}
                 steering_fb = snapshot.get("steering", {}) if isinstance(snapshot, dict) else {}
-                if force_global_entry_only:
-                    crab_residual = (
-                        str(motion_fb.get("gear", "")).strip() == "crab"
-                        or str(steering_fb.get("gear", "")).strip() == "crab"
-                        or current_cmd_gear == "crab"
-                    )
-                    now_sync = time.monotonic()
-                    if crab_residual and row_end_reverse.forward_mode_sync_until <= now_sync:
-                        row_end_reverse.forward_mode_sync_until = now_sync + 0.35
-                        row_end_reverse.forward_mode_sync_logged = False
-                    if row_end_reverse.forward_mode_sync_until > now_sync:
-                        if not row_end_reverse.forward_mode_sync_logged:
-                            sync_msg = (
-                                "Post-row-change forward sync: forcing 4t4d zero command "
-                                f"before entry-global handoff (body_gear={motion_fb.get('gear', '--')}, "
-                                f"steer_gear={steering_fb.get('gear', '--')})."
-                            )
-                            core.log(sync_msg)
-                            _append_hybrid_log(hybrid_run_log, sync_msg)
-                            row_end_reverse.forward_mode_sync_logged = True
-                        local_controller.publish_mode(
-                            enable=False,
-                            reverse=False,
-                            cruise_vx=cruise_vx,
-                            gear="4t4d",
-                            low_beam=args.line_low_beam,
-                            target_center_offset_px=offset_px,
-                            vehicle_direction_angle_deg=direction_angle_deg,
-                        )
-                        local_controller.hold_direct_control(0.45)
-                        local_controller.send_direct_drive("4t4d", 0.0, 0.0, force_brake=True)
-                        current_cmd_gear = "4t4d"
-                        local_status = local_controller.status_snapshot()
-                        local_cmd = TwistCommand(vx=0.0, vy=0.0, wz=0.0, updated_at=time.monotonic(), fresh=True)
-                        time.sleep(0.05)
-                        continue
-                else:
-                    row_end_reverse.forward_mode_sync_until = 0.0
-                    row_end_reverse.forward_mode_sync_logged = False
+                row_end_reverse.forward_mode_sync_until = 0.0
+                row_end_reverse.forward_mode_sync_logged = False
                 local_controller.publish_mode(
                     enable=False,
                     reverse=reversing_here,
@@ -1600,6 +1629,19 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     vehicle_direction_angle_deg=direction_angle_deg,
                 )
                 if row_entry_global_window and current_segment is not None:
+                    if not row_entry_assist.fresh_start_reset_done:
+                        send_state.reset_motion()
+                        local_controller.clear_motion_history()
+                        row_end_reverse.row_change_sync_until = 0.0
+                        row_end_reverse.row_change_sync_sent = False
+                        row_end_reverse.forward_mode_sync_until = 0.0
+                        row_end_reverse.forward_mode_sync_logged = False
+                        row_entry_assist.fresh_start_reset_done = True
+                    if send_state.crab_locked_until >= 0:
+                        send_state.crab_locked_until = -1
+                        send_state.crab_target_index = -1
+                        send_state.crab_best_dist = float("inf")
+                        send_state.crab_diverge_count = 0
                     target_index = _nearest_forward_target_index(
                         points,
                         current_segment,
@@ -1647,6 +1689,17 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                                 )
                             else:
                                 target_index = min(len(points) - 1, start_index + 2)
+                elif reverse_row_global_window:
+                    reverse_nearest_index, _reverse_nearest_dist = _nearest_index_in_range(
+                        points,
+                        pose,
+                        row_end_reverse.reverse_start_index,
+                        row_end_reverse.reverse_end_index,
+                    )
+                    target_index = min(
+                        row_end_reverse.reverse_end_index,
+                        max(row_end_reverse.reverse_start_index, reverse_nearest_index + 2),
+                    )
                 target = points[target_index]
                 motion = motions[min(target_index, len(motions) - 1)]
                 tracking_heading = core._tracking_heading(points, motions, target_index, "crab" if row_change_global_window else "4t4d")
@@ -1667,7 +1720,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 if reversing_here:
                     cmd_vx = -min(abs(float(args.line_cruise_vx)), 0.16)
                     cmd_wz = core._clamp(
-                        heading_err_deg * 0.72 + lateral_err * 18.0,
+                        -(heading_err_deg * 0.72 + lateral_err * 18.0),
                         -12.0,
                         12.0,
                     )
@@ -1809,6 +1862,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     core.log(end_reverse_msg)
                     _append_hybrid_log(hybrid_run_log, end_reverse_msg)
                     core._hold_current_gear_stop(controller, send_state, current_gear)
+                    local_controller.clear_motion_history()
                     row_end_reverse.stop_until = time.monotonic() + reverse_stop_pause_s
                     row_end_reverse.hard_stop_sent = True
                     row_end_reverse.pending_next_index = next_index

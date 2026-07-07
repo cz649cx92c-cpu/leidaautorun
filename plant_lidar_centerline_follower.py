@@ -460,6 +460,27 @@ class PlantRowFollower(Node):
             f"started scan_topic={args.scan_topic} speed={args.speed:.2f} row_width={args.row_width:.2f}"
         )
 
+    def clear_motion_history(self) -> None:
+        self.last_found_time = 0.0
+        self.last_good_time = 0.0
+        self.last_filtered_center_y = 0.0
+        self.last_good_center_y = 0.0
+        self.last_error_y = 0.0
+        self.last_direct_error_y = 0.0
+        self.last_good_heading_deg = 0.0
+        self.direct_error_history.clear()
+        self.last_cmd_vx = 0.0
+        self.last_cmd_wz = 0.0
+        self.last_good_cmd = BodyCommand(gear=self.args.gear, vx=0.0, vy=0.0, wz=0.0)
+        self.last_good_estimate = RowEstimate(found=False)
+        self.last_good_center_line = None
+        self.last_good_left_line = None
+        self.last_good_right_line = None
+        self.last_good_mode = ""
+        self.last_following_wz_deg = 0.0
+        self.wz_not_following_count = 0
+        self.last_debug = {}
+
     def _on_scan(self, msg: LaserScan) -> None:
         with self.scan_lock:
             self.last_scan = msg
@@ -1050,6 +1071,12 @@ class PlantRowFollower(Node):
         with self.scan_lock:
             scan = self.last_scan
             scan_age = now - self.last_scan_time if self.last_scan is not None else float("inf")
+        if not bool(self.drive_enable):
+            if scan is None or scan_age > float(self.args.scan_timeout):
+                self.last_estimate = RowEstimate(found=False, mode="scan_timeout")
+            else:
+                self.last_estimate = self._estimate_row(scan)
+            return
         if scan is None or scan_age > float(self.args.scan_timeout):
             self.last_estimate = RowEstimate(found=False, mode="scan_timeout")
             hold_phase = "scan_timeout_hold_reverse" if bool(self.args.reverse) else "scan_timeout_hold_forward"
