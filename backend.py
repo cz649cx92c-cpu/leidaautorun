@@ -699,6 +699,9 @@ class DirectLocalLidarController:
         follower_args.reverse_steer_sign = float(args.lidar_reverse_steer_sign)
         follower_args.reverse_heading_conflict_error_y = float(args.lidar_reverse_heading_conflict_error_y)
         follower_args.reverse_heading_max_ratio = float(args.lidar_reverse_heading_max_ratio)
+        follower_args.reverse_recenter_error_y = float(args.lidar_reverse_recenter_error_y)
+        follower_args.reverse_recenter_heading_deg = float(args.lidar_reverse_recenter_heading_deg)
+        follower_args.reverse_recenter_scale = float(args.lidar_reverse_recenter_scale)
         follower_args.reverse_error_stop = float(args.lidar_reverse_error_stop)
         follower_args.reverse_wz_smoothing_alpha = float(args.lidar_reverse_wz_smoothing_alpha)
         follower_args.reverse_lost_hold_sec = float(args.lidar_reverse_lost_hold_sec)
@@ -1125,6 +1128,9 @@ class RowEndReverseState:
     forward_mode_sync_logged: bool = False
     force_global_only: bool = False
     start_index_floor: int = 0
+    last_global_lateral_err: float = 0.0
+    last_global_heading_err_deg: float = 0.0
+    runaway_same_side_count: int = 0
 
 
 @dataclass
@@ -1598,6 +1604,9 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_end_reverse.reverse_end_index = -1
                 row_end_reverse.pending_next_index = -1
                 row_end_reverse.force_global_only = False
+                row_end_reverse.last_global_lateral_err = 0.0
+                row_end_reverse.last_global_heading_err_deg = 0.0
+                row_end_reverse.runaway_same_side_count = 0
                 row_end_reverse.start_index_floor = max(int(row_end_reverse.start_index_floor), int(next_index))
                 row_end_reverse.row_change_sync_until = time.monotonic() + 0.45
                 row_end_reverse.row_change_sync_sent = False
@@ -1613,6 +1622,8 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 last_reverse_state = None
                 time.sleep(0.05)
                 continue
+
+            reverse_global_only_active = bool(reversing_here and reverse_row_global_window)
 
             if global_control_active:
                 motion_fb = snapshot.get("motion", {}) if isinstance(snapshot, dict) else {}
@@ -1718,13 +1729,38 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 cmd_vy = 0.0
                 cmd_gear = "4t4d"
                 if reversing_here:
+                    # Reverse global control should use the same reverse-facing control frame
+                    # as the lidar local reverse logic. tracking_heading has already been
+                    # flipped for reverse motion, so lateral_err must also be flipped here.
+                    reverse_lateral_err = -lateral_err
                     cmd_vx = -min(abs(float(args.line_cruise_vx)), 0.16)
                     cmd_wz = core._clamp(
-                        -(heading_err_deg * 0.72 + lateral_err * 18.0),
+                        -(heading_err_deg * 0.72 + reverse_lateral_err * 18.0),
                         -12.0,
                         12.0,
                     )
+                    if reverse_row_global_window:
+                        prev_lateral = float(row_end_reverse.last_global_lateral_err)
+                        prev_heading = float(row_end_reverse.last_global_heading_err_deg)
+                        same_side = (
+                            abs(prev_lateral) > 1e-6
+                            and abs(reverse_lateral_err) > abs(prev_lateral) + 0.01
+                            and prev_lateral * reverse_lateral_err > 0.0
+                            and abs(heading_err_deg) > abs(prev_heading) + 1.5
+                        )
+                        if same_side:
+                            row_end_reverse.runaway_same_side_count += 1
+                        else:
+                            row_end_reverse.runaway_same_side_count = 0
+                        if row_end_reverse.runaway_same_side_count >= 2:
+                            cmd_wz *= 0.45
+                            cmd_vx *= 0.65
+                        row_end_reverse.last_global_lateral_err = float(reverse_lateral_err)
+                        row_end_reverse.last_global_heading_err_deg = float(heading_err_deg)
                 else:
+                    row_end_reverse.last_global_lateral_err = 0.0
+                    row_end_reverse.last_global_heading_err_deg = 0.0
+                    row_end_reverse.runaway_same_side_count = 0
                     if row_change_global_window:
                         cmd_gear = "crab"
                         dist = pose.distance_to(target)
@@ -1786,6 +1822,9 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                             -12.0,
                             12.0,
                         )
+                if reverse_global_only_active:
+                    local_controller.hold_direct_control(0.90)
+
                 if cmd_gear == "crab":
                     local_controller.hold_direct_control(0.60)
                     if (
@@ -1808,6 +1847,12 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 local_status = local_controller.status_snapshot()
                 local_cmd = TwistCommand(vx=cmd_vx, vy=cmd_vy, wz=math.radians(cmd_wz), updated_at=time.monotonic(), fresh=True)
             else:
+                if row_end_reverse.force_global_only:
+                    row_end_reverse.force_global_only = False
+                    row_end_reverse.last_global_lateral_err = 0.0
+                    row_end_reverse.last_global_heading_err_deg = 0.0
+                    row_end_reverse.runaway_same_side_count = 0
+                    local_controller.clear_motion_history()
                 row_end_reverse.row_change_sync_until = 0.0
                 row_end_reverse.row_change_sync_sent = False
                 row_end_reverse.forward_mode_sync_until = 0.0
@@ -1887,6 +1932,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     f"post_row_change_lock={post_row_change_locked} "
                     f"force_global_entry_only={force_global_entry_only} "
                     f"entry_handoff={row_entry_handoff_ready} "
+                    f"reverse_global_only={reverse_global_only_active} "
                     f"reverse={reversing_here}"
                 )
                 core.log(cmd_log)
@@ -2061,6 +2107,9 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-reverse-steer-sign", type=float, default=-1.0)
     parser.add_argument("--lidar-reverse-heading-conflict-error-y", type=float, default=0.01)
     parser.add_argument("--lidar-reverse-heading-max-ratio", type=float, default=0.35)
+    parser.add_argument("--lidar-reverse-recenter-error-y", type=float, default=0.06)
+    parser.add_argument("--lidar-reverse-recenter-heading-deg", type=float, default=6.0)
+    parser.add_argument("--lidar-reverse-recenter-scale", type=float, default=0.45)
     parser.add_argument("--lidar-reverse-error-stop", type=float, default=0.28)
     parser.add_argument("--lidar-reverse-wz-smoothing-alpha", type=float, default=0.0)
     parser.add_argument("--lidar-reverse-lost-hold-sec", type=float, default=0.35)

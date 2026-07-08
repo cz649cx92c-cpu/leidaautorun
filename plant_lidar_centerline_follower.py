@@ -405,6 +405,8 @@ class PlantRowFollower(Node):
         self.last_good_right_line: tuple[float, float] | None = None
         self.last_good_mode = ""
         self.last_following_wz_deg = 0.0
+        self.last_reverse_track_error_y = 0.0
+        self.last_reverse_heading_error_deg = 0.0
         self.send_state = MotionSendState.create()
         self.row_cfg = RowFollowerConfig(
             row_width=float(args.row_width),
@@ -478,6 +480,8 @@ class PlantRowFollower(Node):
         self.last_good_right_line = None
         self.last_good_mode = ""
         self.last_following_wz_deg = 0.0
+        self.last_reverse_track_error_y = 0.0
+        self.last_reverse_heading_error_deg = 0.0
         self.wz_not_following_count = 0
         self.last_debug = {}
 
@@ -672,6 +676,7 @@ class PlantRowFollower(Node):
         reverse_sign_hold_active = False
         reverse_heading_conflict = False
         reverse_sign_flip_blocked = False
+        reverse_recenter_active = False
         wz_zeroed_reason = ""
         reverse_lat_term_deg = 0.0
         reverse_heading_term_deg = 0.0
@@ -774,6 +779,17 @@ class PlantRowFollower(Node):
                     target_wz_deg = sign * min(abs_target_wz_deg, max_wz_deg)
             reverse_wz_after_min_deg = target_wz_deg
             reverse_wz_after_limit_deg = target_wz_deg
+            prev_reverse_track_error_y = float(self.last_reverse_track_error_y)
+            prev_reverse_heading_error_deg = float(self.last_reverse_heading_error_deg)
+            if (
+                abs(track_error_y) <= float(self.args.reverse_recenter_error_y)
+                and abs(heading_error_deg) <= float(self.args.reverse_recenter_heading_deg)
+                and abs(track_error_y) <= abs(prev_reverse_track_error_y)
+                and abs(heading_error_deg) <= abs(prev_reverse_heading_error_deg)
+                and abs(target_wz_deg) > 1e-6
+            ):
+                reverse_recenter_active = True
+                target_wz_deg *= float(self.args.reverse_recenter_scale)
             last_wz_deg = math.degrees(float(self.last_cmd_wz))
             max_delta = max(0.0, float(self.args.max_wz_delta_deg_per_cycle))
             limited_wz_deg = max(last_wz_deg - max_delta, min(last_wz_deg + max_delta, target_wz_deg))
@@ -787,7 +803,11 @@ class PlantRowFollower(Node):
                 final_wz_deg = 0.0
             wz_raw = math.radians(target_wz_deg)
             wz = math.radians(final_wz_deg)
+            self.last_reverse_track_error_y = float(track_error_y)
+            self.last_reverse_heading_error_deg = float(heading_error_deg)
         else:
+            self.last_reverse_track_error_y = 0.0
+            self.last_reverse_heading_error_deg = 0.0
             if line_fit is not None:
                 track_x = float(self.args.forward_lookahead_x)
                 line_y_at_track = float(line_fit[0] * track_x + line_fit[1])
@@ -882,6 +902,7 @@ class PlantRowFollower(Node):
             reverse_heading_term_applied_deg=reverse_heading_term_applied_deg,
             reverse_heading_conflict=reverse_heading_conflict,
             reverse_sign_flip_blocked=reverse_sign_flip_blocked,
+            reverse_recenter_active=reverse_recenter_active,
             reverse_sign_hold_active=reverse_sign_hold_active,
             wz_zeroed_reason=wz_zeroed_reason,
             slow_ratio=slow_ratio,
@@ -1391,6 +1412,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reverse-steer-sign", type=float, default=-1.0)
     parser.add_argument("--reverse-heading-conflict-error-y", type=float, default=0.01)
     parser.add_argument("--reverse-heading-max-ratio", type=float, default=0.35)
+    parser.add_argument("--reverse-recenter-error-y", type=float, default=0.06)
+    parser.add_argument("--reverse-recenter-heading-deg", type=float, default=6.0)
+    parser.add_argument("--reverse-recenter-scale", type=float, default=0.45)
     parser.add_argument("--reverse-error-stop", type=float, default=0.28)
     parser.add_argument("--reverse-wz-smoothing-alpha", type=float, default=0.0)
     parser.add_argument("--reverse-lost-hold-sec", type=float, default=0.35)
