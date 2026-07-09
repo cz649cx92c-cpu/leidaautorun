@@ -1115,10 +1115,8 @@ class PlantRowFollower(Node):
             flush=True,
         )
         if self.last_debug:
-            print(
-                "[debug] "
-                + json.dumps(
-                    {
+            debug_text = json.dumps(
+                {
                         "found": bool(self.last_debug.get("found", False)),
                         "calibrated": bool(self.last_debug.get("calibrated", False)),
                         "sensor_yaw_deg": round(float(self.last_debug.get("sensor_yaw_deg", 0.0)), 4),
@@ -1217,11 +1215,11 @@ class PlantRowFollower(Node):
                         "raw_center_warning": self.last_debug.get("raw_center_warning", ""),
                         "reject_reason": self.last_debug.get("reject_reason", ""),
                         "stop_reason": self.last_debug.get("stop_reason", ""),
-                    },
-                    ensure_ascii=True,
-                ),
-                flush=True,
+                },
+                ensure_ascii=True,
+                indent=2,
             )
+            print(f"[debug]\n{debug_text}", flush=True)
 
     def stop(self) -> None:
         if self._stopping:

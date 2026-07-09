@@ -847,6 +847,9 @@ class PlantRowFollower(Node):
         if not reverse:
             wz_raw = max(-max_wz_rad, min(max_wz_rad, wz_raw))
             wz = wz_raw
+            min_forward_wz_rad = math.radians(2.0)
+            if abs(wz) > 1e-9 and abs(wz) < min_forward_wz_rad:
+                wz = math.copysign(min_forward_wz_rad, wz)
 
         self.last_direct_error_y = direct_error_y
         self.last_error_y = error_y
@@ -1203,10 +1206,8 @@ class PlantRowFollower(Node):
         self.status_pub.publish(String(data=text))
         print(text, flush=True)
         if self.last_debug:
-            print(
-                "[debug] "
-                + json.dumps(
-                    {
+            debug_text = json.dumps(
+                {
                         "found": bool(self.last_debug.get("found", False)),
                         "calibrated": bool(self.last_debug.get("calibrated", False)),
                         "sensor_yaw_deg": round(float(self.last_debug.get("sensor_yaw_deg", 0.0)), 4),
@@ -1305,11 +1306,11 @@ class PlantRowFollower(Node):
                         "raw_center_warning": self.last_debug.get("raw_center_warning", ""),
                         "reject_reason": self.last_debug.get("reject_reason", ""),
                         "stop_reason": self.last_debug.get("stop_reason", ""),
-                    },
-                    ensure_ascii=True,
-                ),
-                flush=True,
+                },
+                ensure_ascii=True,
+                indent=2,
             )
+            print(f"[debug]\n{debug_text}", flush=True)
 
     def stop(self) -> None:
         if self._stopping:

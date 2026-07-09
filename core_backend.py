@@ -913,6 +913,11 @@ def _resolve_replay_gear(motion: dict[str, Any], current_gear: str | None) -> st
         return 'crab'
     if gear == '4t4d':
         return '4t4d'
+    # Treat raw gear code 7 as a transient chassis state, not a drivable replay mode.
+    # This keeps autorun from handing off into recorded transition frames between
+    # crab and real 4t4d forward motion.
+    if gear == '7':
+        return current_gear or '4t4d'
     if gear in {'park', 'neutral', '', '--'}:
         return current_gear or '4t4d'
     vx = abs(float(motion.get('vx', 0.0) or 0.0))

@@ -2544,6 +2544,23 @@ class WebController:
             except Exception:
                 pass
 
+    def _cleanup_empty_odin_configs(self) -> None:
+        removed = 0
+        config_dir = PROJECT_ROOT / "runtime" / "configs"
+        try:
+            candidates = list(config_dir.glob("odin_mode_*.yaml"))
+        except Exception:
+            return
+        for path in candidates:
+            try:
+                if path.is_file() and path.stat().st_size <= 0:
+                    path.unlink()
+                    removed += 1
+            except Exception:
+                continue
+        if removed:
+            self._log(f"Removed {removed} empty Odin runtime config file(s) before localization startup.")
+
     def _start_pose_debug_monitor(self) -> None:
         if self.pose_debug_monitor is not None:
             return
@@ -2954,6 +2971,7 @@ class WebController:
             self.record_localization_worker = None
             self.replay_localization_worker = None
         self._cleanup_localization_processes("before starting a new localization session")
+        self._cleanup_empty_odin_configs()
         self._wait_for_odin_usb()
         self.localization_map_path = map_path
         self.localization_status = "Starting..."

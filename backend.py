@@ -116,6 +116,44 @@ def _replace_yaml_scalar(text: str, key: str, value: str) -> str:
     return new_text
 
 
+def _validate_odin_config_text(text: str, mode: int, *, map_path: Path | None = None) -> None:
+    if not text.strip():
+        raise RuntimeError("Generated Odin config is empty.")
+    required_keys = (
+        "custom_map_mode",
+        "recorddata",
+        "sendimu",
+        "sendodom",
+        "send_odom_baselink_tf",
+        "relocalization_map_abs_path",
+        "mapping_result_dest_dir",
+        "mapping_result_file_name",
+        "resetalgo",
+    )
+    missing = [key for key in required_keys if not re.search(rf"^\s*{re.escape(key)}\s*:", text, flags=re.MULTILINE)]
+    if missing:
+        raise RuntimeError(f"Generated Odin config is missing required key(s): {', '.join(missing)}")
+    if mode == 2:
+        if map_path is None:
+            match = re.search(r'^\s*relocalization_map_abs_path\s*:\s*"?([^"\n]*)"?\s*$', text, flags=re.MULTILINE)
+            if match is None or not match.group(1).strip():
+                raise RuntimeError("Generated Odin relocalization config has an empty map path.")
+        else:
+            if not map_path.exists() or map_path.stat().st_size <= 0:
+                raise RuntimeError(f"Relocalization map file is missing or empty: {map_path}")
+            expected = f'relocalization_map_abs_path: "{map_path}"'
+            if expected not in text:
+                raise RuntimeError(f"Generated Odin relocalization config does not reference the selected map: {map_path}")
+
+
+def _validate_odin_config_file(config_path: Path, mode: int, *, map_path: Path | None = None) -> None:
+    if not config_path.exists():
+        raise RuntimeError(f"Odin config file was not created: {config_path}")
+    if config_path.stat().st_size <= 0:
+        raise RuntimeError(f"Odin config file is empty: {config_path}")
+    _validate_odin_config_text(config_path.read_text(encoding="utf-8"), mode, map_path=map_path)
+
+
 def sync_shadow_package() -> None:
     if SHADOW_ODIN_PACKAGE_ROS2.exists():
         shutil.copy2(SHADOW_ODIN_PACKAGE_ROS2, SHADOW_ODIN_PACKAGE)
@@ -245,6 +283,8 @@ def _ensure_shadow_workspace_built() -> None:
 
 def write_odin_config(mode: int, *, map_path: Path | None = None, map_name: str = "", recorddata: bool = False) -> Path:
     sync_shadow_package()
+    if not SHADOW_ODIN_CONFIG.exists() or SHADOW_ODIN_CONFIG.stat().st_size <= 0:
+        raise RuntimeError(f"Shadow Odin config is missing or empty: {SHADOW_ODIN_CONFIG}")
     text = SHADOW_ODIN_CONFIG.read_text(encoding="utf-8")
     text = _replace_yaml_scalar(text, "custom_map_mode", str(mode))
     text = _replace_yaml_scalar(text, "recorddata", "1" if recorddata else "0")
@@ -264,6 +304,8 @@ def write_odin_config(mode: int, *, map_path: Path | None = None, map_name: str 
     elif mode == 2:
         if map_path is None:
             raise RuntimeError("Relocalization mode requires a map path.")
+        if not map_path.exists() or map_path.stat().st_size <= 0:
+            raise RuntimeError(f"Relocalization map file is missing or empty: {map_path}")
         text = _replace_yaml_scalar(text, "relocalization_map_abs_path", f'"{map_path}"')
         text = _replace_yaml_scalar(text, "mapping_result_dest_dir", '""')
         text = _replace_yaml_scalar(text, "mapping_result_file_name", '""')
@@ -272,8 +314,10 @@ def write_odin_config(mode: int, *, map_path: Path | None = None, map_name: str 
         # same boot can get stuck waiting for a valid pose until the device is
         # power-cycled.
         text = _replace_yaml_scalar(text, "resetalgo", "1")
+    _validate_odin_config_text(text, mode, map_path=map_path)
     temp_path = TEMP_CONFIG_DIR / f"odin_mode_{mode}_{int(time.time() * 1000)}.yaml"
     temp_path.write_text(text, encoding="utf-8")
+    _validate_odin_config_file(temp_path, mode, map_path=map_path)
     return temp_path
 
 
@@ -390,11 +434,14 @@ class OdinConfigOverride:
         self.target_config = SHADOW_ODIN_CONFIG
 
     def apply(self) -> None:
+        _validate_odin_config_file(self.config_path, 2 if "odin_mode_2_" in self.config_path.name else 1)
         if not self.target_config.exists():
             raise RuntimeError(f"Shadow Odin config file does not exist: {self.target_config}")
         if not os.access(self.target_config, os.W_OK):
             raise RuntimeError(f"Shadow Odin config file is not writable: {self.target_config}")
         shutil.copy2(self.config_path, self.target_config)
+        if self.target_config.stat().st_size <= 0:
+            raise RuntimeError(f"Shadow Odin config override produced an empty file: {self.target_config}")
         core.log(f"Odin config override applied: {self.config_path}")
 
     def restore(self) -> None:
@@ -1043,21 +1090,23 @@ def _forward_row_segments(points: list[Any], motions: list[dict[str, Any]]) -> l
     idx = 0
     while idx < len(points) - 1:
         motion = motions[min(idx, len(motions) - 1)]
+        raw_gear = str(motion.get("gear") or "")
         gear = core._resolve_replay_gear(motion, None)
         vx = _safe_float(motion.get("vx"), 0.0)
-        if gear != "4t4d" or vx < -0.03:
+        if raw_gear == "7" or gear != "4t4d" or vx < -0.03:
             idx += 1
             continue
         start = idx
         end = idx
         while end + 1 < len(points):
             next_motion = motions[min(end + 1, len(motions) - 1)]
+            next_raw_gear = str(next_motion.get("gear") or "")
             next_gear = core._resolve_replay_gear(next_motion, None)
             next_vx = _safe_float(next_motion.get("vx"), 0.0)
             # Ignore tiny speed drops or pauses inside the same row.
             # Only break the row when the recorded mode leaves 4t4d or
             # clearly turns into a reverse segment.
-            if next_gear != "4t4d" or next_vx < -0.03:
+            if next_raw_gear == "7" or next_gear != "4t4d" or next_vx < -0.03:
                 break
             end += 1
         start_point = points[start]
@@ -1100,6 +1149,12 @@ def _next_forward_segment(
     return None
 
 
+def _segment_lateral_error(segment: ForwardRowSegment, pose: Any) -> float:
+    rel_x = float(pose.x - segment.start_point.x)
+    rel_y = float(pose.y - segment.start_point.y)
+    return -rel_x * segment.unit_y + rel_y * segment.unit_x
+
+
 def _choose_start_index_from_offset(
     points: list[Any],
     motions: list[dict[str, Any]],
@@ -1110,6 +1165,25 @@ def _choose_start_index_from_offset(
     start = max(0, min(int(start_index), len(points) - 1))
     rel_index = core._choose_start_index(points[start:], motions[start:])
     return max(start, min(len(points) - 1, start + int(rel_index)))
+
+
+def _next_forward_segment_start_index(
+    segments: list[ForwardRowSegment],
+    motions: list[dict[str, Any]],
+    fallback_index: int,
+) -> int:
+    segment = _next_forward_segment(segments, fallback_index)
+    if segment is not None:
+        start = int(segment.start_index)
+        end = int(segment.end_index)
+        for idx in range(start, end + 1):
+            motion = motions[min(idx, len(motions) - 1)]
+            gear = core._resolve_replay_gear(motion, None)
+            vx = _safe_float(motion.get("vx"), 0.0)
+            if gear == "4t4d" and vx > 0.03:
+                return idx
+        return start
+    return int(fallback_index)
 
 
 @dataclass
@@ -1131,6 +1205,7 @@ class RowEndReverseState:
     last_global_lateral_err: float = 0.0
     last_global_heading_err_deg: float = 0.0
     runaway_same_side_count: int = 0
+    reverse_global_progress_m: float = 0.0
 
 
 @dataclass
@@ -1203,6 +1278,22 @@ def _nearest_index_in_range(
             best_dist = dist
             best_index = idx
     return best_index, best_dist
+
+
+def _path_progress_in_range(
+    points: list[Any],
+    pose: Any,
+    start_index: int,
+    end_index: int,
+) -> tuple[float, int, float]:
+    start = max(0, min(int(start_index), len(points) - 1))
+    end = max(start, min(int(end_index), len(points) - 1))
+    nearest_index, nearest_dist = _nearest_index_in_range(points, pose, start, end)
+    progress_m = 0.0
+    if nearest_index > start:
+        for idx in range(start, nearest_index):
+            progress_m += points[idx].distance_to(points[idx + 1])
+    return progress_m, nearest_index, nearest_dist
 
 
 def _sync_start_index_from_pose(
@@ -1389,12 +1480,31 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
         _append_hybrid_log(hybrid_run_log, f"Map DB: {args.db}")
         last_cmd_log = 0.0
         last_feedback_log = 0.0
+        last_crab_align_log = 0.0
         last_reverse_state: bool | None = None
         current_gear = "4t4d"
         current_cmd_gear = "4t4d"
         row_end_reverse = RowEndReverseState()
         row_entry_assist = RowEntryAssistState()
         reverse_stop_pause_s = 0.8
+
+        def _clear_drive_boundary(reason: str, next_gear: str = "4t4d") -> None:
+            """Hard-clear command state when switching reverse/crab/row-entry phases."""
+            assert local_controller is not None
+            core._hold_current_gear_stop(controller, send_state, current_gear)
+            local_controller.send_direct_body_drive("crab", 0.0, 0.0, 0.0, force_brake=True)
+            local_controller.send_direct_drive("4t4d", 0.0, 0.0, force_brake=True)
+            local_controller.clear_motion_history()
+            send_state.reset_motion()
+            send_state.crab_locked_until = -1
+            send_state.crab_target_index = -1
+            send_state.crab_best_dist = float("inf")
+            send_state.crab_diverge_count = 0
+            send_state.last_sent_gear = next_gear
+            clear_msg = f"Hybrid drive boundary cleared: {reason}, next_gear={next_gear}."
+            core.log(clear_msg)
+            _append_hybrid_log(hybrid_run_log, clear_msg)
+
         while not core.STOP_REQUESTED and start_index < len(points):
             assert tracker is not None
             pose_raw = tracker.lookup()
@@ -1439,7 +1549,12 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
             target_index = min(len(points) - 1, max(start_index, start_index + 1))
             dist = pose.distance_to(points[target_index])
             current_segment = _segment_for_index(forward_segments, start_index)
-            if current_segment is None and not reversing_here and row_entry_assist.force_global_only:
+            if (
+                current_segment is None
+                and not reversing_here
+                and row_entry_assist.force_global_only
+                and send_state.crab_locked_until < start_index
+            ):
                 start_index = _choose_start_index_from_offset(points, motions, start_index)
                 current_segment = _segment_for_index(forward_segments, start_index)
             in_row_end_zone = False
@@ -1519,6 +1634,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_end_reverse.hard_stop_sent = False
                 row_end_reverse.pending_next_index = -1
                 row_end_reverse.force_global_only = True
+                row_end_reverse.reverse_global_progress_m = 0.0
                 reverse_start_index = current_segment.end_index + 1
                 reverse_end_index = reverse_start_index
                 while reverse_end_index + 1 < len(points):
@@ -1558,9 +1674,14 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 and row_end_reverse.reverse_start_index >= 0
                 and row_end_reverse.reverse_start_index < len(points)
             ):
-                reverse_origin = points[row_end_reverse.reverse_start_index]
-                reverse_progress_m = pose.distance_to(reverse_origin)
-                reverse_row_global_window = reverse_progress_m < 2.5
+                reverse_progress_m, _reverse_progress_index, _reverse_progress_dist = _path_progress_in_range(
+                    points,
+                    pose,
+                    row_end_reverse.reverse_start_index,
+                    row_end_reverse.reverse_end_index,
+                )
+                row_end_reverse.reverse_global_progress_m = float(reverse_progress_m)
+                reverse_row_global_window = reverse_progress_m < 1.0
                 if not reverse_row_global_window:
                     row_end_reverse.force_global_only = False
             global_control_active = (
@@ -1595,7 +1716,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 finish_msg = f"Reverse stop pause finished. Switching to next mission stage at index {next_index}."
                 core.log(finish_msg)
                 _append_hybrid_log(hybrid_run_log, finish_msg)
-                local_controller.clear_motion_history()
+                _clear_drive_boundary("reverse_stop_pause_finished", next_gear="crab")
                 row_end_reverse.active = False
                 row_end_reverse.stop_until = 0.0
                 row_end_reverse.triggered_at_index = -1
@@ -1607,12 +1728,17 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_end_reverse.last_global_lateral_err = 0.0
                 row_end_reverse.last_global_heading_err_deg = 0.0
                 row_end_reverse.runaway_same_side_count = 0
+                row_end_reverse.reverse_global_progress_m = 0.0
                 row_end_reverse.start_index_floor = max(int(row_end_reverse.start_index_floor), int(next_index))
                 row_end_reverse.row_change_sync_until = time.monotonic() + 0.45
                 row_end_reverse.row_change_sync_sent = False
-                row_end_reverse.post_row_change_lock_until = time.monotonic() + 1.0
-                row_entry_assist.force_global_only = True
-                row_entry_assist.active = True
+                # After every row change, hand off immediately into the same
+                # forward 2.5m global-entry assist used at startup. Do not add
+                # an extra dead time here, otherwise the car can stop outside
+                # the row before the entry assist begins.
+                row_end_reverse.post_row_change_lock_until = 0.0
+                row_entry_assist.force_global_only = False
+                row_entry_assist.active = False
                 row_entry_assist.handed_off = False
                 row_entry_assist.segment_start_index = -1
                 row_entry_assist.start_along_m = 0.0
@@ -1641,8 +1767,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 )
                 if row_entry_global_window and current_segment is not None:
                     if not row_entry_assist.fresh_start_reset_done:
-                        send_state.reset_motion()
-                        local_controller.clear_motion_history()
+                        _clear_drive_boundary("row_entry_global_start", next_gear="4t4d")
                         row_end_reverse.row_change_sync_until = 0.0
                         row_end_reverse.row_change_sync_sent = False
                         row_end_reverse.forward_mode_sync_until = 0.0
@@ -1716,6 +1841,16 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 tracking_heading = core._tracking_heading(points, motions, target_index, "crab" if row_change_global_window else "4t4d")
                 forward_err, lateral_err = core._body_frame_error(pose, target)
                 heading_err = core.normalize_angle(tracking_heading - pose.yaw)
+                if (
+                    global_control_active
+                    and current_segment is not None
+                    and not reversing_here
+                    and not row_change_global_window
+                ):
+                    rel_x = float(pose.x - current_segment.start_point.x)
+                    rel_y = float(pose.y - current_segment.start_point.y)
+                    segment_lateral = -rel_x * current_segment.unit_y + rel_y * current_segment.unit_x
+                    lateral_err = core._clamp(-segment_lateral, -0.05, 0.05)
                 heading_err_deg, lateral_err = core._smooth_tracking_errors(
                     send_state,
                     math.degrees(heading_err),
@@ -1729,34 +1864,25 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 cmd_vy = 0.0
                 cmd_gear = "4t4d"
                 if reversing_here:
-                    # Reverse global control should use the same reverse-facing control frame
-                    # as the lidar local reverse logic. tracking_heading has already been
-                    # flipped for reverse motion, so lateral_err must also be flipped here.
-                    reverse_lateral_err = -lateral_err
                     cmd_vx = -min(abs(float(args.line_cruise_vx)), 0.16)
-                    cmd_wz = core._clamp(
-                        -(heading_err_deg * 0.72 + reverse_lateral_err * 18.0),
-                        -12.0,
-                        12.0,
-                    )
                     if reverse_row_global_window:
-                        prev_lateral = float(row_end_reverse.last_global_lateral_err)
-                        prev_heading = float(row_end_reverse.last_global_heading_err_deg)
-                        same_side = (
-                            abs(prev_lateral) > 1e-6
-                            and abs(reverse_lateral_err) > abs(prev_lateral) + 0.01
-                            and prev_lateral * reverse_lateral_err > 0.0
-                            and abs(heading_err_deg) > abs(prev_heading) + 1.5
+                        # At row end, reverse the first 1m straight back only.
+                        # Do not let global path tracking inject steering here.
+                        cmd_wz = 0.0
+                        row_end_reverse.last_global_lateral_err = 0.0
+                        row_end_reverse.last_global_heading_err_deg = 0.0
+                        row_end_reverse.runaway_same_side_count = 0
+                    else:
+                        # Non-row-end reverse path keeps the existing global reverse formula.
+                        reverse_lateral_err = -lateral_err
+                        cmd_wz = core._clamp(
+                            -(heading_err_deg * 0.72 + reverse_lateral_err * 18.0),
+                            -12.0,
+                            12.0,
                         )
-                        if same_side:
-                            row_end_reverse.runaway_same_side_count += 1
-                        else:
-                            row_end_reverse.runaway_same_side_count = 0
-                        if row_end_reverse.runaway_same_side_count >= 2:
-                            cmd_wz *= 0.45
-                            cmd_vx *= 0.65
                         row_end_reverse.last_global_lateral_err = float(reverse_lateral_err)
                         row_end_reverse.last_global_heading_err_deg = float(heading_err_deg)
+                        row_end_reverse.runaway_same_side_count = 0
                 else:
                     row_end_reverse.last_global_lateral_err = 0.0
                     row_end_reverse.last_global_heading_err_deg = 0.0
@@ -1788,25 +1914,72 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                         axis_dx = target.x - ref_point.x
                         axis_dy = target.y - ref_point.y
                         if abs(axis_dy) >= abs(axis_dx):
-                            if core._axis_progress_reached(pose.y, target.y, axis_dy, 0.10):
-                                start_index = min(len(points) - 1, target_index + 1)
-                                if start_index > send_state.crab_locked_until:
-                                    send_state.crab_locked_until = -1
-                                    send_state.crab_target_index = -1
-                                    send_state.crab_best_dist = float("inf")
-                                    send_state.crab_diverge_count = 0
-                                time.sleep(0.03)
-                                continue
+                            axis_reached = core._axis_progress_reached(pose.y, target.y, axis_dy, 0.05)
                         else:
-                            if core._axis_progress_reached(pose.x, target.x, axis_dx, 0.10):
-                                start_index = min(len(points) - 1, target_index + 1)
-                                if start_index > send_state.crab_locked_until:
-                                    send_state.crab_locked_until = -1
-                                    send_state.crab_target_index = -1
-                                    send_state.crab_best_dist = float("inf")
-                                    send_state.crab_diverge_count = 0
+                            axis_reached = core._axis_progress_reached(pose.x, target.x, axis_dx, 0.05)
+                        next_segment = _next_forward_segment(forward_segments, target_index + 1)
+                        has_next_forward_segment = next_segment is not None
+                        next_lateral_err = (
+                            abs(_segment_lateral_error(next_segment, pose))
+                            if has_next_forward_segment
+                            else float("inf")
+                        )
+                        strict_crab_finish = (
+                            axis_reached
+                            and dist <= 0.12
+                            and next_lateral_err <= 0.08
+                        )
+                        # After crab row-change, lateral alignment to the next
+                        # forward row is the important part. Any remaining
+                        # along-row offset can be consumed by the forward
+                        # global-entry assist before lidarun takes over.
+                        aligned_crab_finish = has_next_forward_segment and next_lateral_err <= 0.06
+                        crab_finish_ready = strict_crab_finish or aligned_crab_finish
+                        if time.monotonic() - last_crab_align_log >= 1.0:
+                            align_msg = (
+                                f"Hybrid crab align: axis_reached={axis_reached} "
+                                f"target_dist={dist:.2f} next_lateral_err={next_lateral_err:.2f} "
+                                f"ready={crab_finish_ready} target_index={target_index}"
+                            )
+                            core.log(align_msg)
+                            _append_hybrid_log(hybrid_run_log, align_msg)
+                            last_crab_align_log = time.monotonic()
+                        if crab_finish_ready:
+                            next_forward_start = min(
+                                len(points) - 1,
+                                _next_forward_segment_start_index(forward_segments, motions, target_index + 1),
+                            )
+                            if next_forward_start <= start_index:
+                                align_msg = (
+                                    f"Hybrid crab handoff skipped at mission tail: "
+                                    f"target_index={target_index} next_start_index={next_forward_start}"
+                                )
+                                core.log(align_msg)
+                                _append_hybrid_log(hybrid_run_log, align_msg)
+                                start_index = len(points)
                                 time.sleep(0.03)
                                 continue
+                            align_msg = (
+                                f"Hybrid crab handoff: target_index={target_index} "
+                                f"next_start_index={next_forward_start}"
+                            )
+                            core.log(align_msg)
+                            _append_hybrid_log(hybrid_run_log, align_msg)
+                            start_index = next_forward_start
+                            row_entry_assist.force_global_only = True
+                            row_entry_assist.active = True
+                            row_entry_assist.handed_off = False
+                            row_entry_assist.segment_start_index = -1
+                            row_entry_assist.start_along_m = 0.0
+                            row_entry_assist.start_along_valid = False
+                            row_entry_assist.fresh_start_reset_done = False
+                            if start_index > send_state.crab_locked_until:
+                                send_state.crab_locked_until = -1
+                                send_state.crab_target_index = -1
+                                send_state.crab_best_dist = float("inf")
+                                send_state.crab_diverge_count = 0
+                            time.sleep(0.03)
+                            continue
                         vy_cap = 0.25
                         cmd_vx = 0.0
                         cmd_vy = core._clamp(lateral_err * 1.15, -vy_cap, vy_cap)
@@ -1906,8 +2079,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     )
                     core.log(end_reverse_msg)
                     _append_hybrid_log(hybrid_run_log, end_reverse_msg)
-                    core._hold_current_gear_stop(controller, send_state, current_gear)
-                    local_controller.clear_motion_history()
+                    _clear_drive_boundary("reverse_segment_finished", next_gear="4t4d")
                     row_end_reverse.stop_until = time.monotonic() + reverse_stop_pause_s
                     row_end_reverse.hard_stop_sent = True
                     row_end_reverse.pending_next_index = next_index
