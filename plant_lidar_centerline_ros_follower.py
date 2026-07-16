@@ -407,6 +407,8 @@ class PlantRowFollower(Node):
         self.last_good_right_line: tuple[float, float] | None = None
         self.last_good_mode = ""
         self.last_following_wz_deg = 0.0
+        self.reverse_start_valid_frames = 0
+        self.reverse_start_locked = False
         self.send_state = MotionSendState.create()
         self.drive_enable = False
         self.row_cfg = RowFollowerConfig(
@@ -457,8 +459,21 @@ class PlantRowFollower(Node):
             payload = json.loads(msg.data)
         except Exception:
             payload = {}
-        self.drive_enable = bool(payload.get("enable", False))
-        self.args.reverse = bool(payload.get("reverse", False))
+        next_enable = bool(payload.get("enable", False))
+        next_reverse = bool(payload.get("reverse", False))
+        if next_enable and (not self.drive_enable or next_reverse != bool(self.args.reverse)):
+            self.last_good_time = 0.0
+            self.last_cmd_vx = 0.0
+            self.last_cmd_wz = 0.0
+            self.last_good_cmd = BodyCommand(gear=self.args.gear, vx=0.0, vy=0.0, wz=0.0)
+            self.last_good_center_line = None
+            self.last_good_left_line = None
+            self.last_good_right_line = None
+            self.last_good_mode = ""
+            self.reverse_start_valid_frames = 0
+            self.reverse_start_locked = False
+        self.drive_enable = next_enable
+        self.args.reverse = next_reverse
         self.args.low_beam = bool(payload.get("low_beam", self.args.low_beam))
         try:
             self.args.speed = abs(float(payload.get("cruise_vx", self.args.speed)))
@@ -656,6 +671,7 @@ class PlantRowFollower(Node):
         reverse_sign_hold_active = False
         reverse_heading_conflict = False
         reverse_sign_flip_blocked = False
+        reverse_turn_slowdown_active = False
         wz_zeroed_reason = ""
         reverse_lat_term_deg = 0.0
         reverse_heading_term_deg = 0.0
@@ -769,6 +785,13 @@ class PlantRowFollower(Node):
                 and abs(heading_error_deg) <= 0.5
             ):
                 final_wz_deg = 0.0
+            reverse_turn_demand_deg = max(abs(target_wz_deg), abs(final_wz_deg))
+            if (
+                reverse_turn_demand_deg >= float(self.args.reverse_turn_slowdown_wz_deg)
+                or reverse_sign_flip_blocked
+            ):
+                vx *= float(self.args.reverse_turn_slowdown_scale)
+                reverse_turn_slowdown_active = True
             wz_raw = math.radians(target_wz_deg)
             wz = math.radians(final_wz_deg)
         else:
@@ -866,6 +889,7 @@ class PlantRowFollower(Node):
             reverse_heading_term_applied_deg=reverse_heading_term_applied_deg,
             reverse_heading_conflict=reverse_heading_conflict,
             reverse_sign_flip_blocked=reverse_sign_flip_blocked,
+            reverse_turn_slowdown_active=reverse_turn_slowdown_active,
             reverse_sign_hold_active=reverse_sign_hold_active,
             wz_zeroed_reason=wz_zeroed_reason,
             slow_ratio=slow_ratio,
@@ -981,7 +1005,7 @@ class PlantRowFollower(Node):
             self.last_estimate = RowEstimate(found=False, mode="scan_timeout")
             hold_phase = "scan_timeout_hold_reverse" if bool(self.args.reverse) else "scan_timeout_hold_forward"
             hold_limit_deg = float(self.args.reverse_lost_soft_max_wz_deg) if bool(self.args.reverse) else float(self.args.forward_lost_hold_max_wz_deg)
-            hold_scale = 1.0 if bool(self.args.reverse) else float(self.args.forward_lost_hold_wz_scale)
+            hold_scale = 0.0 if bool(self.args.reverse) else float(self.args.forward_lost_hold_wz_scale)
             if self._hold_last_good_command(
                 estimate=self.last_estimate,
                 control_phase=hold_phase,
@@ -1005,9 +1029,42 @@ class PlantRowFollower(Node):
         estimate = self._estimate_row(scan)
         self.last_estimate = estimate
         if estimate.found:
+            if bool(self.args.reverse):
+                self.reverse_start_valid_frames += 1
+                lock_frames = max(1, int(self.args.reverse_start_lock_frames))
+                if not self.reverse_start_locked and self.reverse_start_valid_frames < lock_frames:
+                    self._set_debug_snapshot(
+                        estimate=estimate,
+                        found=True,
+                        control_phase="reverse_start_lock",
+                        stop_reason="waiting_stable_reverse_centerline",
+                        final_vx=0.0,
+                        final_wz=0.0,
+                        warning="waiting_stable_reverse_centerline",
+                        reverse_start_valid_frames=self.reverse_start_valid_frames,
+                        reverse_start_lock_frames=lock_frames,
+                    )
+                    self._send_stop()
+                    return
+                self.reverse_start_locked = True
             self.last_found_time = now
             self.last_good_time = now
             cmd = self._make_command(estimate)
+            if bool(self.args.reverse):
+                ramp_frames = max(lock_frames, int(self.args.reverse_start_ramp_frames))
+                if self.reverse_start_valid_frames < ramp_frames:
+                    max_start_wz = math.radians(abs(float(self.args.reverse_start_max_wz_deg)))
+                    cmd.wz = max(-max_start_wz, min(max_start_wz, float(cmd.wz)))
+                    self.last_debug.update(
+                        {
+                            "control_phase": "reverse_start_ramp",
+                            "reverse_start_valid_frames": self.reverse_start_valid_frames,
+                            "reverse_start_ramp_frames": ramp_frames,
+                            "reverse_start_max_wz_deg": float(self.args.reverse_start_max_wz_deg),
+                            "final_wz_deg": math.degrees(float(cmd.wz)),
+                            "wz_cmd_deg": math.degrees(float(cmd.wz)),
+                        }
+                    )
             cmd.gear = self._normalized_gear()
             self.last_good_cmd = cmd
             self.last_good_estimate = estimate
@@ -1020,6 +1077,8 @@ class PlantRowFollower(Node):
             self.last_cmd_wz = float(cmd.wz)
             self._send_drive(cmd.gear, float(cmd.vx), float(cmd.wz))
         else:
+            if bool(self.args.reverse):
+                self.reverse_start_valid_frames = 0
             last_good_age = now - self.last_good_time if self.last_good_time > 0.0 else float("inf")
             if not bool(self.args.reverse) and self._hold_last_good_command(
                 estimate=estimate,
@@ -1036,7 +1095,7 @@ class PlantRowFollower(Node):
                 stop_reason=estimate.reject_reason or estimate.mode or "lost_hold_reverse",
                 warning=str(getattr(estimate, "warning", "") or "") or "lost_hold_reverse",
                 wz_limit_deg=float(self.args.reverse_lost_soft_max_wz_deg),
-                wz_scale=1.0,
+                wz_scale=0.0,
             ):
                 return
             self._set_debug_snapshot(
@@ -1158,6 +1217,9 @@ class PlantRowFollower(Node):
                         "reverse_heading_term_applied_deg": round(float(self.last_debug.get("reverse_heading_term_applied_deg", 0.0)), 4),
                         "reverse_heading_conflict": bool(self.last_debug.get("reverse_heading_conflict", False)),
                         "reverse_sign_flip_blocked": bool(self.last_debug.get("reverse_sign_flip_blocked", False)),
+                        "reverse_turn_slowdown_active": bool(
+                            self.last_debug.get("reverse_turn_slowdown_active", False)
+                        ),
                         "wz_zeroed_reason": self.last_debug.get("wz_zeroed_reason", ""),
                         "lost_hold_forward": bool(self.last_debug.get("lost_hold_forward", False)),
                         "last_good_age_sec": round(float(self.last_debug.get("last_good_age_sec", 0.0)), 4),
@@ -1312,7 +1374,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reverse-wz-enable-error-y", type=float, default=0.004)
     parser.add_argument("--reverse-wz-enable-heading-deg", type=float, default=1.0)
     parser.add_argument("--reverse-min-wz-error-y", type=float, default=0.025)
-    parser.add_argument("--reverse-sign-flip-guard-error-y", type=float, default=0.02)
+    parser.add_argument("--reverse-sign-flip-guard-error-y", type=float, default=0.06)
     parser.add_argument("--reverse-sign-flip-guard-last-wz-deg", type=float, default=1.5)
     parser.add_argument("--reverse-sign-hold-error-y", type=float, default=0.0)
     parser.add_argument("--reverse-both-sides-k-lat", type=float, default=1.2)
@@ -1323,12 +1385,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reverse-steer-sign", type=float, default=-1.0)
     parser.add_argument("--reverse-heading-conflict-error-y", type=float, default=0.01)
     parser.add_argument("--reverse-heading-max-ratio", type=float, default=0.35)
+    parser.add_argument("--reverse-turn-slowdown-wz-deg", type=float, default=3.0)
+    parser.add_argument("--reverse-turn-slowdown-scale", type=float, default=0.6)
     parser.add_argument("--reverse-error-stop", type=float, default=0.28)
     parser.add_argument("--reverse-wz-smoothing-alpha", type=float, default=0.0)
     parser.add_argument("--reverse-lost-hold-sec", type=float, default=0.35)
     parser.add_argument("--reverse-lost-stop-sec", type=float, default=0.80)
     parser.add_argument("--reverse-lost-hold-max-wz-deg", type=float, default=1.5)
     parser.add_argument("--reverse-lost-soft-max-wz-deg", type=float, default=0.8)
+    parser.add_argument("--reverse-start-lock-frames", type=int, default=3)
+    parser.add_argument("--reverse-start-ramp-frames", type=int, default=8)
+    parser.add_argument("--reverse-start-max-wz-deg", type=float, default=0.8)
     parser.add_argument("--max-wz-delta-deg-per-cycle", type=float, default=1.0)
     parser.add_argument("--enable-4t4d-steering-assist", action="store_true")
     parser.add_argument("--steering-assist-wheelbase-m", type=float, default=0.85)

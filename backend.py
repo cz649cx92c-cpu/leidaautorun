@@ -755,6 +755,9 @@ class DirectLocalLidarController:
         follower_args.reverse_lost_stop_sec = float(args.lidar_reverse_lost_stop_sec)
         follower_args.reverse_lost_hold_max_wz_deg = float(args.lidar_reverse_lost_hold_max_wz_deg)
         follower_args.reverse_lost_soft_max_wz_deg = float(args.lidar_reverse_lost_soft_max_wz_deg)
+        follower_args.reverse_start_lock_frames = int(args.lidar_reverse_start_lock_frames)
+        follower_args.reverse_start_ramp_frames = int(args.lidar_reverse_start_ramp_frames)
+        follower_args.reverse_start_max_wz_deg = float(args.lidar_reverse_start_max_wz_deg)
         follower_args.max_wz_delta_deg_per_cycle = float(args.lidar_max_wz_delta_deg_per_cycle)
         follower_args.enable_4t4d_steering_assist = bool(args.lidar_enable_4t4d_steering_assist)
         follower_args.steering_assist_wheelbase_m = float(args.lidar_steering_assist_wheelbase_m)
@@ -952,6 +955,11 @@ class DirectLocalLidarController:
         vehicle_direction_angle_deg: float = 0.0,
     ) -> None:
         del gear, target_center_offset_px, vehicle_direction_angle_deg
+        mode_changed = bool(enable) and (
+            not bool(self._node.drive_enable) or bool(reverse) != bool(self._node.args.reverse)
+        )
+        if mode_changed:
+            self._node.clear_motion_history()
         self._node.drive_enable = bool(enable)
         self._node.args.reverse = bool(reverse)
         self._node.args.low_beam = bool(low_beam)
@@ -2268,7 +2276,7 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-reverse-wz-enable-error-y", type=float, default=0.004)
     parser.add_argument("--lidar-reverse-wz-enable-heading-deg", type=float, default=1.0)
     parser.add_argument("--lidar-reverse-min-wz-error-y", type=float, default=0.025)
-    parser.add_argument("--lidar-reverse-sign-flip-guard-error-y", type=float, default=0.02)
+    parser.add_argument("--lidar-reverse-sign-flip-guard-error-y", type=float, default=0.06)
     parser.add_argument("--lidar-reverse-sign-flip-guard-last-wz-deg", type=float, default=1.5)
     parser.add_argument("--lidar-reverse-sign-hold-error-y", type=float, default=0.0)
     parser.add_argument("--lidar-reverse-both-sides-k-lat", type=float, default=1.2)
@@ -2288,6 +2296,9 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-reverse-lost-stop-sec", type=float, default=0.80)
     parser.add_argument("--lidar-reverse-lost-hold-max-wz-deg", type=float, default=1.5)
     parser.add_argument("--lidar-reverse-lost-soft-max-wz-deg", type=float, default=0.8)
+    parser.add_argument("--lidar-reverse-start-lock-frames", type=int, default=3)
+    parser.add_argument("--lidar-reverse-start-ramp-frames", type=int, default=8)
+    parser.add_argument("--lidar-reverse-start-max-wz-deg", type=float, default=0.8)
     parser.add_argument("--lidar-max-wz-delta-deg-per-cycle", type=float, default=1.0)
     parser.add_argument("--lidar-enable-4t4d-steering-assist", action="store_true")
     parser.add_argument("--lidar-steering-assist-wheelbase-m", type=float, default=0.85)
