@@ -726,7 +726,7 @@ HTML_PAGE = """<!doctype html>
       justify-content: space-between;
       gap: 14px;
       align-items: center;
-      padding: 16px 18px;
+      padding: 14px 18px;
       border-radius: var(--radius-lg);
       border: 1px solid var(--line);
       background: var(--panel);
@@ -1360,6 +1360,176 @@ HTML_PAGE = """<!doctype html>
     }
     /* 2026-06 UI polish overrides END */
 
+    /* v7 layout refresh — preserves the established blue / violet palette */
+    .page.control-root {
+      width: min(1840px, 100%);
+      min-height: 100vh;
+      padding: 18px clamp(16px, 2vw, 34px) 30px;
+      gap: 14px;
+    }
+    .topbar {
+      position: relative;
+      top: auto;
+      z-index: auto;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      padding: 16px 18px;
+      border-radius: 20px;
+      background: color-mix(in srgb, var(--ui-panel) 88%, transparent);
+      backdrop-filter: blur(20px);
+    }
+    .brand-block { gap: 12px; }
+    .brand-row { align-items: flex-end; }
+    .summary-strip {
+      grid-template-columns: 116px 150px minmax(180px, 1fr) minmax(180px, 1fr);
+      gap: 0;
+      border-top: 1px solid var(--ui-line-soft);
+      border-bottom: 1px solid var(--ui-line-soft);
+    }
+    .summary-cell {
+      padding: 9px 14px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      border-right: 1px solid var(--ui-line-soft);
+    }
+    .summary-cell:last-child { border-right: 0; }
+    .summary-cell strong { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .topbar-actions { align-self: end; padding-bottom: 0; }
+    .tab-dock {
+      position: relative;
+      top: auto;
+      z-index: auto;
+      padding: 4px 0;
+      pointer-events: auto;
+    }
+    .segmented.nav-tabs { box-shadow: var(--ui-shadow); }
+    .segmented.nav-tabs button { min-width: 94px; }
+    .control-grid {
+      grid-template-columns: 276px minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }
+    .ops-rail {
+      position: sticky;
+      top: 158px;
+      gap: 12px;
+    }
+    .workspace { gap: 18px; }
+    .rail-panel, .panel, .workflow-step, .subpanel, .deferred-intro, .locked-stage {
+      box-shadow: none;
+    }
+    .rail-panel {
+      padding: 15px;
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--ui-panel) 92%, transparent);
+    }
+    .rail-metric {
+      padding: 11px 0;
+      border: 0;
+      border-radius: 0;
+      border-bottom: 1px solid var(--ui-line-soft);
+      background: transparent;
+    }
+    .rail-metric:last-child { border-bottom: 0; padding-bottom: 0; }
+    .status-line.compact { padding: 10px 0; border: 0; border-bottom: 1px solid var(--ui-line-soft); border-radius: 0; background: transparent; }
+    .status-line.compact:last-child { border-bottom: 0; padding-bottom: 0; }
+    .overview-grid {
+      grid-template-columns: minmax(0, 1.56fr) minmax(310px, .74fr);
+      gap: 18px;
+    }
+    .preview-panel {
+      grid-row: span 2;
+      padding: 16px;
+      border-radius: 18px;
+    }
+    .preview-stage { border-radius: 12px; }
+    .preview { aspect-ratio: 16 / 8.5; }
+    .status-panel, .console-panel { border-radius: 14px; }
+    .properties { grid-template-columns: 104px 1fr; gap: 0; border-top: 1px solid var(--ui-line-soft); }
+    .properties > div { padding: 10px 0; border: 0; border-bottom: 1px solid var(--ui-line-soft); border-radius: 0; background: transparent; }
+    .properties > div:nth-child(even) { font-weight: 620; }
+    .console-panel textarea { min-height: 224px; }
+    .workflow-shell { gap: 16px; }
+    .workflow-board.primary-workflow { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+    .workflow-board.secondary-workflow { grid-template-columns: minmax(0, .82fr) minmax(0, 1.18fr); gap: 14px; }
+    .workflow-step {
+      min-height: 270px;
+      padding: 18px;
+      border-radius: 16px;
+    }
+    .workflow-step.drive { min-height: 0; }
+    .step-number { margin-bottom: 4px; }
+    .workflow-copy { min-height: 64px; }
+    .workflow-copy h2 { font-size: 18px; }
+    .step-dependency { margin-top: auto; }
+    .locked-stage { border-style: solid; border-radius: 16px; }
+    .settings-layout { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
+    .tuning-main-stack { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
+    .settings-layout.tuning-layout { grid-template-columns: minmax(0, 1fr); }
+    .tuning-main-stack > .panel { padding: 18px; }
+    .subpanel { padding:14px; background: var(--ui-strong-surface); }
+    .note { box-shadow: none; }
+    button { letter-spacing: .01em; }
+    .status-dot { animation: uiStatusPulse 2.4s ease-in-out infinite; }
+    @keyframes uiStatusPulse { 50% { transform: scale(1.18); opacity: .72; } }
+    .tab-panel.active { animation: workspaceEnter 280ms cubic-bezier(.2,.7,.2,1); }
+    @keyframes workspaceEnter { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .workflow-step, .panel { transition: border-color 180ms ease, transform 180ms ease; }
+    .workflow-step:hover, .panel:hover { transform: translateY(-2px); border-color: var(--ui-line); }
+    @media (max-width: 1360px) {
+      .topbar, .control-grid, .overview-grid, .settings-layout { grid-template-columns: 1fr; }
+      .topbar { position: relative; top: auto; }
+      .tab-dock, .ops-rail { position: relative; top: auto; }
+      .ops-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .preview-panel { grid-row: auto; }
+    }
+    @media (max-width: 820px) {
+      .page.control-root { padding: 10px; }
+      .summary-strip, .workflow-board.primary-workflow, .workflow-board.secondary-workflow, .tuning-main-stack { grid-template-columns: 1fr; }
+      .summary-cell { border-right: 0; border-bottom: 1px solid var(--ui-line-soft); }
+      .summary-cell:last-child { border-bottom: 0; }
+      .ops-rail { grid-template-columns: 1fr; }
+      .topbar-actions { justify-content: flex-start; }
+    }
+
+    /* visual QA: prevent dense status labels from competing for the same line */
+    h2 { font-size: 16px; line-height: 1.25; }
+    .brand-kicker, .summary-label, .rail-metric span { font-size: 10.5px; }
+    .panel-sub, .workflow-copy p, .locked-stage p { font-size: 12px; line-height: 1.5; }
+    .rail-title-row, .panel-head.tight, .brand-row {
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .rail-title-row h2, .panel-head.tight > div:first-child { min-width: 0; }
+    .status-badge {
+      max-width: 100%;
+      min-height: 28px;
+      padding: 5px 10px;
+      line-height: 1.15;
+      text-align: center;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+    .status-line.compact { align-items: flex-start; }
+    .status-line.compact > div:first-child { min-width: 0; }
+    .status-line.compact .status-badge { flex: 0 1 auto; }
+    .workflow-copy h2 { font-size: 19px; line-height: 1.15; }
+    .workflow-copy p { max-width: 34ch; }
+    .field label, label { font-size: 12px; }
+    input, select, textarea { font-size: 13px; }
+    .summary-cell { min-width: 0; }
+    @media (max-width: 820px) {
+      h1 { font-size: clamp(28px, 8vw, 34px); }
+      .top-status-cluster { width: 100%; justify-content: flex-start; }
+      .rail-title-row, .panel-head.tight { align-items: flex-start; }
+      .rail-title-row .status-badge { width: fit-content; }
+      .status-line.compact { display: grid; grid-template-columns: 1fr; gap: 7px; }
+      .status-line.compact .status-badge { width: fit-content; max-width: 100%; }
+      .summary-cell strong { white-space: normal; overflow: visible; text-overflow: clip; }
+    }
+
+
   </style>
 </head>
 <body data-theme="dark">
@@ -1367,9 +1537,8 @@ HTML_PAGE = """<!doctype html>
   <div class="page control-root">
     <header class="topbar">
       <div class="brand-block">
-        <div class="brand-kicker">ODIN / UGV CONTROL</div>
         <div class="brand-row">
-          <h1>autorun_final</h1>
+          <h1>autorun</h1>
           <div class="top-status-cluster">
             <div class="status-pill"><span class="status-dot"></span><span id="cameraStatus">Camera stopped</span></div>
             <div class="status-pill compact"><strong id="canStateSummary">CAN --</strong></div>
