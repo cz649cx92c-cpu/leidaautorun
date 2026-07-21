@@ -78,8 +78,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "line_kp_offset": "7.0",
     "line_kp_heading": "0.08",
     "line_max_wz": "1.6",
-    "local_weight_in_row": "0.75",
-    "global_weight_in_row": "0.25",
     "mapping_recorddata": False,
 }
 
@@ -1591,8 +1589,8 @@ HTML_PAGE = """<!doctype html>
               <strong id="previewSource">Waiting for preview stream</strong>
             </div>
             <div class="rail-metric">
-              <span>Guidance Blend</span>
-              <strong id="guidanceBlendSummary">local 0.75 / global 0.25</strong>
+              <span>Guidance Mode</span>
+              <strong>Lidar in-row / staged global</strong>
             </div>
             <div class="rail-metric">
               <span>Projection</span>
@@ -1768,8 +1766,8 @@ HTML_PAGE = """<!doctype html>
                   </div>
                   <div class="field-inline">
                     <div class="field">
-                      <label>Blend Summary</label>
-                      <div class="step-dependency"><strong id="guidanceBlendTaskSummary">local 0.75 / global 0.25</strong><br>Tune weights and projection in <code>Tuning</code>.</div>
+                      <label>Control Strategy</label>
+                      <div class="step-dependency"><strong>Lidar in-row / staged global</strong><br>Global control is used only for mission transition stages.</div>
                     </div>
                   </div>
                   <div class="step-dependency" id="driveDependency"><strong>Localization Ready</strong><br>Choose a mission on the active map, then begin hybrid drive.</div>
@@ -1835,7 +1833,7 @@ HTML_PAGE = """<!doctype html>
                 <div class="panel-head tight">
                   <div>
                     <h2>Line Guidance</h2>
-                    <div class="panel-sub">Row-follow and blend parameters.</div>
+                    <div class="panel-sub">Normal row-follow speed. Control-source switching is stage based.</div>
                   </div>
                   <div class="status-badge">Saved globally</div>
                 </div>
@@ -1843,10 +1841,7 @@ HTML_PAGE = """<!doctype html>
                   <div class="field-inline">
                     <div class="field"><label for="lineCruiseVx">Cruise vx</label><input id="lineCruiseVx"></div>
                   </div>
-                  <div class="field-inline">
-                    <div class="field"><label for="localWeight">Local Weight</label><input id="localWeight"></div>
-                    <div class="field"><label for="globalWeight">Global Weight</label><input id="globalWeight"></div>
-                  </div>
+                  <div class="note"><strong>Control source</strong><br>Normal row travel uses lidar guidance. Startup, row-end, reverse transition, and crab row-change stages use global path control.</div>
                 </div>
               </div>
 
@@ -1894,8 +1889,8 @@ HTML_PAGE = """<!doctype html>
     let consoleAutoFollow = true;
     const defaultTheme = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
     const editableFieldIds = [
-      'mapName', 'missionName', 'lineCruiseVx', 'localWeight',
-      'globalWeight', 'mappingRecorddata', 'sensorHeight', 'bodyXOffset',
+      'mapName', 'missionName', 'lineCruiseVx',
+      'mappingRecorddata', 'sensorHeight', 'bodyXOffset',
       'bodyYOffset', 'rollGain', 'pitchGain'
     ];
 
@@ -2194,12 +2189,6 @@ HTML_PAGE = """<!doctype html>
       document.getElementById('missionDeleteSummary').textContent = libraryMission ? libraryMission.label : 'No mission selected.';
       renderMissionPreview(data.selected_library_mission_preview || null);
 
-      const guidanceBlendText = 'local ' + (data.settings.local_weight_in_row || '--') + ' / global ' + (data.settings.global_weight_in_row || '--');
-      document.getElementById('guidanceBlendSummary').textContent = guidanceBlendText;
-      document.getElementById('guidanceBlendTaskSummary').textContent = guidanceBlendText;
-      const guidanceBlendSummaryTuning = document.getElementById('guidanceBlendSummaryTuning');
-      if (guidanceBlendSummaryTuning) guidanceBlendSummaryTuning.textContent = guidanceBlendText;
-
       document.getElementById('projectionSummary').textContent =
         'h=' + (data.settings.sensor_height_m || '--') +
         ', x=' + (data.settings.body_x_offset_m || '--') +
@@ -2216,8 +2205,6 @@ HTML_PAGE = """<!doctype html>
       updateFieldIfClean('missionName', data.mission_name || '');
       updateFieldIfClean('mappingRecorddata', !!data.settings.mapping_recorddata, true);
       updateFieldIfClean('lineCruiseVx', data.settings.line_cruise_vx || '');
-      updateFieldIfClean('localWeight', data.settings.local_weight_in_row || '');
-      updateFieldIfClean('globalWeight', data.settings.global_weight_in_row || '');
       updateFieldIfClean('sensorHeight', data.settings.sensor_height_m || '');
       updateFieldIfClean('bodyXOffset', data.settings.body_x_offset_m || '');
       updateFieldIfClean('bodyYOffset', data.settings.body_y_offset_m || '');
@@ -2249,8 +2236,6 @@ HTML_PAGE = """<!doctype html>
     async function saveSettings() {
       await api('/api/settings', 'POST', {
         line_cruise_vx: document.getElementById('lineCruiseVx').value,
-        local_weight_in_row: document.getElementById('localWeight').value,
-        global_weight_in_row: document.getElementById('globalWeight').value,
         sensor_height_m: document.getElementById('sensorHeight').value,
         body_x_offset_m: document.getElementById('bodyXOffset').value,
         body_y_offset_m: document.getElementById('bodyYOffset').value,
@@ -2951,12 +2936,18 @@ class WebController:
             mission_path = self.library_mission_paths.get(mission_id) or self.mission_paths.get(mission_id)
             if mission_path is None:
                 raise RuntimeError("No mission selected.")
-            if MISSIONS_DIR not in mission_path.parents:
+            resolved_mission_path = mission_path.resolve()
+            allowed_parents = {MISSIONS_DIR.resolve()}
+            allowed_parents.update(
+                map_path.parent.resolve()
+                for map_path in self.map_paths.values()
+            )
+            if resolved_mission_path.parent not in allowed_parents:
                 raise RuntimeError(f"Refusing to delete mission outside workspace: {mission_path}")
-            csv_path = mission_path.with_suffix(".csv")
-            deleted_names = [mission_path.name]
-            if mission_path.exists():
-                mission_path.unlink()
+            csv_path = resolved_mission_path.with_suffix(".csv")
+            deleted_names = [resolved_mission_path.name]
+            if resolved_mission_path.exists():
+                resolved_mission_path.unlink()
             if csv_path.exists():
                 csv_path.unlink()
                 deleted_names.append(csv_path.name)
@@ -3035,19 +3026,11 @@ class WebController:
             "--line-kp-offset", str(self.settings.get("line_kp_offset") or "7.0"),
             "--line-kp-heading", str(self.settings.get("line_kp_heading") or "0.08"),
             "--line-max-wz", str(self.settings.get("line_max_wz") or "1.6"),
-            "--local-weight-in-row", str(self.settings.get("local_weight_in_row") or "0.5"),
-            "--global-weight-in-row", str(self.settings.get("global_weight_in_row") or "0.5"),
             "--lidar-yaw-correction-deg", DEFAULT_LIDAR_YAW_CORRECTION_DEG,
             "--lidar-x-offset-m", DEFAULT_LIDAR_X_OFFSET_M,
             "--lidar-y-offset-m", DEFAULT_LIDAR_Y_OFFSET_M,
         ]
         return args
-
-    def _hybrid_local_guidance_enabled(self) -> bool:
-        try:
-            return float(str(self.settings.get("local_weight_in_row") or "0.5")) > 1e-6
-        except Exception:
-            return True
 
     def _uvc_preview_args(self) -> list[str]:
         return [
@@ -3238,10 +3221,7 @@ class WebController:
                 self.pending_action = "drive"
                 self._log("Hybrid drive will start automatically after localization becomes ready.")
                 return
-            if self._hybrid_local_guidance_enabled():
-                self._start_uvc_preview_publisher(auto=True)
-            else:
-                self._start_uvc_preview_publisher(auto=True)
+            self._start_uvc_preview_publisher(auto=True)
             self._start_camera_monitor()
             self._start_task(
                 "Hybrid Drive",

@@ -13,7 +13,5 @@
   "line_kp_offset": "7.0",
   "line_kp_heading": "0.08",
   "line_max_wz": "1.6",
-  "local_weight_in_row": "1",
-  "global_weight_in_row": "0",
   "mapping_recorddata": false
 }

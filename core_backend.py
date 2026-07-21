@@ -909,22 +909,24 @@ def _target_heading(points: list[Pose2D], index: int) -> float:
 
 def _resolve_replay_gear(motion: dict[str, Any], current_gear: str | None) -> str:
     gear = str(motion.get('gear') or '')
+    vx = abs(float(motion.get('vx', 0.0) or 0.0))
+    vy = abs(float(motion.get('vy', 0.0) or 0.0))
+    wz = abs(float(motion.get('wz', 0.0) or 0.0))
     if gear == 'crab':
         return 'crab'
     if gear == '4t4d':
         return '4t4d'
-    # Treat raw gear code 7 as a transient chassis state, not a drivable replay mode.
-    # This keeps autorun from handing off into recorded transition frames between
-    # crab and real 4t4d forward motion.
-    if gear == '7':
-        return current_gear or '4t4d'
-    if gear in {'park', 'neutral', '', '--'}:
-        return current_gear or '4t4d'
-    vx = abs(float(motion.get('vx', 0.0) or 0.0))
-    vy = abs(float(motion.get('vy', 0.0) or 0.0))
-    wz = abs(float(motion.get('wz', 0.0) or 0.0))
+    # Unknown/raw feedback values are not executable drive modes.  Infer the
+    # commanded replay mode from the recorded motion: dominant lateral travel
+    # is a crab row change; zero-motion samples inside that segment remain crab
+    # until a real 4t4d sample appears.  This function only returns canonical
+    # command modes ("4t4d" or "crab").
     if vy > max(0.03, vx * 1.2):
         return 'crab'
+    if current_gear == 'crab' and gear not in {'park', 'neutral'}:
+        return 'crab'
+    if gear in {'park', 'neutral', '', '--'}:
+        return current_gear or '4t4d'
     if vx > 0.03 or wz > 3.0:
         return '4t4d'
     return current_gear or '4t4d'
@@ -963,7 +965,7 @@ def _find_future_gear_start(motions: list[dict[str, Any]], start_index: int, gea
 
 def _find_gear_segment_end(motions: list[dict[str, Any]], start_index: int, gear: str) -> int:
     end = start_index
-    while end + 1 < len(motions) and _resolve_replay_gear(motions[end + 1], None) == gear:
+    while end + 1 < len(motions) and _resolve_replay_gear(motions[end + 1], gear) == gear:
         end += 1
     return end
 

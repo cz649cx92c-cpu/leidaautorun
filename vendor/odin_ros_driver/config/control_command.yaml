@@ -91,7 +91,7 @@ register_keys:
   
   custom_map_mode: 2
   custom_init_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-  relocalization_map_abs_path: "/home/orangepi/ugv/autorunlida/maps/map_20260629_143606/map_20260629_143606.bin"
+  relocalization_map_abs_path: "/home/orangepi/ugv/autorunlida/maps/map_20260720_154921/map_20260720_154921.bin"
 
   # To get the mapping result file, please use the set_param.sh script provided: "./set_param.sh save_map 1"
   mapping_result_dest_dir: ""

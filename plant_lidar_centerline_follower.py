@@ -679,6 +679,7 @@ class PlantRowFollower(Node):
         reverse_wz_after_limit_deg = 0.0
         reverse_sign_hold_active = False
         reverse_heading_conflict = False
+        reverse_heading_damping_preserved = False
         reverse_sign_flip_blocked = False
         reverse_recenter_active = False
         reverse_turn_slowdown_active = False
@@ -692,6 +693,7 @@ class PlantRowFollower(Node):
         control_frame = "reverse_centerline_track" if reverse else "normal_forward"
         target_wz_deg = 0.0
         limited_wz_deg = 0.0
+        smoothed_wz_deg = 0.0
         wz_delta_limited = False
         lat_term_deg = 0.0
         heading_term_deg = 0.0
@@ -715,8 +717,13 @@ class PlantRowFollower(Node):
             wz_raw = 0.0
         elif reverse:
             vx = -abs(target_speed)
-            k_lat_eff = 24.0
-            k_heading_eff = 0.50
+            # Reverse control used to ignore the exposed tuning parameters and
+            # always ran with aggressive hard-coded gains.  That is especially
+            # unstable on the real 4WS chassis because steering feedback lags
+            # the lidar estimate.  Keep the gains in degrees here (matching the
+            # rest of this reverse branch), but source them from configuration.
+            k_lat_eff = max(0.0, float(self.args.k_reverse_lat))
+            k_heading_eff = max(0.0, float(self.args.k_reverse_heading))
             max_wz_deg = min(5.0, abs(float(self.args.reverse_max_wz_deg)))
             if mode in {"left_only", "right_only"}:
                 max_wz_deg = min(5.0, abs(float(self.args.reverse_one_side_max_wz_deg)))
@@ -739,8 +746,22 @@ class PlantRowFollower(Node):
             heading_term_deg = reverse_heading_term_applied_deg
             if abs(track_error_y) >= float(self.args.reverse_heading_conflict_error_y):
                 if reverse_lat_term_deg * reverse_heading_term_deg < 0.0:
-                    reverse_heading_term_applied_deg = 0.0
+                    # The heading term is damping in this case: it opposes the
+                    # lateral turn because the chassis has already developed a
+                    # row-angle error.  Dropping it completely lets steering
+                    # latency build into a large yaw overshoot.  Preserve a
+                    # bounded amount instead, so lateral recentering continues
+                    # without allowing the body angle to run away.
+                    heading_limit_deg = max(
+                        0.20,
+                        abs(reverse_lat_term_deg) * float(self.args.reverse_heading_max_ratio),
+                    )
+                    reverse_heading_term_applied_deg = max(
+                        -heading_limit_deg,
+                        min(heading_limit_deg, reverse_heading_term_deg),
+                    )
                     reverse_heading_conflict = True
+                    reverse_heading_damping_preserved = True
                 else:
                     heading_limit_deg = abs(reverse_lat_term_deg) * float(self.args.reverse_heading_max_ratio)
                     reverse_heading_term_applied_deg = max(
@@ -750,9 +771,11 @@ class PlantRowFollower(Node):
             heading_term_deg = reverse_heading_term_applied_deg
             base_wz_deg = reverse_lat_term_deg + reverse_heading_term_applied_deg
             reverse_wz_before_min_deg = base_wz_deg
+            reverse_lateral_deadband = max(0.0, float(self.args.reverse_wz_enable_error_y))
+            reverse_heading_deadband = max(0.0, float(self.args.reverse_wz_enable_heading_deg))
             reverse_wz_need_turn = (
-                abs(track_error_y) > 0.004
-                or abs(heading_error_deg) > 0.5
+                abs(track_error_y) > reverse_lateral_deadband
+                or abs(heading_error_deg) > reverse_heading_deadband
             )
             last_wz_deg = math.degrees(float(self.last_cmd_wz))
             allow_min_wz = abs(track_error_y) >= float(self.args.reverse_min_wz_error_y)
@@ -766,11 +789,7 @@ class PlantRowFollower(Node):
                 reverse_wz_need_turn = False
                 target_wz_deg = 0.0
                 wz_zeroed_reason = "reverse_sign_flip_guard"
-            if (
-                not reverse_sign_flip_blocked
-                and abs(track_error_y) <= 0.004
-                and abs(heading_error_deg) <= 0.5
-            ):
+            if not reverse_sign_flip_blocked and not reverse_wz_need_turn:
                 wz_zeroed_reason = "reverse_deadband"
             elif not reverse_sign_flip_blocked:
                 if abs(base_wz_deg) < 1e-9:
@@ -780,7 +799,11 @@ class PlantRowFollower(Node):
                     sign = 1.0 if base_wz_deg >= 0.0 else -1.0
                     abs_target_wz_deg = abs(base_wz_deg)
                     if allow_min_wz:
-                        abs_target_wz_deg = max(abs_target_wz_deg, 1.8)
+                        configured_min_wz_deg = min(
+                            max_wz_deg,
+                            max(0.0, abs(float(self.args.reverse_min_wz_deg))),
+                        )
+                        abs_target_wz_deg = max(abs_target_wz_deg, configured_min_wz_deg)
                     target_wz_deg = sign * min(abs_target_wz_deg, max_wz_deg)
             reverse_wz_after_min_deg = target_wz_deg
             reverse_wz_after_limit_deg = target_wz_deg
@@ -799,13 +822,15 @@ class PlantRowFollower(Node):
             max_delta = max(0.0, float(self.args.max_wz_delta_deg_per_cycle))
             limited_wz_deg = max(last_wz_deg - max_delta, min(last_wz_deg + max_delta, target_wz_deg))
             wz_delta_limited = abs(limited_wz_deg - target_wz_deg) > 1e-9
-            final_wz_deg = limited_wz_deg
-            if (
-                target_wz_deg == 0.0
-                and abs(track_error_y) <= 0.004
-                and abs(heading_error_deg) <= 0.5
-            ):
+            smoothing_alpha = max(0.0, min(0.95, float(self.args.reverse_wz_smoothing_alpha)))
+            smoothed_wz_deg = (
+                smoothing_alpha * last_wz_deg
+                + (1.0 - smoothing_alpha) * limited_wz_deg
+            )
+            final_wz_deg = smoothed_wz_deg
+            if target_wz_deg == 0.0 and (not reverse_wz_need_turn or reverse_sign_flip_blocked):
                 final_wz_deg = 0.0
+                smoothed_wz_deg = 0.0
             reverse_turn_demand_deg = max(abs(target_wz_deg), abs(final_wz_deg))
             if (
                 reverse_turn_demand_deg >= float(self.args.reverse_turn_slowdown_wz_deg)
@@ -916,6 +941,7 @@ class PlantRowFollower(Node):
             reverse_heading_term_deg=reverse_heading_term_deg,
             reverse_heading_term_applied_deg=reverse_heading_term_applied_deg,
             reverse_heading_conflict=reverse_heading_conflict,
+            reverse_heading_damping_preserved=reverse_heading_damping_preserved,
             reverse_sign_flip_blocked=reverse_sign_flip_blocked,
             reverse_recenter_active=reverse_recenter_active,
             reverse_turn_slowdown_active=reverse_turn_slowdown_active,
@@ -926,6 +952,11 @@ class PlantRowFollower(Node):
             effective_max_wz_deg=max_wz_deg,
             max_wz_deg=max_wz_deg,
             reverse_steer_sign=active_reverse_steer_sign,
+            reverse_wz_smoothing_alpha=max(
+                0.0,
+                min(0.95, float(self.args.reverse_wz_smoothing_alpha)),
+            ),
+            smoothed_wz_deg=smoothed_wz_deg,
             display_frame=display_frame,
             control_frame=control_frame,
             reverse_control_transform=reverse_control_transform,
@@ -935,10 +966,10 @@ class PlantRowFollower(Node):
 
         return BodyCommand(gear=self.args.gear, vx=vx, vy=0.0, wz=wz)
 
-    def _send_stop(self) -> None:
+    def _send_stop(self, *, force_brake: bool = False) -> None:
         self.last_cmd_vx = 0.0
         self.last_cmd_wz = 0.0
-        self._send_drive(self.args.gear, 0.0, 0.0, force_brake=False)
+        self._send_drive(self.args.gear, 0.0, 0.0, force_brake=force_brake)
 
     def _hold_last_good_command(
         self,
@@ -1116,16 +1147,16 @@ class PlantRowFollower(Node):
             return
         if scan is None or scan_age > float(self.args.scan_timeout):
             self.last_estimate = RowEstimate(found=False, mode="scan_timeout")
-            hold_phase = "scan_timeout_hold_reverse" if bool(self.args.reverse) else "scan_timeout_hold_forward"
-            hold_limit_deg = float(self.args.reverse_lost_soft_max_wz_deg) if bool(self.args.reverse) else float(self.args.forward_lost_hold_max_wz_deg)
-            hold_scale = 0.0 if bool(self.args.reverse) else float(self.args.forward_lost_hold_wz_scale)
-            if self._hold_last_good_command(
+            if bool(self.args.reverse):
+                self.reverse_start_valid_frames = 0
+                self.reverse_start_locked = False
+            if not bool(self.args.reverse) and self._hold_last_good_command(
                 estimate=self.last_estimate,
-                control_phase=hold_phase,
-                stop_reason=hold_phase,
-                warning=hold_phase,
-                wz_limit_deg=hold_limit_deg,
-                wz_scale=hold_scale,
+                control_phase="scan_timeout_hold_forward",
+                stop_reason="scan_timeout_hold_forward",
+                warning="scan_timeout_hold_forward",
+                wz_limit_deg=float(self.args.forward_lost_hold_max_wz_deg),
+                wz_scale=float(self.args.forward_lost_hold_wz_scale),
             ):
                 return
             self._set_debug_snapshot(
@@ -1136,7 +1167,7 @@ class PlantRowFollower(Node):
                 final_vx=0.0,
                 final_wz=0.0,
             )
-            self._send_stop()
+            self._send_stop(force_brake=bool(self.args.reverse))
             return
 
         estimate = self._estimate_row(scan)
@@ -1157,7 +1188,7 @@ class PlantRowFollower(Node):
                         reverse_start_valid_frames=self.reverse_start_valid_frames,
                         reverse_start_lock_frames=lock_frames,
                     )
-                    self._send_stop()
+                    self._send_stop(force_brake=True)
                     return
                 self.reverse_start_locked = True
             self.last_found_time = now
@@ -1192,6 +1223,7 @@ class PlantRowFollower(Node):
         else:
             if bool(self.args.reverse):
                 self.reverse_start_valid_frames = 0
+                self.reverse_start_locked = False
             last_good_age = now - self.last_good_time if self.last_good_time > 0.0 else float("inf")
             if not bool(self.args.reverse) and self._hold_last_good_command(
                 estimate=estimate,
@@ -1200,15 +1232,6 @@ class PlantRowFollower(Node):
                 warning="lost_hold_forward",
                 wz_limit_deg=float(self.args.forward_lost_hold_max_wz_deg),
                 wz_scale=float(self.args.forward_lost_hold_wz_scale),
-            ):
-                return
-            if bool(self.args.reverse) and self._hold_last_good_command(
-                estimate=estimate,
-                control_phase="lost_hold_reverse",
-                stop_reason=estimate.reject_reason or estimate.mode or "lost_hold_reverse",
-                warning=str(getattr(estimate, "warning", "") or "") or "lost_hold_reverse",
-                wz_limit_deg=float(self.args.reverse_lost_soft_max_wz_deg),
-                wz_scale=0.0,
             ):
                 return
             self._set_debug_snapshot(
@@ -1228,7 +1251,7 @@ class PlantRowFollower(Node):
                 hold_wz_deg=0.0,
                 control_using_last_good_line=False,
             )
-            self._send_stop()
+            self._send_stop(force_brake=bool(self.args.reverse))
 
     def _publish_status(self) -> None:
         estimate = self.last_estimate
@@ -1249,6 +1272,16 @@ class PlantRowFollower(Node):
             "cmd_wz_rad_s": round(float(self.last_cmd_wz), 4),
             "cmd_wz_deg_s": round(math.degrees(float(self.last_cmd_wz)), 4),
             "max_wz_deg": round(min(abs(float(self.args.max_wz_deg)), 5.0), 4),
+            "control_phase": self.last_debug.get("control_phase", ""),
+            "track_error_y": round(float(self.last_debug.get("track_error_y", 0.0)), 4),
+            "heading_error_deg": round(float(self.last_debug.get("heading_error_deg", 0.0)), 4),
+            "target_wz_deg": round(float(self.last_debug.get("target_wz_deg", 0.0)), 4),
+            "limited_wz_deg": round(float(self.last_debug.get("limited_wz_deg", 0.0)), 4),
+            "smoothed_wz_deg": round(float(self.last_debug.get("smoothed_wz_deg", 0.0)), 4),
+            "reverse_heading_damping_preserved": bool(
+                self.last_debug.get("reverse_heading_damping_preserved", False)
+            ),
+            "wz_zeroed_reason": self.last_debug.get("wz_zeroed_reason", ""),
         }
         text = json.dumps(payload, ensure_ascii=True)
         self.status_pub.publish(String(data=text))
@@ -1296,7 +1329,14 @@ class PlantRowFollower(Node):
                         "reverse_heading_term_deg": round(float(self.last_debug.get("reverse_heading_term_deg", 0.0)), 4),
                         "reverse_heading_term_applied_deg": round(float(self.last_debug.get("reverse_heading_term_applied_deg", 0.0)), 4),
                         "reverse_heading_conflict": bool(self.last_debug.get("reverse_heading_conflict", False)),
+                        "reverse_heading_damping_preserved": bool(
+                            self.last_debug.get("reverse_heading_damping_preserved", False)
+                        ),
                         "reverse_sign_flip_blocked": bool(self.last_debug.get("reverse_sign_flip_blocked", False)),
+                        "reverse_wz_smoothing_alpha": round(
+                            float(self.last_debug.get("reverse_wz_smoothing_alpha", 0.0)), 4
+                        ),
+                        "smoothed_wz_deg": round(float(self.last_debug.get("smoothed_wz_deg", 0.0)), 4),
                         "reverse_turn_slowdown_active": bool(
                             self.last_debug.get("reverse_turn_slowdown_active", False)
                         ),
@@ -1447,38 +1487,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reverse-min-speed", type=float, default=0.04)
     parser.add_argument("--reverse-one-side-speed", type=float, default=0.10)
     parser.add_argument("--reverse-both-sides-speed", type=float, default=0.12)
-    parser.add_argument("--reverse-min-wz-deg", type=float, default=2.5)
-    parser.add_argument("--reverse-max-wz-deg", type=float, default=5.0)
-    parser.add_argument("--reverse-one-side-max-wz-deg", type=float, default=5.0)
-    parser.add_argument("--reverse-wz-enable-error-y", type=float, default=0.004)
+    parser.add_argument("--reverse-min-wz-deg", type=float, default=0.6)
+    parser.add_argument("--reverse-max-wz-deg", type=float, default=2.0)
+    parser.add_argument("--reverse-one-side-max-wz-deg", type=float, default=1.5)
+    parser.add_argument("--reverse-wz-enable-error-y", type=float, default=0.010)
     parser.add_argument("--reverse-wz-enable-heading-deg", type=float, default=1.0)
-    parser.add_argument("--reverse-min-wz-error-y", type=float, default=0.025)
+    parser.add_argument("--reverse-min-wz-error-y", type=float, default=0.040)
     parser.add_argument("--reverse-sign-flip-guard-error-y", type=float, default=0.06)
     parser.add_argument("--reverse-sign-flip-guard-last-wz-deg", type=float, default=1.5)
     parser.add_argument("--reverse-sign-hold-error-y", type=float, default=0.0)
     parser.add_argument("--reverse-both-sides-k-lat", type=float, default=1.2)
     parser.add_argument("--reverse-both-sides-k-heading", type=float, default=0.15)
     parser.add_argument("--reverse-one-side-k-lat", type=float, default=1.0)
-    parser.add_argument("--k-reverse-lat", type=float, default=25.0)
-    parser.add_argument("--k-reverse-heading", type=float, default=0.03)
+    parser.add_argument("--k-reverse-lat", type=float, default=12.0)
+    parser.add_argument("--k-reverse-heading", type=float, default=0.12)
     parser.add_argument("--reverse-steer-sign", type=float, default=-1.0)
     parser.add_argument("--reverse-heading-conflict-error-y", type=float, default=0.01)
     parser.add_argument("--reverse-heading-max-ratio", type=float, default=0.35)
     parser.add_argument("--reverse-recenter-error-y", type=float, default=0.06)
     parser.add_argument("--reverse-recenter-heading-deg", type=float, default=6.0)
-    parser.add_argument("--reverse-recenter-scale", type=float, default=0.45)
-    parser.add_argument("--reverse-turn-slowdown-wz-deg", type=float, default=3.0)
-    parser.add_argument("--reverse-turn-slowdown-scale", type=float, default=0.6)
+    parser.add_argument("--reverse-recenter-scale", type=float, default=0.35)
+    parser.add_argument("--reverse-turn-slowdown-wz-deg", type=float, default=1.2)
+    parser.add_argument("--reverse-turn-slowdown-scale", type=float, default=0.5)
     parser.add_argument("--reverse-error-stop", type=float, default=0.28)
-    parser.add_argument("--reverse-wz-smoothing-alpha", type=float, default=0.0)
+    parser.add_argument("--reverse-wz-smoothing-alpha", type=float, default=0.65)
     parser.add_argument("--reverse-lost-hold-sec", type=float, default=0.35)
     parser.add_argument("--reverse-lost-stop-sec", type=float, default=0.80)
     parser.add_argument("--reverse-lost-hold-max-wz-deg", type=float, default=1.5)
     parser.add_argument("--reverse-lost-soft-max-wz-deg", type=float, default=0.8)
     parser.add_argument("--reverse-start-lock-frames", type=int, default=3)
     parser.add_argument("--reverse-start-ramp-frames", type=int, default=8)
-    parser.add_argument("--reverse-start-max-wz-deg", type=float, default=0.8)
-    parser.add_argument("--max-wz-delta-deg-per-cycle", type=float, default=1.0)
+    parser.add_argument("--reverse-start-max-wz-deg", type=float, default=0.6)
+    parser.add_argument("--max-wz-delta-deg-per-cycle", type=float, default=0.25)
     parser.add_argument("--enable-4t4d-steering-assist", action="store_true")
     parser.add_argument("--steering-assist-wheelbase-m", type=float, default=0.85)
     parser.add_argument("--steering-assist-gain", type=float, default=1.0)
