@@ -23,6 +23,7 @@ from fw_mini_controller import BodyCommand, FWMiniController, IOCommand, Steerin
 from fw_mini_status_reader import build_snapshot, decode_msg, open_can_bus  # noqa: E402
 from row_geometry import (  # noqa: E402
     ROBOT_FRAME_BACK,
+    ROBOT_FRAME_FRONT,
     RowEstimate,
     RowFollowerConfig,
     blend_line,
@@ -649,15 +650,16 @@ class PlantRowFollower(Node):
         target_speed = float(self.args.reverse_speed if reverse else self.args.speed)
         center_y_target = float(self.args.center_y_target)
         line_fit = getattr(estimate, "center_line", None)
-        # Reuse the same fitted lines in both directions.  In reverse, extend
-        # the front-observed plant boundaries back to the leading rear edge of
-        # the vehicle (rear body length plus the configured safety margin).
-        # This makes the control reference match the part of the body that can
-        # contact a pot first instead of an arbitrary point 0.60 m behind it.
+        # Reuse the same fitted lines in both directions.  The lidar is mounted
+        # at the front of this vehicle, so its unshifted scan origin is about
+        # one complete body length ahead of the rear edge.  Extend the straight
+        # plant-boundary fits rearward by that full length and control the
+        # virtual centerline at the rear edge.  Lateral safety margin is handled
+        # separately by the rear-corner clearance calculation below.
         forward_lookahead_x = abs(float(self.args.forward_lookahead_x))
         reverse_rear_x = -(
-            abs(float(ROBOT_FRAME_BACK))
-            + max(0.0, float(self.row_cfg.safety_margin))
+            abs(float(ROBOT_FRAME_FRONT))
+            + abs(float(ROBOT_FRAME_BACK))
         )
         effective_lookahead_x = reverse_rear_x if reverse else forward_lookahead_x
         target_y = float(estimate.center_y)
