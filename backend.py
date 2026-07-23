@@ -678,7 +678,6 @@ class DirectLocalLidarController:
         follower_args.max_row_width = float(args.lidar_max_row_width)
         follower_args.lookahead_x = float(args.lidar_lookahead_x)
         follower_args.forward_lookahead_x = float(args.lidar_forward_lookahead_x)
-        follower_args.reverse_lookahead_x = float(args.lidar_reverse_lookahead_x)
         follower_args.forward_min = float(args.lidar_forward_min)
         follower_args.forward_max = float(args.lidar_forward_max)
         follower_args.lateral_limit = float(args.lidar_lateral_limit)
@@ -726,39 +725,12 @@ class DirectLocalLidarController:
         follower_args.forward_lost_stop_sec = float(args.lidar_forward_lost_stop_sec)
         follower_args.forward_lost_hold_wz_scale = float(args.lidar_forward_lost_hold_wz_scale)
         follower_args.forward_lost_hold_max_wz_deg = float(args.lidar_forward_lost_hold_max_wz_deg)
-        follower_args.reverse_min_speed = float(args.lidar_reverse_min_speed)
-        follower_args.reverse_one_side_speed = float(args.lidar_reverse_one_side_speed)
-        follower_args.reverse_both_sides_speed = float(args.lidar_reverse_both_sides_speed)
-        follower_args.reverse_min_wz_deg = float(args.lidar_reverse_min_wz_deg)
+        follower_args.reverse_speed = float(args.lidar_reverse_speed)
+        follower_args.reverse_k_lat = float(args.lidar_reverse_k_lat)
+        follower_args.reverse_k_heading = float(args.lidar_reverse_k_heading)
         follower_args.reverse_max_wz_deg = float(args.lidar_reverse_max_wz_deg)
-        follower_args.reverse_one_side_max_wz_deg = float(args.lidar_reverse_one_side_max_wz_deg)
-        follower_args.reverse_wz_enable_error_y = float(args.lidar_reverse_wz_enable_error_y)
-        follower_args.reverse_wz_enable_heading_deg = float(args.lidar_reverse_wz_enable_heading_deg)
-        follower_args.reverse_min_wz_error_y = float(args.lidar_reverse_min_wz_error_y)
-        follower_args.reverse_sign_flip_guard_error_y = float(args.lidar_reverse_sign_flip_guard_error_y)
-        follower_args.reverse_sign_flip_guard_last_wz_deg = float(args.lidar_reverse_sign_flip_guard_last_wz_deg)
-        follower_args.reverse_sign_hold_error_y = float(args.lidar_reverse_sign_hold_error_y)
-        follower_args.reverse_both_sides_k_lat = float(args.lidar_reverse_both_sides_k_lat)
-        follower_args.reverse_both_sides_k_heading = float(args.lidar_reverse_both_sides_k_heading)
-        follower_args.reverse_one_side_k_lat = float(args.lidar_reverse_one_side_k_lat)
-        follower_args.k_reverse_lat = float(args.lidar_k_reverse_lat)
-        follower_args.k_reverse_heading = float(args.lidar_k_reverse_heading)
         follower_args.reverse_steer_sign = float(args.lidar_reverse_steer_sign)
-        follower_args.reverse_heading_conflict_error_y = float(args.lidar_reverse_heading_conflict_error_y)
-        follower_args.reverse_heading_max_ratio = float(args.lidar_reverse_heading_max_ratio)
-        follower_args.reverse_recenter_error_y = float(args.lidar_reverse_recenter_error_y)
-        follower_args.reverse_recenter_heading_deg = float(args.lidar_reverse_recenter_heading_deg)
-        follower_args.reverse_recenter_scale = float(args.lidar_reverse_recenter_scale)
-        follower_args.reverse_error_stop = float(args.lidar_reverse_error_stop)
-        follower_args.reverse_wz_smoothing_alpha = float(args.lidar_reverse_wz_smoothing_alpha)
-        follower_args.reverse_lost_hold_sec = float(args.lidar_reverse_lost_hold_sec)
-        follower_args.reverse_lost_stop_sec = float(args.lidar_reverse_lost_stop_sec)
-        follower_args.reverse_lost_hold_max_wz_deg = float(args.lidar_reverse_lost_hold_max_wz_deg)
-        follower_args.reverse_lost_soft_max_wz_deg = float(args.lidar_reverse_lost_soft_max_wz_deg)
-        follower_args.reverse_start_lock_frames = int(args.lidar_reverse_start_lock_frames)
-        follower_args.reverse_start_ramp_frames = int(args.lidar_reverse_start_ramp_frames)
-        follower_args.reverse_start_max_wz_deg = float(args.lidar_reverse_start_max_wz_deg)
-        follower_args.max_wz_delta_deg_per_cycle = float(args.lidar_max_wz_delta_deg_per_cycle)
+        follower_args.reverse_wz_filter_alpha = float(args.lidar_reverse_wz_filter_alpha)
         follower_args.enable_4t4d_steering_assist = bool(args.lidar_enable_4t4d_steering_assist)
         follower_args.steering_assist_wheelbase_m = float(args.lidar_steering_assist_wheelbase_m)
         follower_args.steering_assist_gain = float(args.lidar_steering_assist_gain)
@@ -829,10 +801,10 @@ class DirectLocalLidarController:
                         low_beam=bool(self.args.low_beam),
                         brake=bool(force_brake) and not any(abs(v) > 1e-6 for v in (vx, vy, wz_rad)),
                     )
-                    steering_cmd = None if normalized_gear == "4t4d" else module.SteeringCommand(
+                    steering_cmd = module.SteeringCommand(
                         gear=normalized_gear,
                         speed=0.0,
-                        angle=self.last_steering_angle,
+                        angle=0.0 if normalized_gear == "4t4d" else self.last_steering_angle,
                     )
                     self.sender.update(
                         module.BodyCommand(
@@ -910,6 +882,30 @@ class DirectLocalLidarController:
                     "right_bins": int(estimate.right_bins),
                     "candidate_bins": int(estimate.candidate_bins),
                     "reject_reason": estimate.reject_reason,
+                    "track_x": _safe_float(self.last_debug.get("track_x"), 0.0),
+                    "lateral_error": _safe_float(self.last_debug.get("lateral_error"), 0.0),
+                    "heading_error_deg": _safe_float(self.last_debug.get("heading_error_deg"), 0.0),
+                    "lateral_term_deg": _safe_float(self.last_debug.get("lateral_term_deg"), 0.0),
+                    "heading_term_deg": _safe_float(self.last_debug.get("heading_term_deg"), 0.0),
+                    "reverse_rear_x": _safe_float(self.last_debug.get("reverse_rear_x"), 0.0),
+                    "reverse_rear_left_clearance_m": _safe_float(
+                        self.last_debug.get("reverse_rear_left_clearance_m"), 0.0
+                    ),
+                    "reverse_rear_right_clearance_m": _safe_float(
+                        self.last_debug.get("reverse_rear_right_clearance_m"), 0.0
+                    ),
+                    "reverse_rear_min_clearance_m": _safe_float(
+                        self.last_debug.get("reverse_rear_min_clearance_m"), 0.0
+                    ),
+                    "reverse_rear_guard_active": bool(
+                        self.last_debug.get("reverse_rear_guard_active", False)
+                    ),
+                    "wz_target_deg": _safe_float(self.last_debug.get("wz_target_deg"), 0.0),
+                    "wz_filtered_deg": _safe_float(self.last_debug.get("wz_filtered_deg"), 0.0),
+                    "final_vx": _safe_float(self.last_debug.get("final_vx"), 0.0),
+                    "final_wz_deg": _safe_float(self.last_debug.get("final_wz_deg"), 0.0),
+                    "reverse_steer_sign": _safe_float(self.last_debug.get("reverse_steer_sign"), -1.0),
+                    "line_mode": str(self.last_debug.get("line_mode", estimate.mode) or ""),
                 }
                 with controller._status_lock:
                     controller._status = LineStatus(
@@ -972,7 +968,10 @@ class DirectLocalLidarController:
         self._node.drive_enable = bool(enable)
         self._node.args.reverse = bool(reverse)
         self._node.args.low_beam = bool(low_beam)
-        self._node.args.speed = abs(float(cruise_vx))
+        if reverse:
+            self._node.args.reverse_speed = abs(float(cruise_vx))
+        else:
+            self._node.args.speed = abs(float(cruise_vx))
         if max_wz_deg is not None:
             self._node.args.max_wz_deg = abs(float(max_wz_deg))
 
@@ -1118,8 +1117,9 @@ def _row_entry_lidar_reliable(
     if not status.found:
         return False, "centerline_not_found"
     payload = status.payload if isinstance(status.payload, dict) else {}
-    if str(payload.get("mode") or "") != "both_sides":
-        return False, "both_boundaries_required"
+    mode = str(payload.get("mode") or "")
+    if mode not in {"both_sides", "left_only", "right_only"}:
+        return False, "usable_boundary_required"
     heading_deg = abs(_safe_float(payload.get("heading_deg"), float("inf")))
     if heading_deg > max(0.0, float(max_heading_deg)):
         return False, "heading_out_of_range"
@@ -1257,8 +1257,6 @@ class RowEndReverseState:
     reverse_global_progress_m: float = 0.0
     reverse_total_length_m: float = 0.0
     reverse_exit_global_active: bool = False
-    yaw_guard_active: bool = False
-    yaw_guard_last_log_at: float = 0.0
 
 
 @dataclass
@@ -1767,6 +1765,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
             pose = core.project_pose_to_ground(pose_raw, projection)
             start_index = max(int(start_index), int(row_end_reverse.start_index_floor))
             snapshot = local_controller.feedback_snapshot()
+            entry_lidar_status = local_controller.status_snapshot()
             io_state = snapshot.get("io", {})
             if bool(io_state.get("remote_control", False)):
                 local_controller.publish_mode(
@@ -1785,7 +1784,24 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
             # the forward samples. Do not let nearest-point tracking cross that
             # direction boundary before the geometric row-end trigger has fired.
             tracking_segment = _segment_for_index(forward_segments, start_index)
-            if tracking_segment is not None and not row_end_reverse.active:
+            crab_progress_locked = (
+                not row_end_reverse.active
+                and send_state.crab_target_index >= 0
+                and send_state.crab_locked_until >= start_index
+            )
+            if crab_progress_locked:
+                # Never let nearest-point synchronization jump from an active
+                # crab segment into the next forward row.  The crab alignment
+                # gate below must be the only code allowed to perform that
+                # handoff, otherwise the vehicle can start entering a row while
+                # it is still laterally offset from its center.
+                nearest_index, _nearest_dist = _nearest_index_in_range(
+                    points,
+                    pose,
+                    start_index,
+                    send_state.crab_locked_until,
+                )
+            elif tracking_segment is not None and not row_end_reverse.active:
                 tracking_end_index = min(tracking_segment.end_index, start_index + 13)
                 nearest_index, _nearest_dist = _nearest_index_in_range(
                     points,
@@ -1819,6 +1835,11 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
             row_entry_global_window = False
             row_change_global_window = False
             row_entry_handoff_ready = False
+            row_entry_lidar_guidance = False
+            row_entry_lidar_mode = ""
+            row_entry_lidar_center_error_m = 0.0
+            row_entry_lidar_heading_deg = 0.0
+            row_entry_lidar_wz_deg = 0.0
             if current_segment is not None:
                 rel_x = float(pose.x - current_segment.start_point.x)
                 rel_y = float(pose.y - current_segment.start_point.y)
@@ -1859,8 +1880,36 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                         row_entry_assist.start_along_m = along
                         row_entry_assist.start_along_valid = True
                     row_entry_progress_m = max(0.0, along - row_entry_assist.start_along_m)
-                    global_entry_distance_m = max(0.40, float(args.lidar_row_entry_distance))
-                    row_entry_global_window = row_entry_progress_m < global_entry_distance_m
+                    # Do not hand control to a lidar controller that is still
+                    # SEARCHing.  Continue following the recorded row at low
+                    # speed until the centerline is stable enough to take over.
+                    entry_reliable, entry_reason = _row_entry_lidar_reliable(
+                        entry_lidar_status,
+                        min_clearance_m=float(args.lidar_row_entry_min_clearance),
+                        max_heading_deg=float(args.lidar_row_entry_max_heading_deg),
+                    )
+                    if entry_lidar_status.updated_at > row_entry_assist.last_status_at:
+                        row_entry_assist.last_status_at = entry_lidar_status.updated_at
+                        if entry_reliable:
+                            row_entry_assist.stable_frames += 1
+                        else:
+                            row_entry_assist.stable_frames = 0
+                    required_entry_frames = max(1, int(args.lidar_row_entry_stable_frames))
+                    if (
+                        row_entry_progress_m >= max(0.40, float(args.lidar_row_entry_distance))
+                        and row_entry_assist.stable_frames < required_entry_frames
+                        and time.monotonic() - row_entry_assist.last_log_at >= 1.0
+                    ):
+                        wait_message = (
+                            "Global row entry continuing until lidar centerline is stable: "
+                            f"progress={row_entry_progress_m:.2f}m "
+                            f"frames={row_entry_assist.stable_frames}/{required_entry_frames} "
+                            f"reason={entry_reason}."
+                        )
+                        core.log(wait_message)
+                        _append_hybrid_log(hybrid_run_log, wait_message)
+                        row_entry_assist.last_log_at = time.monotonic()
+                    row_entry_global_window = True
                 else:
                     row_entry_progress_m = 0.0
                 if time.monotonic() < row_end_reverse.post_row_change_lock_until:
@@ -1869,6 +1918,8 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_entry_handoff_ready = (
                     row_entry_assist.start_along_valid
                     and row_entry_progress_m >= max(0.40, float(args.lidar_row_entry_distance))
+                    and row_entry_assist.stable_frames
+                    >= max(1, int(args.lidar_row_entry_stable_frames))
                 )
                 if row_entry_handoff_ready:
                     row_entry_assist.active = False
@@ -1881,7 +1932,8 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     local_controller.clear_motion_history()
                     entry_message = (
                         "Global low-speed row entry finished; handing control to lidar guidance "
-                        f"after {row_entry_progress_m:.2f}m."
+                        f"after {row_entry_progress_m:.2f}m with "
+                        f"{row_entry_assist.stable_frames} stable lidar frames."
                     )
                     core.log(entry_message)
                     _append_hybrid_log(hybrid_run_log, entry_message)
@@ -2054,8 +2106,6 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_end_reverse.reverse_global_progress_m = 0.0
                 row_end_reverse.reverse_total_length_m = 0.0
                 row_end_reverse.reverse_exit_global_active = False
-                row_end_reverse.yaw_guard_active = False
-                row_end_reverse.yaw_guard_last_log_at = 0.0
                 row_end_reverse.start_index_floor = max(int(row_end_reverse.start_index_floor), int(next_index))
                 row_end_reverse.row_change_sync_until = time.monotonic() + 0.45
                 row_end_reverse.row_change_sync_sent = False
@@ -2425,13 +2475,13 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                         )
                         strict_crab_finish = (
                             axis_reached
-                            and dist <= 0.12
-                            and next_lateral_err <= 0.08
+                            and dist <= 0.10
+                            and next_lateral_err <= 0.04
                         )
                         # After crab row-change, lateral alignment to the next
                         # forward row is the important part. Lidar entry will
-                        # verify both boundaries before any forward movement.
-                        aligned_crab_finish = has_next_forward_segment and next_lateral_err <= 0.06
+                        # then verify safe inferred clearance before handoff.
+                        aligned_crab_finish = has_next_forward_segment and next_lateral_err <= 0.04
                         crab_finish_ready = strict_crab_finish or aligned_crab_finish
                         if time.monotonic() - last_crab_align_log >= 1.0:
                             align_msg = (
@@ -2527,6 +2577,48 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                                 -abs(float(args.lidar_row_entry_max_wz_deg)),
                                 abs(float(args.lidar_row_entry_max_wz_deg)),
                             )
+                            # The recorded path brings the vehicle through open
+                            # space to the row mouth.  As soon as lidar sees one
+                            # or both plant boundaries, use that live centerline
+                            # for the fine entry correction.  A single boundary
+                            # is enough because the configured row width gives
+                            # the opposite boundary; formal handoff still waits
+                            # until the inferred clearance is safe and stable.
+                            entry_payload = (
+                                entry_lidar_status.payload
+                                if isinstance(entry_lidar_status.payload, dict)
+                                else {}
+                            )
+                            entry_mode = str(entry_payload.get("mode") or "")
+                            if (
+                                entry_lidar_status.fresh
+                                and entry_lidar_status.found
+                                and entry_mode in {"both_sides", "left_only", "right_only"}
+                            ):
+                                center_error_m = _safe_float(entry_payload.get("center_error_m"), 0.0)
+                                lidar_heading_deg = _safe_float(entry_payload.get("heading_deg"), 0.0)
+                                one_side = entry_mode in {"left_only", "right_only"}
+                                lat_scale = 0.5 if one_side else 1.0
+                                heading_scale = 0.3 if one_side else 1.0
+                                lidar_wz_deg = (
+                                    math.degrees(float(args.lidar_k_lat) * lat_scale * center_error_m)
+                                    + float(args.lidar_k_heading)
+                                    * heading_scale
+                                    * lidar_heading_deg
+                                )
+                                entry_max_wz_deg = abs(float(args.lidar_row_entry_max_wz_deg))
+                                cmd_wz = core._clamp(
+                                    lidar_wz_deg,
+                                    -entry_max_wz_deg,
+                                    entry_max_wz_deg,
+                                )
+                                if abs(center_error_m) > 0.08:
+                                    cmd_vx = min(cmd_vx, 0.05)
+                                row_entry_lidar_guidance = True
+                                row_entry_lidar_mode = entry_mode
+                                row_entry_lidar_center_error_m = center_error_m
+                                row_entry_lidar_heading_deg = lidar_heading_deg
+                                row_entry_lidar_wz_deg = cmd_wz
                 if reverse_global_only_active:
                     local_controller.hold_direct_control(0.90)
 
@@ -2586,108 +2678,12 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 continue
             current_gear = current_cmd_gear
 
-            # Lidar owns lateral centering during the long reverse row, but it
-            # must not be allowed to turn the vehicle far away from the
-            # recorded path heading. Use global localization only as a bounded
-            # heading guard, then hand control back to lidar.
+            # Lidar owns both lateral centering and heading correction during
+            # the long reverse row.  A second global yaw controller used to
+            # take over here and repeatedly reduce reverse speed; keeping one
+            # controller avoids those stop/start handoffs.
             reverse_path_heading_err_deg = 0.0
             reverse_yaw_guard_engaged = False
-            if (
-                reversing_here
-                and row_end_reverse.active
-                and not global_control_active
-                and row_end_reverse.reverse_start_index >= 0
-                and row_end_reverse.reverse_end_index >= row_end_reverse.reverse_start_index
-            ):
-                guard_index, _guard_dist = _nearest_index_in_range(
-                    points,
-                    pose,
-                    row_end_reverse.reverse_start_index,
-                    row_end_reverse.reverse_end_index,
-                )
-                expected_reverse_heading = core._tracking_heading(
-                    points,
-                    motions,
-                    guard_index,
-                    "4t4d",
-                )
-                reverse_path_heading_err_deg = math.degrees(
-                    core.normalize_angle(expected_reverse_heading - pose.yaw)
-                )
-                guard_enter_deg = max(1.0, abs(float(args.lidar_reverse_path_yaw_guard_deg)))
-                guard_release_deg = min(
-                    guard_enter_deg * 0.8,
-                    max(0.5, abs(float(args.lidar_reverse_path_yaw_release_deg))),
-                )
-                if (
-                    not row_end_reverse.yaw_guard_active
-                    and abs(reverse_path_heading_err_deg) >= guard_enter_deg
-                ):
-                    row_end_reverse.yaw_guard_active = True
-                    row_end_reverse.yaw_guard_last_log_at = 0.0
-                elif (
-                    row_end_reverse.yaw_guard_active
-                    and abs(reverse_path_heading_err_deg) <= guard_release_deg
-                ):
-                    row_end_reverse.yaw_guard_active = False
-                    local_controller.release_direct_control()
-                    local_controller.clear_motion_history()
-                    guard_msg = (
-                        "Reverse path yaw guard released; handing control back to lidar "
-                        f"at heading_error={reverse_path_heading_err_deg:.1f}deg."
-                    )
-                    core.log(guard_msg)
-                    _append_hybrid_log(hybrid_run_log, guard_msg)
-
-                lidar_safe_for_recovery = (
-                    local_status.fresh
-                    and local_status.found
-                    and not local_status.obstacle_blocked
-                )
-                if row_end_reverse.yaw_guard_active and lidar_safe_for_recovery:
-                    recovery_wz_limit_deg = max(
-                        0.3,
-                        abs(float(args.lidar_reverse_path_yaw_recovery_wz_deg)),
-                    )
-                    recovery_wz_deg = core._clamp(
-                        reverse_path_heading_err_deg * 0.28,
-                        -recovery_wz_limit_deg,
-                        recovery_wz_limit_deg,
-                    )
-                    recovery_vx = -max(
-                        0.03,
-                        min(
-                            abs(float(args.lidar_reverse_path_yaw_recovery_speed)),
-                            max(0.03, abs(float(local_cmd.vx))),
-                        ),
-                    )
-                    local_controller.hold_direct_control(0.25)
-                    local_controller.send_direct_drive(
-                        "4t4d",
-                        recovery_vx,
-                        math.radians(recovery_wz_deg),
-                    )
-                    local_cmd = TwistCommand(
-                        vx=recovery_vx,
-                        vy=0.0,
-                        wz=math.radians(recovery_wz_deg),
-                        updated_at=time.monotonic(),
-                        fresh=True,
-                    )
-                    reverse_yaw_guard_engaged = True
-                    now_guard = time.monotonic()
-                    if now_guard - row_end_reverse.yaw_guard_last_log_at >= 1.0:
-                        guard_msg = (
-                            "Reverse path yaw guard active: "
-                            f"heading_error={reverse_path_heading_err_deg:.1f}deg "
-                            f"vx={recovery_vx:.2f} wz={recovery_wz_deg:.1f}deg/s "
-                            f"path_index={guard_index}."
-                        )
-                        core.log(guard_msg)
-                        _append_hybrid_log(hybrid_run_log, guard_msg)
-                        row_end_reverse.yaw_guard_last_log_at = now_guard
-                elif row_end_reverse.yaw_guard_active and not lidar_safe_for_recovery:
-                    local_controller.release_direct_control()
 
             if row_end_reverse.active and row_end_reverse.reverse_end_index >= row_end_reverse.reverse_start_index:
                 reverse_nearest_index, reverse_nearest_dist = _nearest_index_in_range(
@@ -2754,6 +2750,11 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     f"post_row_change_lock={post_row_change_locked} "
                     f"force_global_entry_only={force_global_entry_only} "
                     f"entry_handoff={row_entry_handoff_ready} "
+                    f"entry_lidar_guidance={row_entry_lidar_guidance} "
+                    f"entry_lidar_mode={row_entry_lidar_mode or '-'} "
+                    f"entry_lidar_center_err={row_entry_lidar_center_error_m:.3f} "
+                    f"entry_lidar_heading={row_entry_lidar_heading_deg:.1f} "
+                    f"entry_lidar_wz={row_entry_lidar_wz_deg:.1f} "
                     f"lidar_entry_pending={row_entry_assist.lidar_pending} "
                     f"lidar_entry_tracking={row_entry_assist.lidar_tracking} "
                     f"reverse_global_only={reverse_global_only_active} "
@@ -2761,10 +2762,22 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     f"reverse_remaining={reverse_remaining_m:.2f} "
                     f"reverse_path_heading_err={reverse_path_heading_err_deg:.1f} "
                     f"reverse_yaw_guard={reverse_yaw_guard_engaged} "
-                    f"lidar_track_err={_safe_float(local_payload.get('track_error_y'), 0.0):.3f} "
+                    f"lidar_line_mode={local_payload.get('line_mode', '')} "
+                    f"lidar_track_x={_safe_float(local_payload.get('track_x'), 0.0):.2f} "
+                    f"lidar_lateral_err={_safe_float(local_payload.get('lateral_error'), 0.0):.3f} "
                     f"lidar_heading_err={_safe_float(local_payload.get('heading_error_deg'), 0.0):.1f} "
-                    f"lidar_target_wz={_safe_float(local_payload.get('target_wz_deg'), 0.0):.1f} "
-                    f"lidar_smoothed_wz={_safe_float(local_payload.get('smoothed_wz_deg'), 0.0):.1f} "
+                    f"lidar_lateral_term={_safe_float(local_payload.get('lateral_term_deg'), 0.0):.1f} "
+                    f"lidar_heading_term={_safe_float(local_payload.get('heading_term_deg'), 0.0):.1f} "
+                    f"rear_x={_safe_float(local_payload.get('reverse_rear_x'), 0.0):.2f} "
+                    f"rear_left_clear={_safe_float(local_payload.get('reverse_rear_left_clearance_m'), 0.0):.3f} "
+                    f"rear_right_clear={_safe_float(local_payload.get('reverse_rear_right_clearance_m'), 0.0):.3f} "
+                    f"rear_min_clear={_safe_float(local_payload.get('reverse_rear_min_clearance_m'), 0.0):.3f} "
+                    f"rear_guard={bool(local_payload.get('reverse_rear_guard_active', False))} "
+                    f"lidar_target_wz={_safe_float(local_payload.get('wz_target_deg'), 0.0):.1f} "
+                    f"lidar_filtered_wz={_safe_float(local_payload.get('wz_filtered_deg'), 0.0):.1f} "
+                    f"lidar_final_vx={_safe_float(local_payload.get('final_vx'), 0.0):.2f} "
+                    f"lidar_final_wz={_safe_float(local_payload.get('final_wz_deg'), 0.0):.1f} "
+                    f"lidar_reverse_sign={_safe_float(local_payload.get('reverse_steer_sign'), -1.0):.1f} "
                     f"reverse={reversing_here}"
                 )
                 core.log(cmd_log)
@@ -2881,7 +2894,6 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-max-row-width", type=float, default=0.78)
     parser.add_argument("--lidar-lookahead-x", type=float, default=0.75)
     parser.add_argument("--lidar-forward-lookahead-x", type=float, default=0.6)
-    parser.add_argument("--lidar-reverse-lookahead-x", type=float, default=-0.6)
     parser.add_argument("--lidar-forward-min", type=float, default=0.15)
     parser.add_argument("--lidar-forward-max", type=float, default=1.60)
     parser.add_argument("--lidar-lateral-limit", type=float, default=0.75)
@@ -2924,43 +2936,12 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-forward-lost-stop-sec", type=float, default=0.50)
     parser.add_argument("--lidar-forward-lost-hold-wz-scale", type=float, default=0.5)
     parser.add_argument("--lidar-forward-lost-hold-max-wz-deg", type=float, default=0.6)
-    parser.add_argument("--lidar-reverse-min-speed", type=float, default=0.04)
-    parser.add_argument("--lidar-reverse-one-side-speed", type=float, default=0.10)
-    parser.add_argument("--lidar-reverse-both-sides-speed", type=float, default=0.12)
-    parser.add_argument("--lidar-reverse-min-wz-deg", type=float, default=0.6)
-    parser.add_argument("--lidar-reverse-max-wz-deg", type=float, default=2.0)
-    parser.add_argument("--lidar-reverse-one-side-max-wz-deg", type=float, default=1.5)
-    parser.add_argument("--lidar-reverse-wz-enable-error-y", type=float, default=0.010)
-    parser.add_argument("--lidar-reverse-wz-enable-heading-deg", type=float, default=1.0)
-    parser.add_argument("--lidar-reverse-min-wz-error-y", type=float, default=0.040)
-    parser.add_argument("--lidar-reverse-sign-flip-guard-error-y", type=float, default=0.06)
-    parser.add_argument("--lidar-reverse-sign-flip-guard-last-wz-deg", type=float, default=1.5)
-    parser.add_argument("--lidar-reverse-sign-hold-error-y", type=float, default=0.0)
-    parser.add_argument("--lidar-reverse-both-sides-k-lat", type=float, default=1.2)
-    parser.add_argument("--lidar-reverse-both-sides-k-heading", type=float, default=0.15)
-    parser.add_argument("--lidar-reverse-one-side-k-lat", type=float, default=1.0)
-    parser.add_argument("--lidar-k-reverse-lat", type=float, default=12.0)
-    parser.add_argument("--lidar-k-reverse-heading", type=float, default=0.12)
+    parser.add_argument("--lidar-reverse-speed", type=float, default=0.15)
+    parser.add_argument("--lidar-reverse-k-lat", type=float, default=14.0)
+    parser.add_argument("--lidar-reverse-k-heading", type=float, default=0.10)
+    parser.add_argument("--lidar-reverse-max-wz-deg", type=float, default=2.5)
     parser.add_argument("--lidar-reverse-steer-sign", type=float, default=-1.0)
-    parser.add_argument("--lidar-reverse-heading-conflict-error-y", type=float, default=0.01)
-    parser.add_argument("--lidar-reverse-heading-max-ratio", type=float, default=0.35)
-    parser.add_argument("--lidar-reverse-recenter-error-y", type=float, default=0.06)
-    parser.add_argument("--lidar-reverse-recenter-heading-deg", type=float, default=6.0)
-    parser.add_argument("--lidar-reverse-recenter-scale", type=float, default=0.35)
-    parser.add_argument("--lidar-reverse-error-stop", type=float, default=0.28)
-    parser.add_argument("--lidar-reverse-wz-smoothing-alpha", type=float, default=0.65)
-    parser.add_argument("--lidar-reverse-lost-hold-sec", type=float, default=0.35)
-    parser.add_argument("--lidar-reverse-lost-stop-sec", type=float, default=0.80)
-    parser.add_argument("--lidar-reverse-lost-hold-max-wz-deg", type=float, default=1.5)
-    parser.add_argument("--lidar-reverse-lost-soft-max-wz-deg", type=float, default=0.8)
-    parser.add_argument("--lidar-reverse-start-lock-frames", type=int, default=3)
-    parser.add_argument("--lidar-reverse-start-ramp-frames", type=int, default=8)
-    parser.add_argument("--lidar-reverse-start-max-wz-deg", type=float, default=0.6)
-    parser.add_argument("--lidar-max-wz-delta-deg-per-cycle", type=float, default=0.25)
-    parser.add_argument("--lidar-reverse-path-yaw-guard-deg", type=float, default=5.0)
-    parser.add_argument("--lidar-reverse-path-yaw-release-deg", type=float, default=2.0)
-    parser.add_argument("--lidar-reverse-path-yaw-recovery-wz-deg", type=float, default=1.2)
-    parser.add_argument("--lidar-reverse-path-yaw-recovery-speed", type=float, default=0.06)
+    parser.add_argument("--lidar-reverse-wz-filter-alpha", type=float, default=0.30)
     parser.add_argument("--lidar-reverse-exit-global-distance", type=float, default=1.50)
     parser.add_argument("--lidar-reverse-exit-global-speed", type=float, default=0.06)
     parser.add_argument("--lidar-reverse-exit-global-max-wz-deg", type=float, default=1.2)
