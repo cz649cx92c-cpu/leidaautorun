@@ -61,6 +61,13 @@ ODIN_USB_PRODUCT = "0019"
 DEFAULT_LIDAR_YAW_CORRECTION_DEG = "-3.0"
 DEFAULT_LIDAR_X_OFFSET_M = "0.035"
 DEFAULT_LIDAR_Y_OFFSET_M = "0.0"
+GAMEPAD_COMMAND_TIMEOUT_S = 0.45
+GAMEPAD_CONTROL_PERIOD_S = 0.05
+GAMEPAD_SPEED_LIMITS: dict[str, tuple[float, float]] = {
+    "low": (0.15, 25.0),
+    "medium": (0.30, 50.0),
+    "high": (0.50, 75.0),
+}
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -1527,7 +1534,6 @@ HTML_PAGE = """<!doctype html>
       .summary-cell strong { white-space: normal; overflow: visible; text-overflow: clip; }
     }
 
-
   </style>
 </head>
 <body data-theme="dark">
@@ -1540,6 +1546,7 @@ HTML_PAGE = """<!doctype html>
           <div class="top-status-cluster">
             <div class="status-pill"><span class="status-dot"></span><span id="cameraStatus">Camera stopped</span></div>
             <div class="status-pill compact"><strong id="canStateSummary">CAN --</strong></div>
+            <div class="status-pill compact"><strong id="controlModeStatus">控制：待机</strong></div>
           </div>
         </div>
         <div class="summary-strip">
@@ -1893,6 +1900,28 @@ HTML_PAGE = """<!doctype html>
       'mappingRecorddata', 'sensorHeight', 'bodyXOffset',
       'bodyYOffset', 'rollGain', 'pitchGain'
     ];
+    const gamepadClientId = sessionStorage.getItem('autorun_gamepad_client_id') ||
+      ('web-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
+    sessionStorage.setItem('autorun_gamepad_client_id', gamepadClientId);
+    const browserGamepad = {
+      clientId: gamepadClientId,
+      enabled: false,
+      index: null,
+      gear: '4t4d',
+      speedMode: 'low',
+      previousButtons: {},
+      requestInFlight: false,
+      lastSendAt: 0,
+      lastErrorAt: 0,
+      driveAxis: 0,
+      steerAxis: 0,
+      deadman: false,
+      faulted: false,
+      claimedThisPage: false,
+      autoClaimInFlight: false,
+      autoArmNeedsRtRelease: true,
+      nextAutoClaimAt: 0,
+    };
 
     function setTheme(theme) {
       document.body.setAttribute('data-theme', theme);
@@ -1916,6 +1945,215 @@ HTML_PAGE = """<!doctype html>
       const contentType = res.headers.get('content-type') || '';
       if (contentType.includes('application/json')) return await res.json();
       return await res.text();
+    }
+
+    function gamepadButtonValue(gamepad, index) {
+      const button = gamepad?.buttons?.[index];
+      if (!button) return 0;
+      return Math.max(0, Math.min(1, Number(button.value ?? (button.pressed ? 1 : 0)) || 0));
+    }
+
+    function gamepadButtonPressed(gamepad, index) {
+      const button = gamepad?.buttons?.[index];
+      return !!button && (!!button.pressed || gamepadButtonValue(gamepad, index) >= 0.5);
+    }
+
+    function gamepadAxis(value, deadzone=0.12) {
+      const number = Math.max(-1, Math.min(1, Number(value) || 0));
+      const magnitude = Math.abs(number);
+      if (magnitude <= deadzone) return 0;
+      return Math.sign(number) * (magnitude - deadzone) / (1 - deadzone);
+    }
+
+    function isXboxGamepad(gamepad) {
+      const id = String(gamepad?.id || '').toLowerCase();
+      return id.includes('xbox') || id.includes('x-box') || id.includes('xinput') || id.includes('045e');
+    }
+
+    function currentBrowserGamepad() {
+      if (!('getGamepads' in navigator)) return null;
+      try {
+        const pads = Array.from(navigator.getGamepads() || [])
+          .filter(pad => !!pad && pad.connected && isXboxGamepad(pad));
+        if (browserGamepad.index !== null) {
+          const selected = pads.find(pad => pad.index === browserGamepad.index);
+          if (selected) return selected;
+        }
+        const first = pads[0] || null;
+        if (first) browserGamepad.index = first.index;
+        return first;
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function setBrowserGamepadGear(gear) {
+      if (!['4t4d', 'crab', 'park', 'neutral'].includes(gear)) return;
+      browserGamepad.gear = gear;
+    }
+
+    function stepBrowserGamepadSpeed(delta) {
+      const modes = ['low', 'medium', 'high'];
+      const current = Math.max(0, modes.indexOf(browserGamepad.speedMode));
+      browserGamepad.speedMode = modes[Math.max(0, Math.min(modes.length - 1, current + delta))];
+    }
+
+    function handleBrowserGamepadButtons(gamepad) {
+      const actions = {
+        0: () => setBrowserGamepadGear('4t4d'),
+        1: () => setBrowserGamepadGear('crab'),
+        2: () => setBrowserGamepadGear('park'),
+        3: () => setBrowserGamepadGear('neutral'),
+        12: () => stepBrowserGamepadSpeed(+1),
+        13: () => stepBrowserGamepadSpeed(-1),
+      };
+      for (const [indexText, action] of Object.entries(actions)) {
+        const index = Number(indexText);
+        const pressed = gamepadButtonPressed(gamepad, index);
+        if (pressed && !browserGamepad.previousButtons[index]) action();
+        browserGamepad.previousButtons[index] = pressed;
+      }
+    }
+
+    function updateBrowserGamepadReadout(gamepad) {
+      const device = document.getElementById('gamepadDeviceName');
+      const deadman = document.getElementById('gamepadDeadmanValue');
+      const drive = document.getElementById('gamepadDriveValue');
+      const steer = document.getElementById('gamepadSteerValue');
+      if (device) device.textContent = gamepad ? gamepad.id : '未检测到；按一下手柄按键';
+      if (deadman) deadman.textContent = browserGamepad.deadman ? '按住' : '松开';
+      if (drive) drive.textContent = browserGamepad.driveAxis.toFixed(2);
+      if (steer) steer.textContent = browserGamepad.steerAxis.toFixed(2);
+    }
+
+    async function sendBrowserGamepadCommand(gamepad, now) {
+      if (!browserGamepad.enabled || browserGamepad.requestInFlight) return;
+      if (now - browserGamepad.lastSendAt < 80) return;
+      browserGamepad.lastSendAt = now;
+      browserGamepad.requestInFlight = true;
+      try {
+        await api('/api/gamepad/command', 'POST', {
+          client_id: browserGamepad.clientId,
+          connected: !!gamepad,
+          device_name: gamepad?.id || '',
+          deadman: !!gamepad && browserGamepad.deadman,
+          gear: browserGamepad.gear,
+          speed_mode: browserGamepad.speedMode,
+          drive_axis: browserGamepad.driveAxis,
+          steer_axis: browserGamepad.steerAxis,
+        });
+      } catch (err) {
+        releaseBrowserGamepadBeacon('Command channel error');
+        browserGamepad.enabled = false;
+        browserGamepad.faulted = true;
+        const stamp = performance.now();
+        if (stamp - browserGamepad.lastErrorAt > 1500) {
+          showToast(String(err), 'error');
+          browserGamepad.lastErrorAt = stamp;
+        }
+      } finally {
+        browserGamepad.requestInFlight = false;
+      }
+    }
+
+    async function autoClaimBrowserGamepad(gamepad, now) {
+      if (!gamepad || browserGamepad.enabled || browserGamepad.autoClaimInFlight) return;
+      if (now < browserGamepad.nextAutoClaimAt) return;
+      const rtValue = gamepadButtonValue(gamepad, 7);
+      if (browserGamepad.autoArmNeedsRtRelease) {
+        if (rtValue >= 0.10) return;
+        browserGamepad.autoArmNeedsRtRelease = false;
+      }
+      browserGamepad.autoClaimInFlight = true;
+      browserGamepad.nextAutoClaimAt = now + 2000;
+      try {
+        await api('/api/gamepad/claim', 'POST', {
+          client_id: browserGamepad.clientId,
+          connected: true,
+          device_name: gamepad.id || 'Xbox Controller',
+        });
+        browserGamepad.enabled = true;
+        browserGamepad.faulted = false;
+        browserGamepad.claimedThisPage = true;
+        browserGamepad.lastSendAt = 0;
+        showToast('Xbox手柄已自动连接，按住RT后才能移动。');
+      } catch (err) {
+        browserGamepad.enabled = false;
+        browserGamepad.claimedThisPage = false;
+      } finally {
+        browserGamepad.autoClaimInFlight = false;
+      }
+    }
+
+    function pollBrowserGamepad(now) {
+      const gamepad = currentBrowserGamepad();
+      if (gamepad) {
+        handleBrowserGamepadButtons(gamepad);
+        const rightYAxis = gamepad.mapping === 'standard' ? 3 : (gamepad.axes.length > 4 ? 4 : 3);
+        browserGamepad.driveAxis = -gamepadAxis(gamepad.axes[rightYAxis] || 0);
+        browserGamepad.steerAxis = -gamepadAxis(gamepad.axes[0] || 0);
+        browserGamepad.deadman = gamepadButtonValue(gamepad, 7) >= 0.35;
+      } else {
+        browserGamepad.driveAxis = 0;
+        browserGamepad.steerAxis = 0;
+        browserGamepad.deadman = false;
+      }
+      updateBrowserGamepadReadout(gamepad);
+      autoClaimBrowserGamepad(gamepad, now);
+      sendBrowserGamepadCommand(gamepad, now);
+      window.requestAnimationFrame(pollBrowserGamepad);
+    }
+
+    async function releaseBrowserGamepad(reason='Released') {
+      const wasEnabled = browserGamepad.enabled;
+      browserGamepad.enabled = false;
+      browserGamepad.faulted = true;
+      browserGamepad.claimedThisPage = false;
+      browserGamepad.autoArmNeedsRtRelease = true;
+      browserGamepad.deadman = false;
+      browserGamepad.driveAxis = 0;
+      browserGamepad.steerAxis = 0;
+      updateBrowserGamepadReadout(currentBrowserGamepad());
+      try {
+        await api('/api/gamepad/release', 'POST', {
+          client_id: browserGamepad.clientId,
+          reason,
+        });
+        if (wasEnabled) showToast('网页手柄已停止并释放。');
+      } catch (err) {
+        if (wasEnabled) showToast(String(err), 'error');
+      }
+    }
+
+    function releaseBrowserGamepadBeacon(reason) {
+      if (!browserGamepad.enabled) return;
+      browserGamepad.enabled = false;
+      browserGamepad.faulted = true;
+      browserGamepad.claimedThisPage = false;
+      browserGamepad.autoArmNeedsRtRelease = true;
+      const body = JSON.stringify({client_id: browserGamepad.clientId, reason});
+      try {
+        navigator.sendBeacon('/api/gamepad/release', new Blob([body], {type: 'application/json'}));
+      } catch (err) {
+        // The backend command timeout remains the final fail-safe.
+      }
+    }
+
+    function updateGamepadControlState(control) {
+      const state = control || {};
+      const owner = String(state.owner_client_id || '');
+      const enabled = !!state.enabled;
+      const sameBrowserLease = enabled && owner === browserGamepad.clientId;
+      const ownedByThisBrowser =
+        sameBrowserLease && browserGamepad.claimedThisPage && !browserGamepad.faulted;
+      browserGamepad.enabled = ownedByThisBrowser;
+      if (ownedByThisBrowser) {
+        setBrowserGamepadGear(String(state.gear || browserGamepad.gear));
+        browserGamepad.speedMode = String(state.speed_mode || browserGamepad.speedMode);
+      }
+      const label = String(state.control_label || '待机');
+      const topStatus = document.getElementById('controlModeStatus');
+      if (topStatus) topStatus.textContent = '控制：' + label;
     }
 
     function setOptions(selectId, items, selected) {
@@ -2214,6 +2452,7 @@ HTML_PAGE = """<!doctype html>
       updateConsoleBox(data.logs || []);
 
       updateVehicleStatus(data.vehicle_status || {});
+      updateGamepadControlState(data.gamepad_control || {});
       updateProjectionDebug(data.pose_debug || {});
       updateWorkflowState(data);
 
@@ -2451,9 +2690,35 @@ HTML_PAGE = """<!doctype html>
         consoleAutoFollow = nearBottom;
       });
     }
+    window.addEventListener('gamepadconnected', event => {
+      if (!isXboxGamepad(event.gamepad)) return;
+      browserGamepad.index = event.gamepad.index;
+      browserGamepad.autoArmNeedsRtRelease = true;
+      browserGamepad.nextAutoClaimAt = 0;
+      showToast('检测到Xbox手柄，正在自动连接。');
+    });
+    window.addEventListener('gamepaddisconnected', event => {
+      if (browserGamepad.index === event.gamepad.index) browserGamepad.index = null;
+      browserGamepad.deadman = false;
+      browserGamepad.driveAxis = 0;
+      browserGamepad.steerAxis = 0;
+      browserGamepad.lastSendAt = 0;
+      if (isXboxGamepad(event.gamepad)) {
+        releaseBrowserGamepad('Xbox controller disconnected');
+        showToast('Xbox手柄已断开，小车将立即停止。', 'error');
+      }
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) releaseBrowserGamepadBeacon('Page hidden');
+    });
+    window.addEventListener('pagehide', () => releaseBrowserGamepadBeacon('Page closed'));
+    if (!('getGamepads' in navigator)) {
+      showToast('当前浏览器不支持Xbox手柄读取，请使用最新版Chrome或Edge。', 'error');
+    }
     setTheme(localStorage.getItem('autorun_final_theme') || defaultTheme);
     setInterval(refreshState, 1000);
     setInterval(refreshPreview, 250);
+    window.requestAnimationFrame(pollBrowserGamepad);
     refreshState();
     refreshPreview();
   </script>
@@ -2472,6 +2737,7 @@ class WebController:
         self.record_localization_worker: ProcessWorker | None = None
         self.replay_localization_worker: ProcessWorker | None = None
         self.preview_worker: ProcessWorker | None = None
+        self.preview_restart_at = 0.0
         self.camera_monitor: RosImageMonitor | None = None
         self.pose_debug_monitor: RosPoseDebugMonitor | None = None
         self.camera_status = "Stopped"
@@ -2482,6 +2748,29 @@ class WebController:
         self.localization_map_path: Path | None = None
         self.pending_action: str | None = None
         self.latest_preview_jpeg: bytes | None = None
+        self.vehicle_status: dict[str, Any] = {}
+        self.gamepad_control: dict[str, Any] = {
+            "enabled": False,
+            "owner_client_id": "",
+            "browser_connected": False,
+            "device_name": "",
+            "deadman": False,
+            "gear": "4t4d",
+            "speed_mode": "low",
+            "drive_axis": 0.0,
+            "steer_axis": 0.0,
+            "last_packet_at": 0.0,
+            "status": "Disabled",
+            "blocked_reason": "",
+            "control_source": "idle",
+            "control_label": "待机",
+            "final_vx": 0.0,
+            "final_vy": 0.0,
+            "final_wz_deg": 0.0,
+            "final_crab_angle_deg": 0.0,
+        }
+        self._gamepad_output_active = False
+        self._gamepad_last_published_gear = ""
         self.map_paths: dict[str, Path] = {}
         self.mission_paths: dict[str, Path] = {}
         self.library_mission_paths: dict[str, Path] = {}
@@ -2509,11 +2798,230 @@ class WebController:
         self._refresh_missions()
         self.can_status = self._query_can_state(str(self.settings.get("can_channel") or "can0"))
         self._log("Web UI is ready.")
+        self._auto_connect_can()
         self._start_pose_debug_monitor()
         self.event_thread = threading.Thread(target=self._pump_events, daemon=True)
         self.event_thread.start()
+        self._start_uvc_preview_publisher(auto=True)
         self.status_thread = threading.Thread(target=self._poll_vehicle_status, daemon=True)
         self.status_thread.start()
+        self.gamepad_thread = threading.Thread(target=self._gamepad_control_loop, daemon=True)
+        self.gamepad_thread.start()
+
+    @staticmethod
+    def _clamp_gamepad_axis(value: Any) -> float:
+        try:
+            number = float(value)
+        except Exception:
+            return 0.0
+        if not math.isfinite(number):
+            return 0.0
+        return max(-1.0, min(1.0, number))
+
+    def claim_gamepad_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id") or "").strip()
+        if not client_id:
+            raise RuntimeError("Missing browser gamepad client ID.")
+        with self.lock:
+            owner = str(self.gamepad_control.get("owner_client_id") or "")
+            last_packet_at = float(self.gamepad_control.get("last_packet_at") or 0.0)
+            owner_is_fresh = (time.monotonic() - last_packet_at) <= 2.0
+            if bool(self.gamepad_control.get("enabled")) and owner and owner != client_id and owner_is_fresh:
+                raise RuntimeError("Web gamepad control is already active in another browser.")
+            if self.task_status == "Hybrid Drive":
+                raise RuntimeError("Stop Hybrid Drive before enabling the web gamepad.")
+            self.gamepad_control.update(
+                {
+                    "enabled": True,
+                    "owner_client_id": client_id,
+                    "browser_connected": bool(payload.get("connected", False)),
+                    "device_name": str(payload.get("device_name") or "")[:160],
+                    "deadman": False,
+                    "drive_axis": 0.0,
+                    "steer_axis": 0.0,
+                    "last_packet_at": time.monotonic(),
+                    "status": "Waiting for controller input",
+                    "blocked_reason": "",
+                }
+            )
+            self._log("Web gamepad control enabled. Hold RT to move.")
+            return self._gamepad_state_locked()
+
+    def update_gamepad_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id") or "").strip()
+        with self.lock:
+            if not bool(self.gamepad_control.get("enabled")):
+                raise RuntimeError("Web gamepad control is not enabled.")
+            if client_id != str(self.gamepad_control.get("owner_client_id") or ""):
+                raise RuntimeError("This browser does not own web gamepad control.")
+            gear = str(payload.get("gear") or self.gamepad_control.get("gear") or "4t4d").strip().lower()
+            if gear not in {"4t4d", "crab", "park", "neutral"}:
+                gear = "4t4d"
+            speed_mode = str(payload.get("speed_mode") or "low").strip().lower()
+            if speed_mode not in GAMEPAD_SPEED_LIMITS:
+                speed_mode = "low"
+            connected = bool(payload.get("connected", False))
+            self.gamepad_control.update(
+                {
+                    "browser_connected": connected,
+                    "device_name": str(payload.get("device_name") or "")[:160],
+                    "deadman": connected and bool(payload.get("deadman", False)),
+                    "gear": gear,
+                    "speed_mode": speed_mode,
+                    "drive_axis": self._clamp_gamepad_axis(payload.get("drive_axis", 0.0)),
+                    "steer_axis": self._clamp_gamepad_axis(payload.get("steer_axis", 0.0)),
+                    "last_packet_at": time.monotonic(),
+                }
+            )
+            return self._gamepad_state_locked()
+
+    def release_gamepad_control(self, payload: dict[str, Any] | None = None, *, reason: str = "Released") -> None:
+        client_id = str((payload or {}).get("client_id") or "").strip()
+        reason = str(reason or "Released")[:160]
+        with self.lock:
+            owner = str(self.gamepad_control.get("owner_client_id") or "")
+            if client_id and owner and client_id != owner:
+                raise RuntimeError("This browser does not own web gamepad control.")
+            was_enabled = bool(self.gamepad_control.get("enabled"))
+            self.gamepad_control.update(
+                {
+                    "enabled": False,
+                    "owner_client_id": "",
+                    "browser_connected": False,
+                    "deadman": False,
+                    "drive_axis": 0.0,
+                    "steer_axis": 0.0,
+                    "status": reason,
+                    "blocked_reason": "",
+                    "final_vx": 0.0,
+                    "final_vy": 0.0,
+                    "final_wz_deg": 0.0,
+                    "final_crab_angle_deg": 0.0,
+                }
+            )
+            if was_enabled:
+                self._publish_gamepad_stop_locked()
+                self._log(f"Web gamepad control released: {reason}.")
+
+    def _publish_gamepad_stop_locked(self) -> None:
+        io_state = self.vehicle_status.get("io", {}) if isinstance(self.vehicle_status, dict) else {}
+        if bool(io_state.get("remote_control", False)) or bool(io_state.get("estop", False)):
+            self._gamepad_output_active = False
+            return
+        gear = str(self.gamepad_control.get("gear") or "4t4d")
+        if gear not in {"4t4d", "crab"}:
+            gear = "neutral"
+        bridge = get_bridge()
+        if gear == "crab":
+            angle = self._clamp_gamepad_axis(
+                float(self.gamepad_control.get("final_crab_angle_deg") or 0.0) / 90.0
+            ) * 90.0
+            bridge.publish_steering("crab", 0.0, angle)
+        else:
+            bridge.publish_body(gear, 0.0, 0.0, 0.0)
+        bridge.publish_io(unlock=False, brake=True)
+        self._gamepad_output_active = False
+        self._gamepad_last_published_gear = gear
+
+    def _gamepad_state_locked(self) -> dict[str, Any]:
+        now = time.monotonic()
+        packet_at = float(self.gamepad_control.get("last_packet_at") or 0.0)
+        packet_age_ms = None if packet_at <= 0.0 else max(0, int((now - packet_at) * 1000.0))
+        state = dict(self.gamepad_control)
+        state["packet_age_ms"] = packet_age_ms
+        state["command_timeout_ms"] = int(GAMEPAD_COMMAND_TIMEOUT_S * 1000.0)
+        return state
+
+    def _gamepad_control_loop(self) -> None:
+        bridge = get_bridge()
+        while not self.closing:
+            with self.lock:
+                now = time.monotonic()
+                state = self.gamepad_control
+                io_state = self.vehicle_status.get("io", {}) if isinstance(self.vehicle_status, dict) else {}
+                physical_remote = bool(io_state.get("remote_control", False))
+                estop = bool(io_state.get("estop", False))
+                enabled = bool(state.get("enabled", False))
+                connected = bool(state.get("browser_connected", False))
+                packet_at = float(state.get("last_packet_at") or 0.0)
+                fresh = packet_at > 0.0 and (now - packet_at) <= GAMEPAD_COMMAND_TIMEOUT_S
+                automatic_drive = self.task_status == "Hybrid Drive"
+                blocked_reason = ""
+                if physical_remote:
+                    source, label = "remote_controller", "遥控器控制"
+                    blocked_reason = "Physical remote controller has priority"
+                elif automatic_drive:
+                    source, label = "automatic", "自动驾驶"
+                    blocked_reason = "Hybrid Drive is running"
+                elif enabled:
+                    source, label = "browser_gamepad", "手柄控制"
+                    if estop:
+                        blocked_reason = "Emergency stop is active"
+                    elif not connected:
+                        blocked_reason = "Controller is not detected by the browser"
+                    elif not fresh:
+                        blocked_reason = "Browser command timed out"
+                else:
+                    source, label = "idle", "待机"
+
+                gear = str(state.get("gear") or "4t4d")
+                deadman = bool(state.get("deadman", False))
+                can_publish = enabled and connected and fresh and not physical_remote and not estop and not automatic_drive
+                command_active = can_publish and deadman and gear in {"4t4d", "crab"}
+                speed_mode = str(state.get("speed_mode") or "low")
+                linear_limit, yaw_limit_deg = GAMEPAD_SPEED_LIMITS.get(speed_mode, GAMEPAD_SPEED_LIMITS["low"])
+                drive_axis = self._clamp_gamepad_axis(state.get("drive_axis", 0.0))
+                steer_axis = self._clamp_gamepad_axis(state.get("steer_axis", 0.0))
+                drive_speed = drive_axis * linear_limit if command_active else 0.0
+                vx = drive_speed if gear == "4t4d" else 0.0
+                vy = 0.0
+                wz_deg = steer_axis * yaw_limit_deg if command_active and gear == "4t4d" else 0.0
+                crab_angle_deg = steer_axis * 90.0 if gear == "crab" else 0.0
+
+                state["control_source"] = source
+                state["control_label"] = label
+                state["blocked_reason"] = blocked_reason
+                state["final_vx"] = round(vx, 3)
+                state["final_vy"] = round(vy, 3)
+                state["final_wz_deg"] = round(wz_deg, 2)
+                state["final_crab_angle_deg"] = round(crab_angle_deg, 2)
+                if command_active:
+                    active_speed = drive_speed if gear == "crab" else vx
+                    state["status"] = "Driving" if abs(active_speed) > 1e-4 else "Ready"
+                    if gear == "crab":
+                        bridge.publish_steering("crab", drive_speed, crab_angle_deg)
+                    else:
+                        bridge.publish_body(gear, vx, 0.0, math.radians(wz_deg))
+                    bridge.publish_io(unlock=True, brake=False)
+                    self._gamepad_output_active = True
+                    self._gamepad_last_published_gear = gear
+                else:
+                    if enabled and blocked_reason:
+                        state["status"] = blocked_reason
+                    elif enabled and connected and fresh:
+                        state["status"] = "Ready - hold RT to move"
+                    elif not enabled:
+                        state["status"] = "Disabled"
+                    should_stop_previous_motion = (
+                        self._gamepad_output_active
+                        and not physical_remote
+                        and not estop
+                        and not automatic_drive
+                    )
+                    should_send_zero = should_stop_previous_motion or (
+                        can_publish
+                        and gear in {"4t4d", "crab", "park", "neutral"}
+                        and gear != self._gamepad_last_published_gear
+                    )
+                    if should_send_zero:
+                        if gear == "crab":
+                            bridge.publish_steering("crab", 0.0, crab_angle_deg)
+                        else:
+                            bridge.publish_body(gear, 0.0, 0.0, 0.0)
+                        bridge.publish_io(unlock=False, brake=True)
+                        self._gamepad_last_published_gear = gear
+                    self._gamepad_output_active = False
+            time.sleep(GAMEPAD_CONTROL_PERIOD_S)
 
     def _load_settings(self) -> None:
         try:
@@ -2543,12 +3051,30 @@ class WebController:
         except Exception:
             return "Unavailable"
         text = result.stdout
-        match = re.search(r"state\\s+([A-Z]+)", text)
+        flags_match = re.search(r"<([^>]*)>", text)
+        if flags_match and "UP" in {flag.strip().upper() for flag in flags_match.group(1).split(",")}:
+            return "UP"
+        match = re.search(r"state\s+([A-Z]+)", text)
         if match:
             return match.group(1)
-        if "<NOARP,UP" in text or ",UP" in text:
-            return "UP"
         return "UNKNOWN"
+
+    def _auto_connect_can(self) -> None:
+        channel = str(self.settings.get("can_channel") or "can0").strip() or "can0"
+        bitrate = str(self.settings.get("can_bitrate") or "500000").strip() or "500000"
+        current_state = self._query_can_state(channel)
+        if current_state == "UP":
+            self.can_status = current_state
+            self._log(f"CAN {channel} is already up; automatic connection reused it.")
+            return
+        self._log(
+            f"CAN {channel} is {current_state}. Automatically connecting at {bitrate} bps."
+        )
+        try:
+            self.connect_can(channel, bitrate)
+        except Exception as exc:
+            self.can_status = self._query_can_state(channel)
+            self._log(f"Automatic CAN connection failed: {exc}")
 
     def connect_can(self, channel: str, bitrate: str | int) -> None:
         with self.lock:
@@ -3058,16 +3584,12 @@ class WebController:
     def _start_uvc_preview_publisher(self, auto: bool = False) -> None:
         if self.preview_worker is not None:
             return
+        self.preview_restart_at = 0.0
         worker = ProcessWorker([ROS_PYTHON, *self._uvc_preview_args()], PROJECT_ROOT, "UVC Preview", self.events)
         self.preview_worker = worker
         worker.start()
         self._start_camera_monitor()
         self._log("UVC preview publisher started." if not auto else "UVC preview publisher auto-started.")
-
-    def _stop_uvc_preview_publisher(self) -> None:
-        if self.preview_worker is None:
-            return
-        self.preview_worker.stop()
 
     def _clear_preview(self, text: str = "Waiting for preview stream") -> None:
         self.latest_preview_jpeg = None
@@ -3212,6 +3734,8 @@ class WebController:
                     raise
                 except Exception:
                     pass
+            if bool(self.gamepad_control.get("enabled", False)):
+                self.release_gamepad_control(reason="Hybrid Drive requested")
             active = self._active_localization_worker()
             if active is None or self.localization_map_path != map_path:
                 self.pending_action = "drive"
@@ -3233,14 +3757,12 @@ class WebController:
             if self.task_worker is not None:
                 self._log("Stop requested for the current task.")
                 self.task_worker.stop()
-                self._stop_uvc_preview_publisher()
                 return
             active = self._active_localization_worker()
             if active is not None:
                 self._log("Stop requested for shared localization.")
                 active.stop()
                 self._cleanup_localization_processes("after global stop request")
-                self._stop_uvc_preview_publisher()
 
     def _mark_localization_ready(self) -> None:
         if self._active_localization_worker() is None:
@@ -3298,6 +3820,10 @@ class WebController:
         if label == "UVC Preview":
             if self.preview_worker is not None and self.preview_worker.worker_id == worker_id:
                 self.preview_worker = None
+                if not self.closing and not stopped:
+                    self.camera_status = "Restarting..."
+                    self.preview_source = "UVC preview restarting"
+                    self.preview_restart_at = time.monotonic() + 3.0
             self._log(f"{label} {'stopped' if stopped else 'finished'} with exit code {code}")
             return
         if label in {"Record Localization", "Replay Localization", "Shared Localization"}:
@@ -3326,6 +3852,12 @@ class WebController:
         while not self.closing:
             with self.lock:
                 self.vehicle_status = bridge.snapshot()
+                if (
+                    self.preview_worker is None
+                    and self.preview_restart_at > 0.0
+                    and time.monotonic() >= self.preview_restart_at
+                ):
+                    self._start_uvc_preview_publisher(auto=True)
             time.sleep(0.4)
 
     def _ppm_to_jpeg(self, ppm: bytes) -> bytes | None:
@@ -3377,6 +3909,7 @@ class WebController:
                 "mission_name": self.mission_name,
                 "settings": dict(self.settings),
                 "vehicle_status": getattr(self, "vehicle_status", {}),
+                "gamepad_control": self._gamepad_state_locked(),
                 "pose_debug": dict(self.pose_debug_state),
             }
 
@@ -3385,7 +3918,10 @@ class WebController:
             return self.latest_preview_jpeg
 
     def close(self) -> None:
-        self.closing = True
+        with self.lock:
+            if bool(self.gamepad_control.get("enabled", False)) or self._gamepad_output_active:
+                self.release_gamepad_control(reason="Web server stopped")
+            self.closing = True
         if self.task_worker is not None:
             self.task_worker.stop()
         active = self._active_localization_worker()
@@ -3429,6 +3965,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Permissions-Policy", "gamepad=(self)")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self._safe_write(body)
@@ -3437,6 +3975,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         body = text.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Permissions-Policy", "gamepad=(self)")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self._safe_write(body)
@@ -3496,6 +4036,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/connect_can":
                 APP.connect_can(str(payload.get("channel") or ""), str(payload.get("bitrate") or ""))
+                self._send_json({"ok": True})
+                return
+            if self.path == "/api/gamepad/claim":
+                state = APP.claim_gamepad_control(payload)
+                self._send_json({"ok": True, "gamepad_control": state})
+                return
+            if self.path == "/api/gamepad/command":
+                state = APP.update_gamepad_control(payload)
+                self._send_json({"ok": True, "gamepad_control": state})
+                return
+            if self.path == "/api/gamepad/release":
+                APP.release_gamepad_control(payload, reason=str(payload.get("reason") or "Released"))
                 self._send_json({"ok": True})
                 return
             if self.path == "/api/select_map":
