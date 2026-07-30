@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 import cv2
 import numpy as np
+from sensor_msgs.msg import LaserScan as RosLaserScan
 
 ROOT = Path(__file__).resolve().parent.parent
 import sys
@@ -44,6 +45,7 @@ from app import (  # type: ignore
     SETTINGS_PATH,
     UVC_PREVIEW_SCRIPT,
     UVC_PREVIEW_TOPIC,
+    ensure_ros_monitor_node,
     generated_name,
     missions_for_map,
     normalize_device_path,
@@ -51,6 +53,8 @@ from app import (  # type: ignore
     project_ground_pose,
 )
 from control.official_fwmini_compat import get_bridge
+from row_geometry import RowFollowerConfig, estimate_row
+from yhs_can_interfaces.msg import ChassisInfoFb
 
 
 HOST = "0.0.0.0"
@@ -61,6 +65,38 @@ ODIN_USB_PRODUCT = "0019"
 DEFAULT_LIDAR_YAW_CORRECTION_DEG = "-3.0"
 DEFAULT_LIDAR_X_OFFSET_M = "0.035"
 DEFAULT_LIDAR_Y_OFFSET_M = "0.0"
+LIDAR_SCAN_TOPIC = "/scan"
+LIDAR_CALIBRATION_PATH = PROJECT_ROOT / "config" / "lidar_calibration.json"
+LIDAR_DRIVER_ROOT = Path("/home/orangepi/ugv")
+LIDAR_DRIVER_BIN = LIDAR_DRIVER_ROOT / "install" / "lidar_pkg" / "lib" / "lidar_pkg" / "lidar_node"
+LIDAR_DRIVER_PARAMS = (
+    LIDAR_DRIVER_ROOT / "install" / "lidar_pkg" / "share" / "lidar_pkg" / "config" / "lidar_params.yaml"
+)
+GAMEPAD_COMMAND_TIMEOUT_S = 0.45
+GAMEPAD_CONTROL_PERIOD_S = 0.05
+GAMEPAD_SPEED_LIMITS: dict[str, tuple[float, float]] = {
+    "low": (0.15, 25.0),
+    "medium": (0.30, 50.0),
+    "high": (0.50, 75.0),
+}
+
+
+def load_lidar_preview_calibration() -> dict[str, float]:
+    calibration = {
+        "lidar_yaw_correction_deg": float(DEFAULT_LIDAR_YAW_CORRECTION_DEG),
+        "lidar_x_offset_m": float(DEFAULT_LIDAR_X_OFFSET_M),
+        "lidar_y_offset_m": float(DEFAULT_LIDAR_Y_OFFSET_M),
+    }
+    try:
+        payload = json.loads(LIDAR_CALIBRATION_PATH.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            for key in tuple(calibration):
+                value = float(payload.get(key, calibration[key]))
+                if math.isfinite(value):
+                    calibration[key] = value
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return calibration
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -835,6 +871,9 @@ HTML_PAGE = """<!doctype html>
       --ui-success: #29c06f;
       --ui-warn: #ef6b7b;
       --ui-shadow: 0 12px 32px rgba(0, 0, 0, 0.34);
+      --ui-overlay-sheet: rgba(17, 21, 29, 0.72);
+      --ui-overlay-dim: rgba(0, 0, 0, 0.20);
+      --ui-overlay-shadow: rgba(0, 0, 0, 0.34);
       --ui-radius: 16px;
       --ui-radius-sm: 12px;
       --ui-radius-xs: 10px;
@@ -856,6 +895,9 @@ HTML_PAGE = """<!doctype html>
       --ui-success: #1fa15c;
       --ui-warn: #d85d6f;
       --ui-shadow: 0 10px 28px rgba(24, 42, 70, 0.08);
+      --ui-overlay-sheet: rgba(255, 255, 255, 0.72);
+      --ui-overlay-dim: rgba(48, 63, 88, 0.10);
+      --ui-overlay-shadow: rgba(24, 42, 70, 0.18);
     }
     body {
       background:
@@ -1150,6 +1192,134 @@ HTML_PAGE = """<!doctype html>
       border-top: 1px solid var(--ui-line);
     }
     .preview-footer strong { color: var(--ui-text); }
+    .lidar-example {
+      margin-top: 18px;
+      padding-top: 16px;
+      border-top: 1px solid var(--ui-line-soft);
+    }
+    .lidar-example-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 12px;
+    }
+    .lidar-example-title {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin-bottom: 4px;
+    }
+    .lidar-example-title h2 { margin: 0; }
+    .lidar-sample-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 24px;
+      padding: 4px 9px;
+      border: 1px solid color-mix(in srgb, var(--ui-warn) 34%, var(--ui-line));
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--ui-warn) 10%, transparent);
+      color: color-mix(in srgb, var(--ui-warn) 78%, var(--ui-text));
+      font-size: 9.5px;
+      font-weight: 760;
+      letter-spacing: .07em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .lidar-sample-badge::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--ui-warn);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--ui-warn) 13%, transparent);
+    }
+    .lidar-sample-badge.live {
+      border-color: color-mix(in srgb, var(--ui-success) 38%, var(--ui-line));
+      background: color-mix(in srgb, var(--ui-success) 11%, transparent);
+      color: color-mix(in srgb, var(--ui-success) 75%, var(--ui-text));
+    }
+    .lidar-sample-badge.live::before {
+      background: var(--ui-success);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--ui-success) 13%, transparent);
+      animation: lidarLivePulse 1.8s ease-in-out infinite;
+    }
+    @keyframes lidarLivePulse {
+      50% { transform: scale(1.35); opacity: .7; }
+    }
+    .lidar-geometry {
+      display: flex;
+      justify-content: flex-end;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .lidar-chip {
+      padding: 6px 9px;
+      border: 1px solid var(--ui-line-soft);
+      border-radius: 8px;
+      background: var(--ui-strong-surface);
+      color: var(--ui-muted);
+      font-size: 11px;
+      line-height: 1.1;
+      white-space: nowrap;
+    }
+    .lidar-chip strong { color: var(--ui-text); font-weight: 740; }
+    .lidar-canvas-wrap {
+      position: relative;
+      min-height: 300px;
+      overflow: hidden;
+      border: 1px solid var(--ui-line);
+      border-radius: 12px;
+      background: var(--ui-strong-surface-2);
+      box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ui-text) 4%, transparent);
+    }
+    #lidarExampleCanvas {
+      display: block;
+      width: 100%;
+      height: 320px;
+    }
+    .lidar-axis-note {
+      position: absolute;
+      top: 10px;
+      left: 12px;
+      pointer-events: none;
+      color: var(--ui-muted);
+      font-size: 9.5px;
+      letter-spacing: .02em;
+    }
+    .lidar-example-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px 16px;
+      flex-wrap: wrap;
+      padding: 10px 2px 0;
+      color: var(--ui-muted);
+      font-size: 10px;
+    }
+    .lidar-legend {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .lidar-legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      white-space: nowrap;
+    }
+    .lidar-key {
+      width: 12px;
+      height: 3px;
+      border-radius: 999px;
+      background: #64748b;
+    }
+    .lidar-key.left { background: #16a34a; }
+    .lidar-key.right { background: #ea580c; }
+    .lidar-key.center { background: #e11d48; }
+    .lidar-example-note strong { color: var(--ui-text); }
     .properties {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -1489,6 +1659,10 @@ HTML_PAGE = """<!doctype html>
       .summary-cell:last-child { border-bottom: 0; }
       .ops-rail { grid-template-columns: 1fr; }
       .topbar-actions { justify-content: flex-start; }
+      .lidar-example-head { flex-direction: column; }
+      .lidar-geometry { justify-content: flex-start; }
+      #lidarExampleCanvas { height: 270px; }
+      .lidar-canvas-wrap { min-height: 250px; }
     }
 
     /* visual QA: prevent dense status labels from competing for the same line */
@@ -1527,6 +1701,450 @@ HTML_PAGE = """<!doctype html>
       .summary-cell strong { white-space: normal; overflow: visible; text-overflow: clip; }
     }
 
+    /* Primary driving display: camera first, lidar and instruments alongside it. */
+    .page.control-root {
+      width: 100%;
+      padding: 10px 14px 12px;
+      gap: 10px;
+    }
+    .topbar {
+      padding: 10px 16px;
+    }
+    .brand-row h1 {
+      font-size: clamp(22px, 1.8vw, 29px);
+    }
+    .control-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .workspace {
+      width: 100%;
+    }
+    .dashboard-metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-rows: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin: 0;
+      min-height: 0;
+    }
+    .run-metric {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      height: 100%;
+      padding: 8px 12px;
+      overflow: hidden;
+      border: 1px solid var(--ui-line);
+      border-radius: 13px;
+      background: linear-gradient(180deg, color-mix(in srgb, var(--ui-panel) 97%, transparent), color-mix(in srgb, var(--ui-panel-2) 94%, transparent));
+      display: grid;
+      align-content: center;
+    }
+    .run-metric::after {
+      content: none;
+    }
+    .run-metric span {
+      display: block;
+      color: var(--ui-muted);
+      font-size: 9px;
+      font-weight: 650;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .run-metric strong {
+      display: block;
+      margin-top: 4px;
+      color: var(--ui-text);
+      font-size: 13px;
+      line-height: 1.1;
+      font-weight: 760;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .run-metric small {
+      margin-left: 4px;
+      color: var(--ui-muted);
+      font-size: 8.5px;
+      font-weight: 600;
+    }
+    .overview-grid {
+      grid-template-columns: minmax(0, 1.12fr) minmax(450px, 1fr);
+      grid-template-rows: minmax(360px, 1.38fr) minmax(190px, .62fr);
+      grid-template-areas:
+        "camera lidar"
+        "camera status";
+      gap: 10px;
+      height: calc(100vh - 92px);
+      min-height: 680px;
+      align-items: stretch;
+    }
+    .preview-panel {
+      grid-area: camera;
+      padding: 10px;
+      border-radius: 16px;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .preview-panel .preview-stage {
+      min-height: 0;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+    }
+    .preview-panel .preview {
+      min-height: 0;
+      height: 100%;
+      flex: 1;
+      aspect-ratio: auto;
+      object-fit: contain;
+    }
+    .preview-panel .preview-footer {
+      padding: 8px 10px;
+      font-size: 10px;
+    }
+    .preview-panel .panel-head.tight {
+      margin-bottom: 7px;
+    }
+    .preview-panel .panel-head.tight h2,
+    .lidar-panel .lidar-example-title h2 {
+      font-size: 15px;
+    }
+    .status-panel {
+      grid-area: status;
+      position: relative;
+      min-height: 0;
+      padding: 12px 126px 12px 12px;
+      border-radius: 16px;
+      display: grid;
+      grid-template-rows: minmax(0, 2fr) minmax(0, 1fr);
+      gap: 8px;
+    }
+    #vehicleStatus {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-rows: minmax(0, 1fr);
+      gap: 8px;
+      border-top: 0;
+      min-height: 0;
+    }
+    #vehicleStatus .vehicle-metric {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      height: 100%;
+      padding: 8px 12px;
+      overflow: hidden;
+      border: 1px solid var(--ui-line);
+      border-radius: 13px;
+      background: linear-gradient(180deg, color-mix(in srgb, var(--ui-panel) 97%, transparent), color-mix(in srgb, var(--ui-panel-2) 94%, transparent));
+      display: grid;
+      align-content: center;
+      gap: 5px;
+    }
+    #vehicleStatus .vehicle-metric::after {
+      content: none;
+    }
+    #vehicleStatus .vehicle-metric.charging {
+      border-color: var(--ui-line);
+      background: linear-gradient(180deg, color-mix(in srgb, var(--ui-panel) 97%, transparent), color-mix(in srgb, var(--ui-panel-2) 94%, transparent));
+    }
+    #vehicleStatus .vehicle-metric.charging strong {
+      color: color-mix(in srgb, var(--ui-success) 76%, var(--ui-text));
+    }
+    #vehicleStatus .vehicle-metric span {
+      color: var(--ui-muted);
+      font-size: 9px;
+      font-weight: 650;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    #vehicleStatus .vehicle-metric strong {
+      min-width: 0;
+      color: var(--ui-text);
+      font-size: 13px;
+      line-height: 1.1;
+      font-weight: 760;
+      text-align: left;
+      overflow-wrap: anywhere;
+    }
+    .floating-tools {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      bottom: 12px;
+      width: 102px;
+      display: grid;
+      grid-template-rows: repeat(3, minmax(0, 1fr));
+      align-content: stretch;
+      gap: 8px;
+      padding: 9px;
+      border: 1px solid var(--ui-line);
+      border-radius: 13px;
+      background: linear-gradient(180deg, color-mix(in srgb, var(--ui-panel) 97%, transparent), color-mix(in srgb, var(--ui-panel-2) 94%, transparent));
+    }
+    .floating-tools button {
+      width: 100%;
+      min-height: 0;
+      height: 100%;
+      padding: 0 8px;
+      border-radius: 9px;
+      font-size: 9px;
+      font-weight: 650;
+    }
+    .lidar-panel {
+      grid-area: lidar;
+      padding: 10px;
+      border-radius: 16px;
+      min-height: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .lidar-panel .lidar-example {
+      margin-top: 0;
+      padding-top: 0;
+      border-top: 0;
+      min-height: 0;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+    }
+    .lidar-panel .lidar-example-head {
+      margin-bottom: 7px;
+      display: block;
+    }
+    .lidar-panel .lidar-example-title {
+      margin-bottom: 7px;
+    }
+    .lidar-panel .lidar-geometry {
+      width: 100%;
+      display: grid;
+      grid-template-columns: repeat(6, max-content);
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+    }
+    .lidar-panel .lidar-example-title h2 {
+      white-space: nowrap;
+    }
+    .lidar-panel .lidar-canvas-wrap {
+      min-height: 260px;
+      flex: 1;
+    }
+    .lidar-panel #lidarExampleCanvas {
+      height: 100%;
+    }
+    .lidar-panel .lidar-example-foot {
+      padding-top: 8px;
+    }
+    details.console-panel { display: none; }
+    details.console-panel summary {
+      padding: 11px 14px;
+      color: var(--ui-muted);
+      font-size: 11px;
+      font-weight: 650;
+      cursor: pointer;
+      list-style-position: inside;
+    }
+    details.console-panel[open] summary {
+      border-bottom: 1px solid var(--ui-line-soft);
+    }
+    details.console-panel textarea {
+      height: 170px;
+      min-height: 170px;
+      border: 0;
+      border-radius: 0;
+      resize: vertical;
+    }
+    @media (max-width: 1180px) {
+      .overview-grid {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto;
+        grid-template-areas:
+          "camera"
+          "lidar"
+          "status";
+        height: auto;
+        min-height: 0;
+      }
+      .status-panel {
+        min-height: 250px;
+      }
+    }
+    @media (max-width: 640px) {
+      .dashboard-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .run-metric {
+        min-height: 72px;
+        padding: 11px;
+      }
+      .preview-panel .preview {
+        height: auto;
+        aspect-ratio: 16 / 9;
+      }
+      #vehicleStatus {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .lidar-panel #lidarExampleCanvas {
+        height: 250px;
+      }
+      .lidar-panel .lidar-geometry {
+        grid-template-columns: repeat(2, max-content);
+        justify-content: start;
+      }
+      .status-panel { padding-right: 12px; padding-bottom: 146px; }
+      .floating-tools {
+        top: auto;
+        left: 12px;
+        right: 12px;
+        bottom: 12px;
+        width: auto;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-rows: minmax(0, 1fr);
+      }
+    }
+    #tab-dashboard { display: block; opacity: 1; transform: none; }
+    .overlay-panel {
+      position: fixed;
+      z-index: 120;
+      top: 74px;
+      left: 50%;
+      width: min(1420px, calc(100vw - 40px));
+      height: fit-content;
+      min-height: 0;
+      max-height: calc(100vh - 94px);
+      padding: 18px;
+      overflow: auto;
+      transform: translate(-50%, 12px);
+      border: 1px solid var(--ui-line);
+      border-radius: 18px;
+      background: var(--ui-overlay-sheet);
+      box-shadow:
+        0 0 0 100vmax var(--ui-overlay-dim),
+        0 28px 90px var(--ui-overlay-shadow);
+      backdrop-filter: blur(14px) saturate(1.08);
+    }
+    .overlay-panel.active {
+      display: block;
+      opacity: 1;
+      transform: translate(-50%, 0);
+      animation: overlayEnter 180ms ease;
+    }
+    .overlay-panel::before {
+      content: none;
+    }
+    button.secondary.overlay-close {
+      position: sticky;
+      z-index: 4;
+      top: 0;
+      float: right;
+      width: auto;
+      min-height: 34px;
+      padding: 0 13px;
+      margin: 0 0 10px 12px;
+      border-color: color-mix(in srgb, var(--ui-warn) 42%, var(--ui-line));
+      background: color-mix(in srgb, var(--ui-warn) 16%, var(--ui-panel));
+      color: color-mix(in srgb, var(--ui-warn) 82%, var(--ui-text));
+      box-shadow: none;
+    }
+    button.secondary.overlay-close:not(:disabled):hover {
+      border-color: color-mix(in srgb, var(--ui-warn) 58%, var(--ui-line));
+      background: color-mix(in srgb, var(--ui-warn) 23%, var(--ui-panel));
+      color: color-mix(in srgb, var(--ui-warn) 90%, var(--ui-text));
+      box-shadow: none;
+    }
+    body.workflow-overlay-open {
+      overflow: hidden;
+    }
+    #tab-tasks.overlay-panel {
+      top: 66px;
+      width: min(1540px, calc(100vw - 32px));
+      height: auto;
+      max-height: none;
+      overflow: visible;
+    }
+    #tab-tasks .workflow-shell,
+    #tab-tasks .deferred-stage {
+      gap: 10px;
+    }
+    #tab-tasks .workflow-board.primary-workflow,
+    #tab-tasks .workflow-board.secondary-workflow {
+      gap: 10px;
+    }
+    #tab-tasks .workflow-step {
+      min-height: 0;
+      padding: 14px;
+      gap: 8px;
+    }
+    #tab-tasks .workflow-copy {
+      min-height: 0;
+    }
+    #tab-tasks .workflow-copy h2 {
+      font-size: 16px;
+    }
+    #tab-tasks .fields,
+    #tab-tasks .field,
+    #tab-tasks .field-inline {
+      gap: 6px;
+    }
+    #tab-tasks input,
+    #tab-tasks select,
+    #tab-tasks button:not(.overlay-close) {
+      min-height: 34px;
+    }
+    #tab-tasks .step-dependency {
+      padding: 8px 10px;
+      margin-top: 0;
+    }
+    #tab-tasks .deferred-intro,
+    #tab-tasks .locked-stage {
+      padding: 10px 14px;
+    }
+    @media (max-width: 820px), (max-height: 720px) {
+      body.workflow-overlay-open { overflow: hidden; }
+      #tab-tasks.overlay-panel {
+        max-height: calc(100vh - 82px);
+        overflow-y: auto;
+      }
+    }
+    @keyframes overlayEnter {
+      from { opacity: 0; transform: translate(-50%, 12px); }
+      to { opacity: 1; transform: translate(-50%, 0); }
+    }
+    #tab-logs.overlay-panel {
+      width: min(1120px, calc(100vw - 40px));
+    }
+    .log-shell {
+      display: grid;
+      gap: 10px;
+      clear: both;
+    }
+    .log-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .log-toolbar button {
+      width: auto;
+      min-height: 34px;
+      padding: 0 13px;
+    }
+    .log-console {
+      width: 100%;
+      height: min(62vh, 560px);
+      min-height: 320px;
+      resize: none;
+      border: 1px solid var(--ui-line);
+      border-radius: 13px;
+      padding: 12px 14px;
+      background: color-mix(in srgb, var(--ui-strong-surface) 94%, transparent);
+      color: var(--ui-text);
+      font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.5;
+    }
 
   </style>
 </head>
@@ -1536,111 +2154,28 @@ HTML_PAGE = """<!doctype html>
     <header class="topbar">
       <div class="brand-block">
         <div class="brand-row">
-          <h1>autorun</h1>
+          <h1>Vehicle Motion Monitor</h1>
           <div class="top-status-cluster">
-            <div class="status-pill"><span class="status-dot"></span><span id="cameraStatus">Camera stopped</span></div>
-            <div class="status-pill compact"><strong id="canStateSummary">CAN --</strong></div>
-          </div>
-        </div>
-        <div class="summary-strip">
-          <div class="summary-cell">
-            <span class="summary-label">Task</span>
-            <strong id="taskStatus">Idle</strong>
-          </div>
-          <div class="summary-cell">
-            <span class="summary-label">Localization</span>
-            <strong id="localizationStatus">Not started</strong>
-          </div>
-          <div class="summary-cell stretch">
-            <span class="summary-label">Map</span>
-            <strong id="selectedMapSummary">--</strong>
-          </div>
-          <div class="summary-cell stretch">
-            <span class="summary-label">Mission</span>
-            <strong id="selectedMissionSummary">--</strong>
+            <div class="status-pill"><span class="status-dot"></span><span>autorun online</span></div>
+            <div class="status-pill compact"><strong id="controlModeStatus">Control: Idle</strong></div>
           </div>
         </div>
       </div>
       <div class="topbar-actions">
         <button class="secondary slim" style="width:auto" onclick="toggleTheme()">Theme</button>
         <button id="canConnectTopBtn" class="secondary slim" style="width:auto" onclick="connectCan()">Connect CAN</button>
+        <button id="tabBtn-logs" class="secondary slim" style="width:auto" onclick="selectTab('logs')">Logs</button>
       </div>
     </header>
 
-    <section class="tab-dock">
-      <div class="segmented nav-tabs">
-        <button id="tabBtn-dashboard" class="active" onclick="selectTab('dashboard')">Overview</button>
-        <button id="tabBtn-tasks" onclick="selectTab('tasks')">Workflow</button>
-        <button id="tabBtn-library" onclick="selectTab('library')">Library</button>
-        <button id="tabBtn-settings" onclick="selectTab('settings')">Tuning</button>
-      </div>
-    </section>
-
     <section class="control-grid">
-      <aside class="ops-rail">
-        <div class="rail-panel panel">
-          <div class="rail-title-row">
-            <h2>Session</h2>
-            <div class="status-badge" id="previewModeBadge">Preview</div>
-          </div>
-          <div class="rail-metrics">
-            <div class="rail-metric">
-              <span>Preview Source</span>
-              <strong id="previewSource">Waiting for preview stream</strong>
-            </div>
-            <div class="rail-metric">
-              <span>Guidance Mode</span>
-              <strong>Lidar in-row / staged global</strong>
-            </div>
-            <div class="rail-metric">
-              <span>Projection</span>
-              <strong id="projectionSummary">h=0.00, x=0.00, y=0.00</strong>
-            </div>
-            <div class="rail-metric">
-              <span>Workflow Gate</span>
-              <strong id="workflowGateSummary">Waiting for map lock</strong>
-            </div>
-          </div>
-        </div>
-
-        <div class="rail-panel panel gate-panel">
-          <div class="rail-title-row">
-            <h2>Workflow Gate</h2>
-          </div>
-          <div class="gate-stack">
-            <div class="status-line compact">
-              <div>
-                <strong>Relocalization</strong>
-                <div class="panel-sub">Required before recording or drive.</div>
-              </div>
-              <div class="status-badge" id="localizationGateBadge">Waiting</div>
-            </div>
-            <div class="status-line compact">
-              <div>
-                <strong>Mission Recording</strong>
-                <div class="panel-sub">Enabled after map lock.</div>
-              </div>
-              <div class="status-badge" id="recordingGateBadge">Locked</div>
-            </div>
-            <div class="status-line compact">
-              <div>
-                <strong>Hybrid Drive</strong>
-                <div class="panel-sub">Mission + local guidance blend.</div>
-              </div>
-              <div class="status-badge" id="driveGateBadge">Locked</div>
-            </div>
-          </div>
-        </div>
-      </aside>
-
       <main class="workspace">
         <section id="tab-dashboard" class="tab-panel active">
           <div class="overview-grid">
             <div class="panel preview-panel">
               <div class="panel-head tight">
                 <div>
-                  <h2>Live Preview</h2>
-                  <div class="panel-sub">Live UVC preview feed.</div>
+                  <h2>UVC Live View</h2>
                 </div>
               </div>
               <div class="preview-stage">
@@ -1652,33 +2187,83 @@ HTML_PAGE = """<!doctype html>
               </div>
             </div>
 
-            <div class="panel status-panel">
-              <div class="panel-head tight">
-                <div>
-                  <h2>Vehicle Status</h2>
-                  <div class="panel-sub">Live chassis feedback.</div>
-                </div>
+            <div class="panel status-panel" aria-label="Vehicle instruments">
+              <div class="dashboard-metrics">
+                <article class="run-metric">
+                  <span>Speed</span>
+                  <strong id="metricSpeed">--<small>m/s</small></strong>
+                </article>
+                <article class="run-metric">
+                  <span>Steering</span>
+                  <strong id="metricSteering">--<small>°</small></strong>
+                </article>
+                <article class="run-metric">
+                  <span>Localization</span>
+                  <strong id="metricLocalization">Not started</strong>
+                </article>
+                <article class="run-metric">
+                  <span>Guidance</span>
+                  <strong id="metricGuidance">Waiting /scan</strong>
+                </article>
+                <article class="run-metric">
+                  <span>Center Offset</span>
+                  <strong id="metricCenterOffset">--<small>m</small></strong>
+                </article>
+                <article class="run-metric">
+                  <span>Battery</span>
+                  <strong id="metricBattery">--<small>%</small></strong>
+                </article>
               </div>
-              <div class="properties" id="vehicleStatus"></div>
+              <div id="vehicleStatus"></div>
+              <nav class="floating-tools" aria-label="Control panels">
+                <button id="tabBtn-tasks" class="secondary" onclick="selectTab('tasks')">Workflow</button>
+                <button id="tabBtn-library" class="secondary" onclick="selectTab('library')">Library</button>
+                <button id="tabBtn-settings" class="secondary" onclick="selectTab('settings')">Tuning</button>
+              </nav>
             </div>
 
-            <div class="panel console-panel">
-              <div class="panel-head tight">
-                <div>
-                  <h2>Console</h2>
-                  <div class="panel-sub">Backend events and task transitions.</div>
+            <div class="panel lidar-panel">
+              <section class="lidar-example" aria-labelledby="lidarExampleTitle">
+                <div class="lidar-example-head">
+                  <div>
+                    <div class="lidar-example-title">
+                      <h2 id="lidarExampleTitle">Lidar Channel Geometry</h2>
+                      <span class="lidar-sample-badge" id="lidarDataBadge">Waiting for /scan</span>
+                    </div>
+                  </div>
+                  <div class="lidar-geometry" aria-label="Lidar geometry parameters">
+                    <span class="lidar-chip">Channel <strong id="lidarChannelState">--</strong></span>
+                    <span class="lidar-chip">Row <strong id="lidarRowWidth">--</strong></span>
+                    <span class="lidar-chip">Vehicle <strong>0.40 × 0.62 m</strong></span>
+                    <span class="lidar-chip">Lookahead <strong>0.60 m</strong></span>
+                    <span class="lidar-chip">Points <strong id="lidarPointCount">--</strong></span>
+                    <span class="lidar-chip">Scan <strong id="lidarScanRate">-- Hz</strong></span>
+                  </div>
                 </div>
-              </div>
-              <textarea id="console" readonly></textarea>
+                <div class="lidar-canvas-wrap">
+                  <canvas id="lidarExampleCanvas" aria-label="Example lidar point cloud with row boundaries, centerline and scaled vehicle footprint"></canvas>
+                  <div class="lidar-axis-note">+X forward · lateral crop ±0.75 m</div>
+                </div>
+                <div class="lidar-example-foot">
+                  <div class="lidar-legend">
+                    <span><i class="lidar-key"></i>Raw scan</span>
+                    <span><i class="lidar-key left"></i>Left fit</span>
+                    <span><i class="lidar-key right"></i>Right fit</span>
+                    <span><i class="lidar-key center"></i>Centerline</span>
+                  </div>
+                  <span class="lidar-example-note" id="lidarDataNote">Detection window <strong>0.15–1.60 m</strong> · side clearance <strong>0.10 m / side</strong></span>
+                </div>
+              </section>
             </div>
+
           </div>
         </section>
 
-        <section id="tab-tasks" class="tab-panel">
+        <section id="tab-tasks" class="tab-panel overlay-panel">
+          <button class="secondary overlay-close" onclick="selectTab('dashboard')">Close</button>
           <div class="workflow-shell fresh-workflow">
             <div class="workflow-board primary-workflow">
               <article class="workflow-step map">
-                <div class="step-number">0</div>
                 <div class="workflow-copy">
                   <span class="task-tag map">Mapping</span>
                   <h2>Build map</h2>
@@ -1695,7 +2280,6 @@ HTML_PAGE = """<!doctype html>
               </article>
 
               <article class="workflow-step loc">
-                <div class="step-number">1</div>
                 <div class="workflow-copy">
                   <span class="task-tag loc">Relocalize</span>
                   <h2>Lock map</h2>
@@ -1729,7 +2313,6 @@ HTML_PAGE = """<!doctype html>
 
               <div class="workflow-board secondary-workflow">
                 <article class="workflow-step record">
-                  <div class="step-number">2</div>
                   <div class="workflow-copy">
                     <span class="task-tag record">Recording</span>
                     <h2>Teach path</h2>
@@ -1778,7 +2361,8 @@ HTML_PAGE = """<!doctype html>
           </div>
         </section>
 
-        <section id="tab-library" class="tab-panel">
+        <section id="tab-library" class="tab-panel overlay-panel">
+          <button class="secondary overlay-close" onclick="selectTab('dashboard')">Close</button>
           <div class="settings-layout library-layout">
             <div class="settings-group">
               <div class="panel">
@@ -1826,7 +2410,8 @@ HTML_PAGE = """<!doctype html>
           </div>
         </section>
 
-        <section id="tab-settings" class="tab-panel">
+        <section id="tab-settings" class="tab-panel overlay-panel">
+          <button class="secondary overlay-close" onclick="selectTab('dashboard')">Close</button>
           <div class="settings-layout tuning-layout">
             <div class="tuning-main-stack">
               <div class="panel">
@@ -1879,11 +2464,28 @@ HTML_PAGE = """<!doctype html>
             </div>
           </div>
         </section>
+
+        <section id="tab-logs" class="tab-panel overlay-panel">
+          <button class="secondary overlay-close" onclick="selectTab('dashboard')">Close</button>
+          <div class="log-shell">
+            <div class="log-toolbar">
+              <div>
+                <h2>Logs</h2>
+                <div class="panel-sub">Backend events and task transitions.</div>
+              </div>
+              <button class="secondary" onclick="copyAllLogs()">Copy All</button>
+            </div>
+            <textarea id="console" class="log-console" readonly></textarea>
+          </div>
+        </section>
       </main>
     </section>
   </div>
 <script>
     let stateCache = null;
+    let lidarFrame = null;
+    let lidarRequestInFlight = false;
+    let lidarLastDrawAt = 0;
     let activeTab = 'dashboard';
     const dirtyFields = new Set();
     let consoleAutoFollow = true;
@@ -1893,6 +2495,28 @@ HTML_PAGE = """<!doctype html>
       'mappingRecorddata', 'sensorHeight', 'bodyXOffset',
       'bodyYOffset', 'rollGain', 'pitchGain'
     ];
+    const gamepadClientId = sessionStorage.getItem('autorun_gamepad_client_id') ||
+      ('web-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
+    sessionStorage.setItem('autorun_gamepad_client_id', gamepadClientId);
+    const browserGamepad = {
+      clientId: gamepadClientId,
+      enabled: false,
+      index: null,
+      gear: '4t4d',
+      speedMode: 'low',
+      previousButtons: {},
+      requestInFlight: false,
+      lastSendAt: 0,
+      lastErrorAt: 0,
+      driveAxis: 0,
+      steerAxis: 0,
+      deadman: false,
+      faulted: false,
+      claimedThisPage: false,
+      autoClaimInFlight: false,
+      autoArmNeedsRtRelease: true,
+      nextAutoClaimAt: 0,
+    };
 
     function setTheme(theme) {
       document.body.setAttribute('data-theme', theme);
@@ -1916,6 +2540,215 @@ HTML_PAGE = """<!doctype html>
       const contentType = res.headers.get('content-type') || '';
       if (contentType.includes('application/json')) return await res.json();
       return await res.text();
+    }
+
+    function gamepadButtonValue(gamepad, index) {
+      const button = gamepad?.buttons?.[index];
+      if (!button) return 0;
+      return Math.max(0, Math.min(1, Number(button.value ?? (button.pressed ? 1 : 0)) || 0));
+    }
+
+    function gamepadButtonPressed(gamepad, index) {
+      const button = gamepad?.buttons?.[index];
+      return !!button && (!!button.pressed || gamepadButtonValue(gamepad, index) >= 0.5);
+    }
+
+    function gamepadAxis(value, deadzone=0.12) {
+      const number = Math.max(-1, Math.min(1, Number(value) || 0));
+      const magnitude = Math.abs(number);
+      if (magnitude <= deadzone) return 0;
+      return Math.sign(number) * (magnitude - deadzone) / (1 - deadzone);
+    }
+
+    function isXboxGamepad(gamepad) {
+      const id = String(gamepad?.id || '').toLowerCase();
+      return id.includes('xbox') || id.includes('x-box') || id.includes('xinput') || id.includes('045e');
+    }
+
+    function currentBrowserGamepad() {
+      if (!('getGamepads' in navigator)) return null;
+      try {
+        const pads = Array.from(navigator.getGamepads() || [])
+          .filter(pad => !!pad && pad.connected && isXboxGamepad(pad));
+        if (browserGamepad.index !== null) {
+          const selected = pads.find(pad => pad.index === browserGamepad.index);
+          if (selected) return selected;
+        }
+        const first = pads[0] || null;
+        if (first) browserGamepad.index = first.index;
+        return first;
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function setBrowserGamepadGear(gear) {
+      if (!['4t4d', 'crab', 'park', 'neutral'].includes(gear)) return;
+      browserGamepad.gear = gear;
+    }
+
+    function stepBrowserGamepadSpeed(delta) {
+      const modes = ['low', 'medium', 'high'];
+      const current = Math.max(0, modes.indexOf(browserGamepad.speedMode));
+      browserGamepad.speedMode = modes[Math.max(0, Math.min(modes.length - 1, current + delta))];
+    }
+
+    function handleBrowserGamepadButtons(gamepad) {
+      const actions = {
+        0: () => setBrowserGamepadGear('4t4d'),
+        1: () => setBrowserGamepadGear('crab'),
+        2: () => setBrowserGamepadGear('park'),
+        3: () => setBrowserGamepadGear('neutral'),
+        12: () => stepBrowserGamepadSpeed(+1),
+        13: () => stepBrowserGamepadSpeed(-1),
+      };
+      for (const [indexText, action] of Object.entries(actions)) {
+        const index = Number(indexText);
+        const pressed = gamepadButtonPressed(gamepad, index);
+        if (pressed && !browserGamepad.previousButtons[index]) action();
+        browserGamepad.previousButtons[index] = pressed;
+      }
+    }
+
+    function updateBrowserGamepadReadout(gamepad) {
+      const device = document.getElementById('gamepadDeviceName');
+      const deadman = document.getElementById('gamepadDeadmanValue');
+      const drive = document.getElementById('gamepadDriveValue');
+      const steer = document.getElementById('gamepadSteerValue');
+      if (device) device.textContent = gamepad ? gamepad.id : 'Not detected; press a controller button';
+      if (deadman) deadman.textContent = browserGamepad.deadman ? 'Held' : 'Released';
+      if (drive) drive.textContent = browserGamepad.driveAxis.toFixed(2);
+      if (steer) steer.textContent = browserGamepad.steerAxis.toFixed(2);
+    }
+
+    async function sendBrowserGamepadCommand(gamepad, now) {
+      if (!browserGamepad.enabled || browserGamepad.requestInFlight) return;
+      if (now - browserGamepad.lastSendAt < 80) return;
+      browserGamepad.lastSendAt = now;
+      browserGamepad.requestInFlight = true;
+      try {
+        await api('/api/gamepad/command', 'POST', {
+          client_id: browserGamepad.clientId,
+          connected: !!gamepad,
+          device_name: gamepad?.id || '',
+          deadman: !!gamepad && browserGamepad.deadman,
+          gear: browserGamepad.gear,
+          speed_mode: browserGamepad.speedMode,
+          drive_axis: browserGamepad.driveAxis,
+          steer_axis: browserGamepad.steerAxis,
+        });
+      } catch (err) {
+        releaseBrowserGamepadBeacon('Command channel error');
+        browserGamepad.enabled = false;
+        browserGamepad.faulted = true;
+        const stamp = performance.now();
+        if (stamp - browserGamepad.lastErrorAt > 1500) {
+          showToast(String(err), 'error');
+          browserGamepad.lastErrorAt = stamp;
+        }
+      } finally {
+        browserGamepad.requestInFlight = false;
+      }
+    }
+
+    async function autoClaimBrowserGamepad(gamepad, now) {
+      if (!gamepad || browserGamepad.enabled || browserGamepad.autoClaimInFlight) return;
+      if (now < browserGamepad.nextAutoClaimAt) return;
+      const rtValue = gamepadButtonValue(gamepad, 7);
+      if (browserGamepad.autoArmNeedsRtRelease) {
+        if (rtValue >= 0.10) return;
+        browserGamepad.autoArmNeedsRtRelease = false;
+      }
+      browserGamepad.autoClaimInFlight = true;
+      browserGamepad.nextAutoClaimAt = now + 2000;
+      try {
+        await api('/api/gamepad/claim', 'POST', {
+          client_id: browserGamepad.clientId,
+          connected: true,
+          device_name: gamepad.id || 'Xbox Controller',
+        });
+        browserGamepad.enabled = true;
+        browserGamepad.faulted = false;
+        browserGamepad.claimedThisPage = true;
+        browserGamepad.lastSendAt = 0;
+        showToast('Xbox controller connected. Hold RT to move.');
+      } catch (err) {
+        browserGamepad.enabled = false;
+        browserGamepad.claimedThisPage = false;
+      } finally {
+        browserGamepad.autoClaimInFlight = false;
+      }
+    }
+
+    function pollBrowserGamepad(now) {
+      const gamepad = currentBrowserGamepad();
+      if (gamepad) {
+        handleBrowserGamepadButtons(gamepad);
+        const rightYAxis = gamepad.mapping === 'standard' ? 3 : (gamepad.axes.length > 4 ? 4 : 3);
+        browserGamepad.driveAxis = -gamepadAxis(gamepad.axes[rightYAxis] || 0);
+        browserGamepad.steerAxis = -gamepadAxis(gamepad.axes[0] || 0);
+        browserGamepad.deadman = gamepadButtonValue(gamepad, 7) >= 0.35;
+      } else {
+        browserGamepad.driveAxis = 0;
+        browserGamepad.steerAxis = 0;
+        browserGamepad.deadman = false;
+      }
+      updateBrowserGamepadReadout(gamepad);
+      autoClaimBrowserGamepad(gamepad, now);
+      sendBrowserGamepadCommand(gamepad, now);
+      window.requestAnimationFrame(pollBrowserGamepad);
+    }
+
+    async function releaseBrowserGamepad(reason='Released') {
+      const wasEnabled = browserGamepad.enabled;
+      browserGamepad.enabled = false;
+      browserGamepad.faulted = true;
+      browserGamepad.claimedThisPage = false;
+      browserGamepad.autoArmNeedsRtRelease = true;
+      browserGamepad.deadman = false;
+      browserGamepad.driveAxis = 0;
+      browserGamepad.steerAxis = 0;
+      updateBrowserGamepadReadout(currentBrowserGamepad());
+      try {
+        await api('/api/gamepad/release', 'POST', {
+          client_id: browserGamepad.clientId,
+          reason,
+        });
+        if (wasEnabled) showToast('Browser controller stopped and released.');
+      } catch (err) {
+        if (wasEnabled) showToast(String(err), 'error');
+      }
+    }
+
+    function releaseBrowserGamepadBeacon(reason) {
+      if (!browserGamepad.enabled) return;
+      browserGamepad.enabled = false;
+      browserGamepad.faulted = true;
+      browserGamepad.claimedThisPage = false;
+      browserGamepad.autoArmNeedsRtRelease = true;
+      const body = JSON.stringify({client_id: browserGamepad.clientId, reason});
+      try {
+        navigator.sendBeacon('/api/gamepad/release', new Blob([body], {type: 'application/json'}));
+      } catch (err) {
+        // The backend command timeout remains the final fail-safe.
+      }
+    }
+
+    function updateGamepadControlState(control) {
+      const state = control || {};
+      const owner = String(state.owner_client_id || '');
+      const enabled = !!state.enabled;
+      const sameBrowserLease = enabled && owner === browserGamepad.clientId;
+      const ownedByThisBrowser =
+        sameBrowserLease && browserGamepad.claimedThisPage && !browserGamepad.faulted;
+      browserGamepad.enabled = ownedByThisBrowser;
+      if (ownedByThisBrowser) {
+        setBrowserGamepadGear(String(state.gear || browserGamepad.gear));
+        browserGamepad.speedMode = String(state.speed_mode || browserGamepad.speedMode);
+      }
+      const label = String(state.control_label || 'Idle');
+      const topStatus = document.getElementById('controlModeStatus');
+      if (topStatus) topStatus.textContent = 'Control: ' + label;
     }
 
     function setOptions(selectId, items, selected) {
@@ -1975,29 +2808,99 @@ HTML_PAGE = """<!doctype html>
       }
     }
 
+    async function copyAllLogs() {
+      const consoleBox = document.getElementById('console');
+      const text = String(consoleBox?.value || '');
+      if (!text) {
+        showToast('No logs to copy.');
+        return;
+      }
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          consoleBox.focus();
+          consoleBox.select();
+          const copied = document.execCommand('copy');
+          consoleBox.setSelectionRange(text.length, text.length);
+          if (!copied) throw new Error('Copy command was rejected');
+        }
+        showToast('All logs copied.');
+      } catch (err) {
+        showToast('Unable to copy logs. Select the text and copy it manually.', 'error');
+      }
+    }
+
     function formatNumber(value, digits=2) {
       const num = Number(value);
       if (!Number.isFinite(num)) return value ?? '--';
       return num.toFixed(digits).replace(/\.?0+$/, '');
     }
 
+    function formatDriveMode(value) {
+      const normalized = String(value ?? '').trim().toLowerCase();
+      const labels = {
+        '1': 'Park',
+        '2': 'Neutral',
+        '5': '4-wheel steer',
+        '6': '4-wheel steer',
+        '7': 'Crab',
+        '8': 'Crab',
+        park: 'Park',
+        neutral: 'Neutral',
+        '4t4d': '4-wheel steer',
+        crab: 'Crab',
+      };
+      return labels[normalized] || (normalized ? String(value) : '--');
+    }
+
+    function formatLocalizationLabel(value) {
+      const normalized = String(value || '').trim().toLowerCase();
+      if (normalized === 'ready') return 'Localized';
+      if (normalized === 'not started') return 'Not started';
+      if (normalized === 'stopped') return 'Stopped';
+      if (normalized.includes('fail')) return 'Failed';
+      return value || '--';
+    }
+
+    function setTextContent(id, value) {
+      const element = document.getElementById(id);
+      if (element) element.textContent = value ?? '--';
+    }
+
+    function setMetricValue(id, value, unit='') {
+      const element = document.getElementById(id);
+      if (!element) return;
+      element.textContent = String(value ?? '--');
+      if (unit) {
+        const suffix = document.createElement('small');
+        suffix.textContent = unit;
+        element.appendChild(suffix);
+      }
+    }
+
     function updateVehicleStatus(status) {
       const root = document.getElementById('vehicleStatus');
+      if (!root) return;
+      const vxRaw = Number(status.motion?.vx_mps ?? status.motion?.vx);
+      const vyRaw = Number(status.motion?.vy_mps ?? status.motion?.vy);
+      const speed = Number.isFinite(vxRaw) && Number.isFinite(vyRaw)
+        ? formatNumber(Math.hypot(vxRaw, vyRaw), 2)
+        : '--';
+      const steering = formatNumber(status.steering?.wheel_angle_deg ?? '--', 1);
+      const soc = status.battery?.soc_pct ?? '--';
+      setMetricValue('metricSpeed', speed, 'm/s');
+      setMetricValue('metricSteering', steering, '°');
+      setMetricValue('metricBattery', soc, '%');
+      const charging = status.battery?.charging;
+      const currentMode = formatDriveMode(status.motion?.gear ?? status.steering?.gear);
       const entries = [
-        ['Gear', status.motion?.gear ?? '--'],
-        ['Linear X', formatNumber(status.motion?.vx_mps ?? status.motion?.vx ?? '--', 2)],
-        ['Linear Y', formatNumber(status.motion?.vy_mps ?? status.motion?.vy ?? '--', 2)],
-        ['Yaw Rate', formatNumber(status.motion?.wz_dps ?? status.motion?.wz ?? '--', 2)],
-        ['Battery', status.battery?.soc_pct ?? '--'],
-        ['Voltage', formatNumber(status.battery?.voltage_v ?? '--', 2)],
-        ['Current', formatNumber(status.battery?.current_a ?? '--', 2)],
-        ['Capacity', formatNumber(status.battery?.capacity_ah ?? '--', 2)],
-        ['Unlock', status.io?.unlock_ok ?? '--'],
-        ['Remote', status.io?.remote_control ?? '--'],
-        ['E-Stop', status.io?.estop ?? '--'],
-        ['Error', (status.error?.level ?? '--') + '/' + (status.error?.type ?? '--')],
+        ['Current Mode', currentMode, ''],
+        ['Charging', charging === true ? 'Charging' : charging === false ? 'Not charging' : '--', charging === true ? 'charging' : ''],
       ];
-      root.innerHTML = entries.map(([k, v]) => `<div>${k}</div><div>${v}</div>`).join('');
+      root.innerHTML = entries
+        .map(([k, v, className]) => `<div class="vehicle-metric ${className}"><span>${k}</span><strong>${v}</strong></div>`)
+        .join('');
     }
 
     function updateProjectionDebug(debug) {
@@ -2045,12 +2948,21 @@ HTML_PAGE = """<!doctype html>
     }
 
     function selectTab(tabName) {
-      activeTab = tabName;
-      for (const name of ['dashboard', 'tasks', 'library', 'settings']) {
-        document.getElementById('tab-' + name).classList.toggle('active', name === tabName);
-        document.getElementById('tabBtn-' + name).classList.toggle('active', name === tabName);
+      const overlayTabs = ['tasks', 'library', 'settings', 'logs'];
+      const requested = overlayTabs.includes(tabName) ? tabName : 'dashboard';
+      const nextTab = requested !== 'dashboard' && activeTab === requested ? 'dashboard' : requested;
+      activeTab = nextTab;
+      document.body.classList.toggle('workflow-overlay-open', nextTab === 'tasks');
+      document.getElementById('tab-dashboard')?.classList.add('active');
+      for (const name of overlayTabs) {
+        document.getElementById('tab-' + name)?.classList.toggle('active', name === nextTab);
+        document.getElementById('tabBtn-' + name)?.classList.toggle('active', name === nextTab);
       }
     }
+
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && activeTab !== 'dashboard') selectTab('dashboard');
+    });
 
     async function onRecordMapChanged() {
       const mapId = document.getElementById('recordMap').value;
@@ -2110,7 +3022,7 @@ HTML_PAGE = """<!doctype html>
         item => item.id === (activeLocalizationMapId || data.selected_replay_map_id || data.selected_record_map_id)
       );
       const selectedMission = (data.missions || []).find(item => item.id === data.selected_mission_id);
-      document.getElementById('workflowGateSummary').textContent = ready ? 'Ready for record or drive' : 'Waiting for map lock';
+      setTextContent('workflowGateSummary', ready ? 'Ready for record or drive' : 'Waiting for map lock');
       const workflowGateTuning = document.getElementById('workflowGateTuning');
       if (workflowGateTuning) workflowGateTuning.textContent = ready ? 'Ready for record or drive' : 'Waiting for map lock';
       document.getElementById('recordDependency').innerHTML = ready
@@ -2154,22 +3066,80 @@ HTML_PAGE = """<!doctype html>
       }
     }
 
+    function updateLidarPreview(preview) {
+      lidarFrame = preview && typeof preview === 'object' ? preview : null;
+      const live = !!(lidarFrame && lidarFrame.live);
+      const badge = document.getElementById('lidarDataBadge');
+      const pointCount = document.getElementById('lidarPointCount');
+      const scanRate = document.getElementById('lidarScanRate');
+      const channelState = document.getElementById('lidarChannelState');
+      const rowWidth = document.getElementById('lidarRowWidth');
+      const note = document.getElementById('lidarDataNote');
+      const geometry = lidarFrame?.geometry && typeof lidarFrame.geometry === 'object'
+        ? lidarFrame.geometry
+        : {};
+      const channelFound = live && geometry.found === true;
+      const controlAccepted = channelFound && geometry.control_accepted === true;
+      const centerOffset = Number(geometry.center_y_m);
+      setMetricValue(
+        'metricCenterOffset',
+        channelFound && Number.isFinite(centerOffset) ? centerOffset.toFixed(3) : '--',
+        'm',
+      );
+      setTextContent(
+        'metricGuidance',
+        controlAccepted ? 'Channel tracking' : live ? 'Lidar scanning' : 'Waiting /scan',
+      );
+      if (badge) {
+        badge.classList.toggle('live', controlAccepted);
+        badge.textContent = controlAccepted
+          ? `CHANNEL · ${Number(lidarFrame.scan_hz || 0).toFixed(1)} Hz`
+          : channelFound
+            ? `GEOMETRY ONLY · ${Number(lidarFrame.scan_hz || 0).toFixed(1)} Hz`
+          : live
+            ? `NO CHANNEL · ${Number(lidarFrame.scan_hz || 0).toFixed(1)} Hz`
+          : String(lidarFrame?.status || 'Waiting for /scan');
+      }
+      if (pointCount) pointCount.textContent = live ? String(lidarFrame.visible_count ?? lidarFrame.points?.length ?? 0) : '--';
+      if (scanRate) scanRate.textContent = live ? `${Number(lidarFrame.scan_hz || 0).toFixed(1)} Hz` : '-- Hz';
+      if (channelState) {
+        channelState.textContent = controlAccepted
+          ? 'TRACKABLE'
+          : channelFound
+            ? 'GEOMETRY ONLY'
+            : 'NOT DETECTED';
+      }
+      if (rowWidth) {
+        rowWidth.textContent = channelFound && Number.isFinite(Number(geometry.row_width_m))
+          ? `${Number(geometry.row_width_m).toFixed(2)} m`
+          : '--';
+      }
+      if (note) {
+        note.innerHTML = live
+          ? channelFound
+            ? `Two-side fit · left bins <strong>${Number(geometry.left_bins || 0)}</strong> · right bins <strong>${Number(geometry.right_bins || 0)}</strong> · measured width <strong>${Number(geometry.row_width_m || 0).toFixed(3)} m</strong>${controlAccepted ? '' : ' · guidance <strong>rejected</strong>'}`
+            : `Raw <strong>${Number(lidarFrame.raw_count || 0)}</strong> · valid <strong>${Number(lidarFrame.valid_count || 0)}</strong> · only raw points are shown`
+          : `Detection window <strong>0.15–1.60 m</strong> · side clearance <strong>0.10 m / side</strong>`;
+      }
+    }
+
     function applyState(data) {
       stateCache = data;
       const activeLocalizationMapId = data.active_localization_map_id || '';
       const localizationText = data.localization_status || 'Not started';
-      document.getElementById('taskStatus').textContent = data.task_status || 'Idle';
-      document.getElementById('localizationStatus').textContent = localizationText;
-      document.getElementById('cameraStatus').textContent = data.camera_status || 'Stopped';
-      document.getElementById('cameraStatusDashboard').textContent = data.camera_status || 'Stopped';
-      document.getElementById('previewSource').textContent = data.preview_source || 'Waiting';
-      document.getElementById('previewSourceDashboard').textContent = data.preview_source || 'Waiting';
-      document.getElementById('previewModeBadge').textContent = String(data.preview_source || 'Preview');
+      setTextContent('taskStatus', data.task_status || 'Idle');
+      setTextContent('localizationStatus', localizationText);
+      setTextContent('metricLocalization', formatLocalizationLabel(localizationText));
+      setTextContent('cameraStatus', data.camera_status || 'Stopped');
+      setTextContent('cameraStatusDashboard', data.camera_status || 'Stopped');
+      setTextContent('previewSource', data.preview_source || 'Waiting');
+      setTextContent('previewSourceDashboard', data.preview_source || 'Waiting');
+      setTextContent('previewModeBadge', String(data.preview_source || 'Preview'));
       const previewSourceTuning = document.getElementById('previewSourceTuning');
       if (previewSourceTuning) previewSourceTuning.textContent = data.preview_source || 'Waiting for preview stream';
       const previewModeBadgeTuning = document.getElementById('previewModeBadgeTuning');
       if (previewModeBadgeTuning) previewModeBadgeTuning.textContent = String(data.preview_source || 'Preview');
-      document.getElementById('canStateSummary').textContent = data.can_status || 'Unknown';
+      setTextContent('canStateSummary', data.can_status || 'Unknown');
 
       setOptions('recordMap', data.maps || [], activeLocalizationMapId || data.selected_record_map_id);
       setOptions('driveMap', data.maps || [], activeLocalizationMapId || data.selected_replay_map_id);
@@ -2183,16 +3153,19 @@ HTML_PAGE = """<!doctype html>
       const selectedMission = (data.missions || []).find(item => item.id === data.selected_mission_id);
       const libraryMap = (data.maps || []).find(item => item.id === data.selected_library_map_id);
       const libraryMission = (data.library_missions || []).find(item => item.id === data.selected_library_mission_id);
-      document.getElementById('selectedMapSummary').textContent = selectedMap ? selectedMap.label : '--';
-      document.getElementById('selectedMissionSummary').textContent = selectedMission ? selectedMission.label : '--';
+      setTextContent('selectedMapSummary', selectedMap ? selectedMap.label : '--');
+      setTextContent('selectedMissionSummary', selectedMission ? selectedMission.label : '--');
       document.getElementById('mapDeleteSummary').textContent = libraryMap ? libraryMap.label : 'No map selected.';
       document.getElementById('missionDeleteSummary').textContent = libraryMission ? libraryMission.label : 'No mission selected.';
       renderMissionPreview(data.selected_library_mission_preview || null);
 
-      document.getElementById('projectionSummary').textContent =
-        'h=' + (data.settings.sensor_height_m || '--') +
-        ', x=' + (data.settings.body_x_offset_m || '--') +
-        ', y=' + (data.settings.body_y_offset_m || '--');
+      const projectionSummary = document.getElementById('projectionSummary');
+      if (projectionSummary) {
+        projectionSummary.textContent =
+          'h=' + (data.settings.sensor_height_m || '--') +
+          ', x=' + (data.settings.body_x_offset_m || '--') +
+          ', y=' + (data.settings.body_y_offset_m || '--');
+      }
       const projectionSummaryTuning = document.getElementById('projectionSummaryTuning');
       if (projectionSummaryTuning) {
         projectionSummaryTuning.textContent =
@@ -2214,6 +3187,7 @@ HTML_PAGE = """<!doctype html>
       updateConsoleBox(data.logs || []);
 
       updateVehicleStatus(data.vehicle_status || {});
+      updateGamepadControlState(data.gamepad_control || {});
       updateProjectionDebug(data.pose_debug || {});
       updateWorkflowState(data);
 
@@ -2230,6 +3204,18 @@ HTML_PAGE = """<!doctype html>
         applyState(data);
       } catch (err) {
         console.error(err);
+      }
+    }
+
+    async function refreshLidarPreview() {
+      if (lidarRequestInFlight || document.hidden || activeTab !== 'dashboard') return;
+      lidarRequestInFlight = true;
+      try {
+        updateLidarPreview(await api('/api/lidar'));
+      } catch (err) {
+        console.error(err);
+      } finally {
+        lidarRequestInFlight = false;
       }
     }
 
@@ -2443,6 +3429,295 @@ HTML_PAGE = """<!doctype html>
       img.src = '/api/preview.jpg?t=' + Date.now();
     }
 
+    function drawLidarExample(timestamp=0) {
+      const canvas = document.getElementById('lidarExampleCanvas');
+      if (!canvas) return;
+      if (document.hidden || activeTab !== 'dashboard' || timestamp - lidarLastDrawAt < 66) {
+        window.requestAnimationFrame(drawLidarExample);
+        return;
+      }
+      lidarLastDrawAt = timestamp;
+      const ctx = canvas.getContext('2d');
+      const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+      const cssWidth = Math.max(320, canvas.clientWidth || 900);
+      const cssHeight = Math.max(250, canvas.clientHeight || 320);
+      const pixelWidth = Math.round(cssWidth * dpr);
+      const pixelHeight = Math.round(cssHeight * dpr);
+      if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+        canvas.width = pixelWidth;
+        canvas.height = pixelHeight;
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const style = getComputedStyle(document.body);
+      const themeDark = document.body.dataset.theme === 'dark';
+      const color = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
+      const bg = color('--ui-strong-surface-2', themeDark ? '#0b1422' : '#f8fafc');
+      const text = color('--ui-text', themeDark ? '#e5edf8' : '#172033');
+      const muted = color('--ui-muted', themeDark ? '#94a3b8' : '#64748b');
+      const line = color('--ui-line-soft', themeDark ? '#26354a' : '#dfe5ee');
+      const panel = color('--ui-strong-surface', themeDark ? '#111d2d' : '#ffffff');
+
+      const w = cssWidth;
+      const h = cssHeight;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, w, h);
+
+      const bounds = { xMin: -0.48, xMax: 1.78, yMin: -2.5, yMax: 2.5 };
+      const pad = { left: 44, right: 24, top: 28, bottom: 28 };
+      const plotW = w - pad.left - pad.right;
+      const plotH = h - pad.top - pad.bottom;
+      const metersToPixels = Math.min(
+        plotW / (bounds.yMax - bounds.yMin),
+        plotH / (bounds.xMax - bounds.xMin),
+      );
+      const usedPlotW = (bounds.yMax - bounds.yMin) * metersToPixels;
+      const usedPlotH = (bounds.xMax - bounds.xMin) * metersToPixels;
+      const plotOffsetX = pad.left + (plotW - usedPlotW) / 2;
+      const plotOffsetY = pad.top + (plotH - usedPlotH) / 2;
+      const project = (x, y) => ({
+        x: plotOffsetX + (y - bounds.yMin) * metersToPixels,
+        y: plotOffsetY + (bounds.xMax - x) * metersToPixels,
+      });
+      const linePath = (points) => {
+        ctx.beginPath();
+        points.forEach((point, index) => {
+          const p = project(point[0], point[1]);
+          if (index === 0) ctx.moveTo(p.x, p.y);
+          else ctx.lineTo(p.x, p.y);
+        });
+      };
+      const roundedRect = (x, y, width, height, radius) => {
+        const r = Math.min(radius, width / 2, height / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + width, y, x + width, y + height, r);
+        ctx.arcTo(x + width, y + height, x, y + height, r);
+        ctx.arcTo(x, y + height, x, y, r);
+        ctx.arcTo(x, y, x + width, y, r);
+        ctx.closePath();
+      };
+
+      ctx.lineWidth = 1;
+      ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
+      ctx.textBaseline = 'middle';
+      for (let x = -0.4; x <= 1.61; x += 0.2) {
+        const major = Math.abs((x * 10) % 5) < 0.01;
+        const p0 = project(x, bounds.yMin);
+        const p1 = project(x, bounds.yMax);
+        ctx.strokeStyle = major ? line : (themeDark ? 'rgba(148,163,184,.08)' : 'rgba(100,116,139,.08)');
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.stroke();
+        if (major && x >= 0) {
+          ctx.fillStyle = muted;
+          ctx.textAlign = 'right';
+          ctx.fillText(x.toFixed(1) + ' m', pad.left - 7, p0.y);
+        }
+      }
+      for (let y = -2.4; y <= 2.41; y += 0.2) {
+        const major = Math.abs((y * 10) % 5) < 0.01;
+        const p0 = project(bounds.xMin, y);
+        const p1 = project(bounds.xMax, y);
+        ctx.strokeStyle = major ? line : (themeDark ? 'rgba(148,163,184,.08)' : 'rgba(100,116,139,.08)');
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.stroke();
+      }
+
+      const cropTopLeft = project(1.60, -0.75);
+      const cropBottomRight = project(0.15, 0.75);
+      ctx.fillStyle = themeDark ? 'rgba(59,130,246,.035)' : 'rgba(59,130,246,.025)';
+      ctx.strokeStyle = themeDark ? 'rgba(96,165,250,.28)' : 'rgba(37,99,235,.19)';
+      ctx.setLineDash([5, 5]);
+      ctx.fillRect(cropTopLeft.x, cropTopLeft.y, cropBottomRight.x - cropTopLeft.x, cropBottomRight.y - cropTopLeft.y);
+      ctx.strokeRect(cropTopLeft.x, cropTopLeft.y, cropBottomRight.x - cropTopLeft.x, cropBottomRight.y - cropTopLeft.y);
+      ctx.setLineDash([]);
+
+      const hasLiveScan = !!(lidarFrame && lidarFrame.live);
+      const geometry = hasLiveScan && lidarFrame.geometry && typeof lidarFrame.geometry === 'object'
+        ? lidarFrame.geometry
+        : {};
+      const channelFound = geometry.found === true;
+      const controlAccepted = geometry.control_accepted === true;
+      const lineFunction = (value) => {
+        if (!Array.isArray(value) || value.length < 2) return null;
+        const slope = Number(value[0]);
+        const intercept = Number(value[1]);
+        if (!Number.isFinite(slope) || !Number.isFinite(intercept)) return null;
+        return x => slope * x + intercept;
+      };
+      const leftY = channelFound ? lineFunction(geometry.left_line) : null;
+      const rightY = channelFound ? lineFunction(geometry.right_line) : null;
+      const centerY = channelFound ? lineFunction(geometry.center_line) : null;
+      const renderChannel = !!(channelFound && leftY && rightY && centerY);
+      const xs = [];
+      for (let x = 0.10; x <= 1.64; x += 0.04) xs.push(x);
+
+      if (renderChannel) {
+        const corridor = [];
+        xs.forEach(x => corridor.push([x, leftY(x)]));
+        [...xs].reverse().forEach(x => corridor.push([x, rightY(x)]));
+        linePath(corridor);
+        ctx.closePath();
+        ctx.fillStyle = controlAccepted
+          ? (themeDark ? 'rgba(34,197,94,.07)' : 'rgba(22,163,74,.055)')
+          : (themeDark ? 'rgba(245,158,11,.08)' : 'rgba(217,119,6,.06)');
+        ctx.fill();
+      }
+
+      const rawPoint = (x, y, radius=1.45, alpha=.68) => {
+        const p = project(x, y);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+        ctx.fillStyle = themeDark ? `rgba(148,163,184,${alpha})` : `rgba(71,85,105,${alpha})`;
+        ctx.fill();
+      };
+      const liveScanPoints = hasLiveScan && Array.isArray(lidarFrame.points)
+        ? lidarFrame.points
+        : [];
+      if (hasLiveScan) {
+        liveScanPoints.forEach(point => {
+          if (!Array.isArray(point) || point.length < 2) return;
+          const x = Number(point[0]);
+          const y = Number(point[1]);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+          const inDetectionWindow = x >= 0.15 && x <= 1.60 && Math.abs(y) <= 0.75;
+          rawPoint(x, y, inDetectionWindow ? 1.85 : 1.25, inDetectionWindow ? .88 : .46);
+        });
+      } else {
+        const waitPoint = project(0.95, 0);
+        ctx.fillStyle = muted;
+        ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Waiting for live /scan · simulated points are disabled', waitPoint.x, waitPoint.y);
+      }
+
+      const drawFit = (fn, stroke, width=2.2) => {
+        linePath([[0.15, fn(0.15)], [1.60, fn(1.60)]]);
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = width;
+        ctx.setLineDash(controlAccepted ? [] : [6, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      };
+      if (renderChannel) {
+        drawFit(leftY, '#16a34a', 2.2);
+        drawFit(rightY, '#ea580c', 2.2);
+        drawFit(centerY, '#e11d48', 2.8);
+        linePath([[0, centerY(0)], [-0.43, centerY(-0.43)]]);
+        ctx.strokeStyle = '#93c5fd';
+        ctx.lineWidth = 1.6;
+        ctx.setLineDash([6, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      } else if (hasLiveScan) {
+        const statusPoint = project(0.82, 0);
+        ctx.fillStyle = themeDark ? 'rgba(15,23,42,.78)' : 'rgba(255,255,255,.84)';
+        roundedRect(statusPoint.x - 76, statusPoint.y - 13, 152, 26, 13);
+        ctx.fill();
+        ctx.fillStyle = muted;
+        ctx.font = '600 10px ui-sans-serif, system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('No valid channel detected', statusPoint.x, statusPoint.y);
+      }
+
+      const sweepX = 0.15 + ((timestamp / 1800) % 1) * 1.45;
+      const sweep = project(sweepX, 0);
+      const sweepLeft = project(sweepX, -0.75);
+      const sweepRight = project(sweepX, 0.75);
+      const sweepGradient = ctx.createLinearGradient(sweepLeft.x, 0, sweepRight.x, 0);
+      sweepGradient.addColorStop(0, 'rgba(59,130,246,0)');
+      sweepGradient.addColorStop(.5, themeDark ? 'rgba(96,165,250,.38)' : 'rgba(37,99,235,.24)');
+      sweepGradient.addColorStop(1, 'rgba(59,130,246,0)');
+      ctx.strokeStyle = sweepGradient;
+      ctx.lineWidth = 1.3;
+      ctx.beginPath();
+      ctx.moveTo(sweepLeft.x, sweep.y);
+      ctx.lineTo(sweepRight.x, sweep.y);
+      ctx.stroke();
+
+      const vehicleFrontLeft = project(0.22, -0.20);
+      const vehicleRearRight = project(-0.40, 0.20);
+      const vehicleX = vehicleFrontLeft.x;
+      const vehicleY = vehicleFrontLeft.y;
+      const vehicleW = vehicleRearRight.x - vehicleFrontLeft.x;
+      const vehicleH = vehicleRearRight.y - vehicleFrontLeft.y;
+      roundedRect(vehicleX, vehicleY, vehicleW, vehicleH, 7);
+      ctx.fillStyle = themeDark ? '#17263b' : '#f8fafc';
+      ctx.fill();
+      ctx.strokeStyle = themeDark ? '#dbeafe' : '#334155';
+      ctx.lineWidth = 1.8;
+      ctx.stroke();
+      const vehicleCenter = project(-0.09, 0);
+      const vehicleNose = project(0.17, 0);
+      ctx.strokeStyle = '#0ea5e9';
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.moveTo(vehicleCenter.x, vehicleCenter.y);
+      ctx.lineTo(vehicleNose.x, vehicleNose.y);
+      ctx.stroke();
+      ctx.fillStyle = '#0ea5e9';
+      ctx.beginPath();
+      ctx.moveTo(vehicleNose.x, vehicleNose.y - 5);
+      ctx.lineTo(vehicleNose.x - 4, vehicleNose.y + 3);
+      ctx.lineTo(vehicleNose.x + 4, vehicleNose.y + 3);
+      ctx.closePath();
+      ctx.fill();
+
+      const lidar = project(0.035, 0);
+      ctx.fillStyle = '#22d3ee';
+      ctx.beginPath();
+      ctx.arc(lidar.x, lidar.y, 3.4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = themeDark ? 'rgba(34,211,238,.22)' : 'rgba(8,145,178,.18)';
+      ctx.beginPath();
+      ctx.arc(lidar.x, lidar.y, 7, 0, Math.PI * 2);
+      ctx.stroke();
+
+      if (renderChannel) {
+        const lookahead = project(0.60, centerY(0.60));
+        const pulse = 4.2 + 1.2 * (0.5 + 0.5 * Math.sin(timestamp / 320));
+        ctx.fillStyle = panel;
+        ctx.strokeStyle = '#e11d48';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(lookahead.x, lookahead.y, pulse, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = text;
+        ctx.font = '600 10px ui-sans-serif, system-ui, sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText('0.60 m lookahead', lookahead.x + 9, lookahead.y - 8);
+      }
+      ctx.fillStyle = muted;
+      ctx.font = '9.5px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillText('vehicle 0.40 × 0.62 m', vehicleRearRight.x + 8, vehicleRearRight.y - 8);
+
+      if (renderChannel) {
+        const widthX = 1.42;
+        const leftWidthPoint = project(widthX, leftY(widthX));
+        const rightWidthPoint = project(widthX, rightY(widthX));
+        ctx.strokeStyle = themeDark ? 'rgba(226,232,240,.56)' : 'rgba(51,65,85,.46)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(leftWidthPoint.x, leftWidthPoint.y);
+        ctx.lineTo(rightWidthPoint.x, rightWidthPoint.y);
+        ctx.stroke();
+        ctx.fillStyle = muted;
+        ctx.textAlign = 'center';
+        ctx.fillText(
+          `${Number(geometry.row_width_m || 0).toFixed(2)} m row`,
+          (leftWidthPoint.x + rightWidthPoint.x) / 2,
+          leftWidthPoint.y - 9,
+        );
+      }
+      window.requestAnimationFrame(drawLidarExample);
+    }
+
     for (const id of editableFieldIds) markFieldDirty(id);
     const consoleBox = document.getElementById('console');
     if (consoleBox) {
@@ -2451,15 +3726,350 @@ HTML_PAGE = """<!doctype html>
         consoleAutoFollow = nearBottom;
       });
     }
+    window.addEventListener('gamepadconnected', event => {
+      if (!isXboxGamepad(event.gamepad)) return;
+      browserGamepad.index = event.gamepad.index;
+      browserGamepad.autoArmNeedsRtRelease = true;
+      browserGamepad.nextAutoClaimAt = 0;
+      showToast('Xbox controller detected. Connecting automatically.');
+    });
+    window.addEventListener('gamepaddisconnected', event => {
+      if (browserGamepad.index === event.gamepad.index) browserGamepad.index = null;
+      browserGamepad.deadman = false;
+      browserGamepad.driveAxis = 0;
+      browserGamepad.steerAxis = 0;
+      browserGamepad.lastSendAt = 0;
+      if (isXboxGamepad(event.gamepad)) {
+        releaseBrowserGamepad('Xbox controller disconnected');
+        showToast('Xbox controller disconnected. Vehicle stopping now.', 'error');
+      }
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) releaseBrowserGamepadBeacon('Page hidden');
+    });
+    window.addEventListener('pagehide', () => releaseBrowserGamepadBeacon('Page closed'));
+    if (!('getGamepads' in navigator)) {
+      showToast('This browser cannot read the Xbox controller. Use the latest Chrome or Edge.', 'error');
+    }
     setTheme(localStorage.getItem('autorun_final_theme') || defaultTheme);
     setInterval(refreshState, 1000);
+    setInterval(refreshLidarPreview, 200);
     setInterval(refreshPreview, 250);
+    window.requestAnimationFrame(pollBrowserGamepad);
+    window.requestAnimationFrame(drawLidarExample);
     refreshState();
+    refreshLidarPreview();
     refreshPreview();
   </script>
 </body>
 </html>
 """
+
+
+class RosLaserScanMonitor:
+    def __init__(
+        self,
+        sink: queue.Queue[tuple[str, Any]],
+        topic: str = LIDAR_SCAN_TOPIC,
+    ) -> None:
+        self.sink = sink
+        self.topic = topic
+        self.calibration = load_lidar_preview_calibration()
+        self.running = False
+        self.subscription: Any = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.last_emit = 0.0
+        self.scan_times: deque[float] = deque(maxlen=40)
+        self.scan_hz = 0.0
+        self.min_emit_interval = 0.12
+        self.last_good_row_width = 0.60
+        self.row_cfg = RowFollowerConfig(
+            row_width=0.60,
+            min_row_width=0.48,
+            max_row_width=0.78,
+            lookahead_x=0.60,
+            forward_min=0.15,
+            forward_max=1.60,
+            lateral_limit=0.75,
+            range_min=0.05,
+            range_max=6.0,
+            bin_size=0.20,
+            min_points=16,
+            min_bins=2,
+            min_line_bins=4,
+            min_side_points_per_bin=2,
+            center_deadband=0.03,
+            left_percentile=20.0,
+            right_percentile=80.0,
+            sensor_yaw_deg=180.0,
+            lidar_yaw_correction_deg=self.calibration["lidar_yaw_correction_deg"],
+            lidar_x_offset_m=self.calibration["lidar_x_offset_m"],
+            lidar_y_offset_m=self.calibration["lidar_y_offset_m"],
+            boundary_max_gap_x=0.45,
+            boundary_width_tolerance_m=0.0,
+            vehicle_half_width=0.20,
+            safety_margin=0.03,
+            center_jump_reject=0.25,
+            one_side_center_jump_reject=0.30,
+        )
+
+    def start(self) -> None:
+        self.running = True
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.running = False
+
+    def _run(self) -> None:
+        try:
+            ros_thread = ensure_ros_monitor_node()
+            self.subscription = ros_thread.node.create_subscription(
+                RosLaserScan,
+                self.topic,
+                self._on_scan,
+                10,
+            )
+            self.sink.put(("log", f"{now_text()} Lidar preview monitor subscribed to {self.topic}."))
+            self.sink.put(("lidar_status", f"Waiting for {self.topic}"))
+            while self.running:
+                time.sleep(0.1)
+        except Exception as exc:
+            self.sink.put(("log", f"{now_text()} Lidar preview monitor failed: {exc}"))
+            self.sink.put(("lidar_status", "Monitor failed"))
+        finally:
+            self.sink.put(("lidar_status", "Monitor stopped"))
+
+    def _on_scan(self, msg: RosLaserScan) -> None:
+        if not self.running:
+            return
+        now = time.monotonic()
+        self.scan_times.append(now)
+        if len(self.scan_times) >= 2:
+            elapsed = self.scan_times[-1] - self.scan_times[0]
+            if elapsed > 1e-4:
+                self.scan_hz = (len(self.scan_times) - 1) / elapsed
+        if now - self.last_emit < self.min_emit_interval:
+            return
+        self.last_emit = now
+
+        yaw_correction_deg = self.calibration["lidar_yaw_correction_deg"]
+        sensor_yaw = math.radians(180.0 + yaw_correction_deg)
+        cos_yaw = math.cos(sensor_yaw)
+        sin_yaw = math.sin(sensor_yaw)
+        offset_x = self.calibration["lidar_x_offset_m"]
+        offset_y = self.calibration["lidar_y_offset_m"]
+        min_range = max(float(msg.range_min), 0.05)
+        max_range = min(float(msg.range_max), 6.0)
+        visible_points: list[list[float]] = []
+        valid_count = 0
+        for index, raw_range in enumerate(msg.ranges):
+            distance = float(raw_range)
+            if not math.isfinite(distance) or distance < min_range or distance > max_range:
+                continue
+            valid_count += 1
+            angle = float(msg.angle_min) + index * float(msg.angle_increment)
+            sensor_x = distance * math.cos(angle)
+            sensor_y = distance * math.sin(angle)
+            body_x = cos_yaw * sensor_x - sin_yaw * sensor_y + offset_x
+            body_y = sin_yaw * sensor_x + cos_yaw * sensor_y + offset_y
+            if -0.55 <= body_x <= 1.85 and -2.55 <= body_y <= 2.55:
+                visible_points.append([round(body_x, 4), round(body_y, 4)])
+
+        max_points = 720
+        if len(visible_points) > max_points:
+            step = max(1, math.ceil(len(visible_points) / max_points))
+            visible_points = visible_points[::step][:max_points]
+
+        geometry: dict[str, Any]
+        try:
+            estimate, debug = estimate_row(msg, self.row_cfg, self.last_good_row_width)
+
+            def point_list(values: Any, limit: int = 120) -> list[list[float]]:
+                array = np.asarray(values, dtype=np.float64)
+                if array.ndim != 2 or array.shape[1] < 2 or len(array) == 0:
+                    return []
+                if len(array) > limit:
+                    stride = max(1, math.ceil(len(array) / limit))
+                    array = array[::stride][:limit]
+                return [
+                    [round(float(point[0]), 4), round(float(point[1]), 4)]
+                    for point in array
+                    if math.isfinite(float(point[0])) and math.isfinite(float(point[1]))
+                ]
+
+            def line_value(value: Any) -> list[float] | None:
+                if value is None or len(value) < 2:
+                    return None
+                slope = float(value[0])
+                intercept = float(value[1])
+                if not math.isfinite(slope) or not math.isfinite(intercept):
+                    return None
+                return [round(slope, 6), round(intercept, 6)]
+
+            left_line = line_value(estimate.left_line)
+            right_line = line_value(estimate.right_line)
+            center_line = line_value(estimate.center_line)
+            measured_widths: list[float] = []
+            if left_line is not None and right_line is not None:
+                for sample_x in (0.30, 0.60, 0.90, 1.20):
+                    measured_widths.append(
+                        abs(
+                            (left_line[0] * sample_x + left_line[1])
+                            - (right_line[0] * sample_x + right_line[1])
+                        )
+                    )
+            measured_width = (
+                sum(measured_widths) / len(measured_widths)
+                if measured_widths
+                else 0.0
+            )
+            width_valid = bool(
+                measured_widths
+                and all(
+                    self.row_cfg.min_row_width <= width <= self.row_cfg.max_row_width
+                    for width in measured_widths
+                )
+            )
+            # A visible channel requires two independently validated, parallel boundaries.
+            # A one-sided/virtual estimate remains useful to the controller, but must not be
+            # presented in the UI as a measured flower-pot corridor.
+            geometry_found = bool(
+                estimate.left_valid
+                and estimate.right_valid
+                and str(estimate.effective_mode or estimate.mode) == "both_sides"
+                and left_line is not None
+                and right_line is not None
+                and center_line is not None
+                and width_valid
+            )
+            control_accepted = bool(geometry_found and estimate.found)
+            if geometry_found:
+                self.last_good_row_width = measured_width
+            reject_reason = str(estimate.reject_reason or "")
+            if estimate.found and not geometry_found:
+                reject_reason = "not_a_complete_two_side_channel"
+                if not width_valid and measured_widths:
+                    reject_reason = "row_width_out_of_range"
+            geometry = {
+                "found": geometry_found,
+                "control_accepted": control_accepted,
+                "algorithm_found": bool(estimate.found),
+                "mode": str(estimate.mode or estimate.effective_mode or "lost"),
+                "reject_reason": reject_reason,
+                "warning": str(estimate.warning or ""),
+                "row_width_m": round(measured_width, 4) if measured_width > 0.0 else None,
+                "target_row_width_m": self.row_cfg.row_width,
+                "center_y_m": (
+                    round(float(estimate.center_y if control_accepted else estimate.raw_center_y), 4)
+                    if geometry_found
+                    else None
+                ),
+                "heading_deg": (
+                    round(math.degrees(math.atan(float(center_line[0]))), 3)
+                    if geometry_found and center_line is not None
+                    else None
+                ),
+                "left_valid": bool(estimate.left_valid),
+                "right_valid": bool(estimate.right_valid),
+                "left_bins": int(estimate.left_bins),
+                "right_bins": int(estimate.right_bins),
+                "candidate_bins": int(estimate.candidate_bins),
+                "left_line": left_line if geometry_found else None,
+                "right_line": right_line if geometry_found else None,
+                "center_line": center_line if geometry_found else None,
+                "left_points": point_list(debug.left_points) if geometry_found else [],
+                "right_points": point_list(debug.right_points) if geometry_found else [],
+                "center_points": point_list(debug.center_points) if geometry_found else [],
+            }
+        except Exception as exc:
+            geometry = {
+                "found": False,
+                "algorithm_found": False,
+                "mode": "fit_error",
+                "reject_reason": str(exc),
+                "left_line": None,
+                "right_line": None,
+                "center_line": None,
+                "left_points": [],
+                "right_points": [],
+                "center_points": [],
+            }
+        self.sink.put((
+            "lidar_scan",
+            {
+                "topic": self.topic,
+                "frame_id": str(msg.header.frame_id or "laser"),
+                "points": visible_points,
+                "raw_count": len(msg.ranges),
+                "valid_count": valid_count,
+                "visible_count": len(visible_points),
+                "scan_hz": round(self.scan_hz, 1),
+                "received_monotonic": now,
+                "sensor_yaw_deg": 180.0,
+                "yaw_correction_deg": yaw_correction_deg,
+                "offset_x_m": offset_x,
+                "offset_y_m": offset_y,
+                "geometry": geometry,
+            },
+        ))
+
+
+class RosChassisChargeMonitor:
+    """Read the BMS charging flag from the official chassis feedback topic."""
+
+    def __init__(self, sink: queue.Queue[tuple[str, Any]]) -> None:
+        self.sink = sink
+        self.running = False
+        self.subscription: Any | None = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.running = True
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.running = False
+
+    def _run(self) -> None:
+        try:
+            ros_thread = ensure_ros_monitor_node()
+            self.subscription = ros_thread.node.create_subscription(
+                ChassisInfoFb,
+                "chassis_info_fb",
+                self._on_feedback,
+                10,
+            )
+            self.sink.put((
+                "log",
+                f"{now_text()} Charging monitor subscribed to chassis_info_fb "
+                "(BMS charge flag).",
+            ))
+            while self.running:
+                time.sleep(0.1)
+        except Exception as exc:
+            self.sink.put(("log", f"{now_text()} Charging monitor failed: {exc}"))
+
+    def _on_feedback(self, msg: ChassisInfoFb) -> None:
+        if not self.running:
+            return
+        bms = getattr(msg, "bms_flag_fb", None)
+        io_fb = getattr(msg, "io_fb", None)
+        self.sink.put((
+            "charge_feedback",
+            {
+                "charging": (
+                    bool(getattr(bms, "bms_flag_fb_charge_flag"))
+                    if bms is not None and hasattr(bms, "bms_flag_fb_charge_flag")
+                    else None
+                ),
+                "charge_dock": (
+                    bool(getattr(io_fb, "io_fb_charge_state"))
+                    if io_fb is not None and hasattr(io_fb, "io_fb_charge_state")
+                    else None
+                ),
+                "received_monotonic": time.monotonic(),
+            },
+        ))
 
 
 class WebController:
@@ -2472,9 +4082,16 @@ class WebController:
         self.record_localization_worker: ProcessWorker | None = None
         self.replay_localization_worker: ProcessWorker | None = None
         self.preview_worker: ProcessWorker | None = None
+        self.preview_restart_at = 0.0
+        self.lidar_worker: ProcessWorker | None = None
+        self.lidar_restart_at = 0.0
+        self.lidar_driver_probe_at = 0.0
         self.camera_monitor: RosImageMonitor | None = None
         self.pose_debug_monitor: RosPoseDebugMonitor | None = None
+        self.lidar_monitor: RosLaserScanMonitor | None = None
+        self.chassis_charge_monitor: RosChassisChargeMonitor | None = None
         self.camera_status = "Stopped"
+        self.lidar_status = "Starting..."
         self.can_status = "Unknown"
         self.preview_source = "Waiting for preview stream"
         self.localization_status = "Not started"
@@ -2482,6 +4099,32 @@ class WebController:
         self.localization_map_path: Path | None = None
         self.pending_action: str | None = None
         self.latest_preview_jpeg: bytes | None = None
+        self.latest_camera_frame_at = 0.0
+        self.latest_lidar_scan: dict[str, Any] = {}
+        self.vehicle_status: dict[str, Any] = {}
+        self.charge_feedback: dict[str, Any] = {}
+        self.gamepad_control: dict[str, Any] = {
+            "enabled": False,
+            "owner_client_id": "",
+            "browser_connected": False,
+            "device_name": "",
+            "deadman": False,
+            "gear": "4t4d",
+            "speed_mode": "low",
+            "drive_axis": 0.0,
+            "steer_axis": 0.0,
+            "last_packet_at": 0.0,
+            "status": "Disabled",
+            "blocked_reason": "",
+            "control_source": "idle",
+            "control_label": "Idle",
+            "final_vx": 0.0,
+            "final_vy": 0.0,
+            "final_wz_deg": 0.0,
+            "final_crab_angle_deg": 0.0,
+        }
+        self._gamepad_output_active = False
+        self._gamepad_last_published_gear = ""
         self.map_paths: dict[str, Path] = {}
         self.mission_paths: dict[str, Path] = {}
         self.library_mission_paths: dict[str, Path] = {}
@@ -2509,11 +4152,236 @@ class WebController:
         self._refresh_missions()
         self.can_status = self._query_can_state(str(self.settings.get("can_channel") or "can0"))
         self._log("Web UI is ready.")
+        self._auto_connect_can()
         self._start_pose_debug_monitor()
         self.event_thread = threading.Thread(target=self._pump_events, daemon=True)
         self.event_thread.start()
+        self._start_chassis_charge_monitor()
+        self._start_lidar_monitor()
+        self._start_lidar_preview_driver(auto=True)
+        # Subscribe first. An already-running publisher may own /dev/video0 and
+        # provide the preview topic; only start our own publisher if no frames arrive.
+        self._start_camera_monitor()
+        self.preview_restart_at = time.monotonic() + 1.5
         self.status_thread = threading.Thread(target=self._poll_vehicle_status, daemon=True)
         self.status_thread.start()
+        self.gamepad_thread = threading.Thread(target=self._gamepad_control_loop, daemon=True)
+        self.gamepad_thread.start()
+
+    @staticmethod
+    def _clamp_gamepad_axis(value: Any) -> float:
+        try:
+            number = float(value)
+        except Exception:
+            return 0.0
+        if not math.isfinite(number):
+            return 0.0
+        return max(-1.0, min(1.0, number))
+
+    def claim_gamepad_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id") or "").strip()
+        if not client_id:
+            raise RuntimeError("Missing browser gamepad client ID.")
+        with self.lock:
+            owner = str(self.gamepad_control.get("owner_client_id") or "")
+            last_packet_at = float(self.gamepad_control.get("last_packet_at") or 0.0)
+            owner_is_fresh = (time.monotonic() - last_packet_at) <= 2.0
+            if bool(self.gamepad_control.get("enabled")) and owner and owner != client_id and owner_is_fresh:
+                raise RuntimeError("Web gamepad control is already active in another browser.")
+            if self.task_status == "Hybrid Drive":
+                raise RuntimeError("Stop Hybrid Drive before enabling the web gamepad.")
+            self.gamepad_control.update(
+                {
+                    "enabled": True,
+                    "owner_client_id": client_id,
+                    "browser_connected": bool(payload.get("connected", False)),
+                    "device_name": str(payload.get("device_name") or "")[:160],
+                    "deadman": False,
+                    "drive_axis": 0.0,
+                    "steer_axis": 0.0,
+                    "last_packet_at": time.monotonic(),
+                    "status": "Waiting for controller input",
+                    "blocked_reason": "",
+                }
+            )
+            self._log("Web gamepad control enabled. Hold RT to move.")
+            return self._gamepad_state_locked()
+
+    def update_gamepad_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+        client_id = str(payload.get("client_id") or "").strip()
+        with self.lock:
+            if not bool(self.gamepad_control.get("enabled")):
+                raise RuntimeError("Web gamepad control is not enabled.")
+            if client_id != str(self.gamepad_control.get("owner_client_id") or ""):
+                raise RuntimeError("This browser does not own web gamepad control.")
+            gear = str(payload.get("gear") or self.gamepad_control.get("gear") or "4t4d").strip().lower()
+            if gear not in {"4t4d", "crab", "park", "neutral"}:
+                gear = "4t4d"
+            speed_mode = str(payload.get("speed_mode") or "low").strip().lower()
+            if speed_mode not in GAMEPAD_SPEED_LIMITS:
+                speed_mode = "low"
+            connected = bool(payload.get("connected", False))
+            self.gamepad_control.update(
+                {
+                    "browser_connected": connected,
+                    "device_name": str(payload.get("device_name") or "")[:160],
+                    "deadman": connected and bool(payload.get("deadman", False)),
+                    "gear": gear,
+                    "speed_mode": speed_mode,
+                    "drive_axis": self._clamp_gamepad_axis(payload.get("drive_axis", 0.0)),
+                    "steer_axis": self._clamp_gamepad_axis(payload.get("steer_axis", 0.0)),
+                    "last_packet_at": time.monotonic(),
+                }
+            )
+            return self._gamepad_state_locked()
+
+    def release_gamepad_control(self, payload: dict[str, Any] | None = None, *, reason: str = "Released") -> None:
+        client_id = str((payload or {}).get("client_id") or "").strip()
+        reason = str(reason or "Released")[:160]
+        with self.lock:
+            owner = str(self.gamepad_control.get("owner_client_id") or "")
+            if client_id and owner and client_id != owner:
+                raise RuntimeError("This browser does not own web gamepad control.")
+            was_enabled = bool(self.gamepad_control.get("enabled"))
+            self.gamepad_control.update(
+                {
+                    "enabled": False,
+                    "owner_client_id": "",
+                    "browser_connected": False,
+                    "deadman": False,
+                    "drive_axis": 0.0,
+                    "steer_axis": 0.0,
+                    "status": reason,
+                    "blocked_reason": "",
+                    "final_vx": 0.0,
+                    "final_vy": 0.0,
+                    "final_wz_deg": 0.0,
+                    "final_crab_angle_deg": 0.0,
+                }
+            )
+            if was_enabled:
+                self._publish_gamepad_stop_locked()
+                self._log(f"Web gamepad control released: {reason}.")
+
+    def _publish_gamepad_stop_locked(self) -> None:
+        io_state = self.vehicle_status.get("io", {}) if isinstance(self.vehicle_status, dict) else {}
+        if bool(io_state.get("remote_control", False)) or bool(io_state.get("estop", False)):
+            self._gamepad_output_active = False
+            return
+        gear = str(self.gamepad_control.get("gear") or "4t4d")
+        if gear not in {"4t4d", "crab"}:
+            gear = "neutral"
+        bridge = get_bridge()
+        if gear == "crab":
+            angle = self._clamp_gamepad_axis(
+                float(self.gamepad_control.get("final_crab_angle_deg") or 0.0) / 90.0
+            ) * 90.0
+            bridge.publish_steering("crab", 0.0, angle)
+        else:
+            bridge.publish_body(gear, 0.0, 0.0, 0.0)
+        bridge.publish_io(unlock=False, brake=True)
+        self._gamepad_output_active = False
+        self._gamepad_last_published_gear = gear
+
+    def _gamepad_state_locked(self) -> dict[str, Any]:
+        now = time.monotonic()
+        packet_at = float(self.gamepad_control.get("last_packet_at") or 0.0)
+        packet_age_ms = None if packet_at <= 0.0 else max(0, int((now - packet_at) * 1000.0))
+        state = dict(self.gamepad_control)
+        state["packet_age_ms"] = packet_age_ms
+        state["command_timeout_ms"] = int(GAMEPAD_COMMAND_TIMEOUT_S * 1000.0)
+        return state
+
+    def _gamepad_control_loop(self) -> None:
+        bridge = get_bridge()
+        while not self.closing:
+            with self.lock:
+                now = time.monotonic()
+                state = self.gamepad_control
+                io_state = self.vehicle_status.get("io", {}) if isinstance(self.vehicle_status, dict) else {}
+                physical_remote = bool(io_state.get("remote_control", False))
+                estop = bool(io_state.get("estop", False))
+                enabled = bool(state.get("enabled", False))
+                connected = bool(state.get("browser_connected", False))
+                packet_at = float(state.get("last_packet_at") or 0.0)
+                fresh = packet_at > 0.0 and (now - packet_at) <= GAMEPAD_COMMAND_TIMEOUT_S
+                automatic_drive = self.task_status == "Hybrid Drive"
+                blocked_reason = ""
+                if physical_remote:
+                    source, label = "remote_controller", "Remote control"
+                    blocked_reason = "Physical remote controller has priority"
+                elif automatic_drive:
+                    source, label = "automatic", "Automatic"
+                    blocked_reason = "Hybrid Drive is running"
+                elif enabled:
+                    source, label = "browser_gamepad", "Gamepad"
+                    if estop:
+                        blocked_reason = "Emergency stop is active"
+                    elif not connected:
+                        blocked_reason = "Controller is not detected by the browser"
+                    elif not fresh:
+                        blocked_reason = "Browser command timed out"
+                else:
+                    source, label = "idle", "Idle"
+
+                gear = str(state.get("gear") or "4t4d")
+                deadman = bool(state.get("deadman", False))
+                can_publish = enabled and connected and fresh and not physical_remote and not estop and not automatic_drive
+                command_active = can_publish and deadman and gear in {"4t4d", "crab"}
+                speed_mode = str(state.get("speed_mode") or "low")
+                linear_limit, yaw_limit_deg = GAMEPAD_SPEED_LIMITS.get(speed_mode, GAMEPAD_SPEED_LIMITS["low"])
+                drive_axis = self._clamp_gamepad_axis(state.get("drive_axis", 0.0))
+                steer_axis = self._clamp_gamepad_axis(state.get("steer_axis", 0.0))
+                drive_speed = drive_axis * linear_limit if command_active else 0.0
+                vx = drive_speed if gear == "4t4d" else 0.0
+                vy = 0.0
+                wz_deg = steer_axis * yaw_limit_deg if command_active and gear == "4t4d" else 0.0
+                crab_angle_deg = steer_axis * 90.0 if gear == "crab" else 0.0
+
+                state["control_source"] = source
+                state["control_label"] = label
+                state["blocked_reason"] = blocked_reason
+                state["final_vx"] = round(vx, 3)
+                state["final_vy"] = round(vy, 3)
+                state["final_wz_deg"] = round(wz_deg, 2)
+                state["final_crab_angle_deg"] = round(crab_angle_deg, 2)
+                if command_active:
+                    active_speed = drive_speed if gear == "crab" else vx
+                    state["status"] = "Driving" if abs(active_speed) > 1e-4 else "Ready"
+                    if gear == "crab":
+                        bridge.publish_steering("crab", drive_speed, crab_angle_deg)
+                    else:
+                        bridge.publish_body(gear, vx, 0.0, math.radians(wz_deg))
+                    bridge.publish_io(unlock=True, brake=False)
+                    self._gamepad_output_active = True
+                    self._gamepad_last_published_gear = gear
+                else:
+                    if enabled and blocked_reason:
+                        state["status"] = blocked_reason
+                    elif enabled and connected and fresh:
+                        state["status"] = "Ready - hold RT to move"
+                    elif not enabled:
+                        state["status"] = "Disabled"
+                    should_stop_previous_motion = (
+                        self._gamepad_output_active
+                        and not physical_remote
+                        and not estop
+                        and not automatic_drive
+                    )
+                    should_send_zero = should_stop_previous_motion or (
+                        can_publish
+                        and gear in {"4t4d", "crab", "park", "neutral"}
+                        and gear != self._gamepad_last_published_gear
+                    )
+                    if should_send_zero:
+                        if gear == "crab":
+                            bridge.publish_steering("crab", 0.0, crab_angle_deg)
+                        else:
+                            bridge.publish_body(gear, 0.0, 0.0, 0.0)
+                        bridge.publish_io(unlock=False, brake=True)
+                        self._gamepad_last_published_gear = gear
+                    self._gamepad_output_active = False
+            time.sleep(GAMEPAD_CONTROL_PERIOD_S)
 
     def _load_settings(self) -> None:
         try:
@@ -2543,12 +4411,30 @@ class WebController:
         except Exception:
             return "Unavailable"
         text = result.stdout
-        match = re.search(r"state\\s+([A-Z]+)", text)
+        flags_match = re.search(r"<([^>]*)>", text)
+        if flags_match and "UP" in {flag.strip().upper() for flag in flags_match.group(1).split(",")}:
+            return "UP"
+        match = re.search(r"state\s+([A-Z]+)", text)
         if match:
             return match.group(1)
-        if "<NOARP,UP" in text or ",UP" in text:
-            return "UP"
         return "UNKNOWN"
+
+    def _auto_connect_can(self) -> None:
+        channel = str(self.settings.get("can_channel") or "can0").strip() or "can0"
+        bitrate = str(self.settings.get("can_bitrate") or "500000").strip() or "500000"
+        current_state = self._query_can_state(channel)
+        if current_state == "UP":
+            self.can_status = current_state
+            self._log(f"CAN {channel} is already up; automatic connection reused it.")
+            return
+        self._log(
+            f"CAN {channel} is {current_state}. Automatically connecting at {bitrate} bps."
+        )
+        try:
+            self.connect_can(channel, bitrate)
+        except Exception as exc:
+            self.can_status = self._query_can_state(channel)
+            self._log(f"Automatic CAN connection failed: {exc}")
 
     def connect_can(self, channel: str, bitrate: str | int) -> None:
         with self.lock:
@@ -3047,6 +4933,70 @@ class WebController:
             "--publish-fps", "6.0",
         ]
 
+    def _lidar_driver_running(self) -> bool:
+        patterns = (str(LIDAR_DRIVER_BIN), "ros2 run lidar_pkg lidar_node")
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "args="],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except Exception:
+            return False
+        for line in result.stdout.splitlines():
+            command = line.strip()
+            if command and any(pattern in command for pattern in patterns):
+                return True
+        return False
+
+    def _lidar_driver_args(self) -> list[str]:
+        if not LIDAR_DRIVER_BIN.exists():
+            raise RuntimeError(f"Lidar driver binary not found: {LIDAR_DRIVER_BIN}")
+        args = [str(LIDAR_DRIVER_BIN)]
+        if LIDAR_DRIVER_PARAMS.exists():
+            args.extend(["--ros-args", "--params-file", str(LIDAR_DRIVER_PARAMS)])
+        else:
+            port = "/dev/lidar" if Path("/dev/lidar").exists() else "/dev/ttyACM0"
+            args.extend(["--ros-args", "-p", f"port_name:={port}", "-p", "frame_id:=laser"])
+        return args
+
+    def _start_lidar_monitor(self) -> None:
+        if self.lidar_monitor is not None:
+            return
+        self.lidar_monitor = RosLaserScanMonitor(self.events)
+        self.lidar_monitor.start()
+        self.lidar_status = f"Waiting for {LIDAR_SCAN_TOPIC}"
+
+    def _start_chassis_charge_monitor(self) -> None:
+        if self.chassis_charge_monitor is not None:
+            return
+        self.chassis_charge_monitor = RosChassisChargeMonitor(self.events)
+        self.chassis_charge_monitor.start()
+
+    def _start_lidar_preview_driver(self, auto: bool = False) -> None:
+        if self.lidar_worker is not None:
+            return
+        self.lidar_restart_at = 0.0
+        if self._lidar_driver_running():
+            self.lidar_status = "Waiting for existing lidar driver"
+            if not self.latest_lidar_scan:
+                self._log("Existing lidar driver detected; preview monitor will reuse /scan.")
+            return
+        try:
+            args = self._lidar_driver_args()
+        except Exception as exc:
+            self.lidar_status = "Driver unavailable"
+            self._log(f"Lidar preview driver unavailable: {exc}")
+            self.lidar_restart_at = time.monotonic() + 5.0
+            return
+        worker = ProcessWorker(args, LIDAR_DRIVER_ROOT, "Lidar Preview", self.events)
+        self.lidar_worker = worker
+        self.lidar_status = "Driver starting"
+        worker.start()
+        self._log("Lidar preview driver auto-started." if auto else "Lidar preview driver started.")
+
     def _start_camera_monitor(self) -> None:
         if self.camera_monitor is not None:
             return
@@ -3055,19 +5005,27 @@ class WebController:
         self.camera_status = "Starting..."
         self._log("UVC preview monitor started. This is only the camera preview stream, not lidar local guidance.")
 
+    def _camera_stream_live(self, now: float | None = None) -> bool:
+        current = time.monotonic() if now is None else float(now)
+        return (
+            self.latest_camera_frame_at > 0.0
+            and (current - self.latest_camera_frame_at) <= 1.5
+        )
+
     def _start_uvc_preview_publisher(self, auto: bool = False) -> None:
+        self._start_camera_monitor()
+        if self._camera_stream_live():
+            self.preview_restart_at = 0.0
+            self.camera_status = "Streaming"
+            return
         if self.preview_worker is not None:
             return
+        self.preview_restart_at = 0.0
         worker = ProcessWorker([ROS_PYTHON, *self._uvc_preview_args()], PROJECT_ROOT, "UVC Preview", self.events)
         self.preview_worker = worker
         worker.start()
         self._start_camera_monitor()
         self._log("UVC preview publisher started." if not auto else "UVC preview publisher auto-started.")
-
-    def _stop_uvc_preview_publisher(self) -> None:
-        if self.preview_worker is None:
-            return
-        self.preview_worker.stop()
 
     def _clear_preview(self, text: str = "Waiting for preview stream") -> None:
         self.latest_preview_jpeg = None
@@ -3212,6 +5170,8 @@ class WebController:
                     raise
                 except Exception:
                     pass
+            if bool(self.gamepad_control.get("enabled", False)):
+                self.release_gamepad_control(reason="Hybrid Drive requested")
             active = self._active_localization_worker()
             if active is None or self.localization_map_path != map_path:
                 self.pending_action = "drive"
@@ -3233,14 +5193,12 @@ class WebController:
             if self.task_worker is not None:
                 self._log("Stop requested for the current task.")
                 self.task_worker.stop()
-                self._stop_uvc_preview_publisher()
                 return
             active = self._active_localization_worker()
             if active is not None:
                 self._log("Stop requested for shared localization.")
                 active.stop()
                 self._cleanup_localization_processes("after global stop request")
-                self._stop_uvc_preview_publisher()
 
     def _mark_localization_ready(self) -> None:
         if self._active_localization_worker() is None:
@@ -3281,12 +5239,31 @@ class WebController:
                         topic = str(payload.get("topic", ""))
                         if isinstance(ppm, (bytes, bytearray)):
                             self.latest_preview_jpeg = self._ppm_to_jpeg(bytes(ppm))
+                            self.latest_camera_frame_at = time.monotonic()
+                            self.camera_status = "Streaming"
+                            self.preview_restart_at = 0.0
                         if topic == UVC_PREVIEW_TOPIC:
                             self.preview_source = "Raw UVC Preview"
                         elif topic:
                             self.preview_source = topic
                 elif event == "camera_status":
-                    self.camera_status = str(payload)
+                    status = str(payload)
+                    if status == "Streaming" or not self._camera_stream_live():
+                        self.camera_status = status
+                elif event == "lidar_scan" and isinstance(payload, dict):
+                    first_scan = not bool(self.latest_lidar_scan)
+                    self.latest_lidar_scan = dict(payload)
+                    self.lidar_status = "Live"
+                    if first_scan:
+                        self._log(
+                            f"Live lidar scans are arriving from {payload.get('topic', LIDAR_SCAN_TOPIC)} "
+                            f"({payload.get('visible_count', 0)} visible points)."
+                        )
+                elif event == "lidar_status":
+                    if self.lidar_status != "Live" or not self.latest_lidar_scan:
+                        self.lidar_status = str(payload)
+                elif event == "charge_feedback" and isinstance(payload, dict):
+                    self.charge_feedback = dict(payload)
                 elif event == "pose_debug" and isinstance(payload, dict):
                     self._update_pose_debug_state(payload)
 
@@ -3298,6 +5275,23 @@ class WebController:
         if label == "UVC Preview":
             if self.preview_worker is not None and self.preview_worker.worker_id == worker_id:
                 self.preview_worker = None
+                if not self.closing and not stopped:
+                    if self._camera_stream_live():
+                        self.camera_status = "Streaming"
+                        self.preview_source = "Raw UVC Preview"
+                        self.preview_restart_at = 0.0
+                    else:
+                        self.camera_status = "Restarting..."
+                        self.preview_source = "UVC preview restarting"
+                        self.preview_restart_at = time.monotonic() + 3.0
+            self._log(f"{label} {'stopped' if stopped else 'finished'} with exit code {code}")
+            return
+        if label == "Lidar Preview":
+            if self.lidar_worker is not None and self.lidar_worker.worker_id == worker_id:
+                self.lidar_worker = None
+                if not self.closing:
+                    self.lidar_status = "Driver restarting"
+                    self.lidar_restart_at = time.monotonic() + 3.0
             self._log(f"{label} {'stopped' if stopped else 'finished'} with exit code {code}")
             return
         if label in {"Record Localization", "Replay Localization", "Shared Localization"}:
@@ -3325,7 +5319,41 @@ class WebController:
         bridge = get_bridge()
         while not self.closing:
             with self.lock:
-                self.vehicle_status = bridge.snapshot()
+                now = time.monotonic()
+                snapshot = bridge.snapshot()
+                charge_received_at = float(
+                    self.charge_feedback.get("received_monotonic", 0.0) or 0.0
+                )
+                if charge_received_at > 0.0 and (now - charge_received_at) <= 2.0:
+                    battery = dict(snapshot.get("battery", {}))
+                    io_state = dict(snapshot.get("io", {}))
+                    battery["charging"] = self.charge_feedback.get("charging")
+                    io_state["charge_dock"] = self.charge_feedback.get("charge_dock")
+                    snapshot["battery"] = battery
+                    snapshot["io"] = io_state
+                self.vehicle_status = snapshot
+                if (
+                    self.preview_worker is None
+                    and self.preview_restart_at > 0.0
+                    and now >= self.preview_restart_at
+                ):
+                    if self._camera_stream_live(now):
+                        self.preview_restart_at = 0.0
+                        self.camera_status = "Streaming"
+                    else:
+                        self._start_uvc_preview_publisher(auto=True)
+                if now >= self.lidar_driver_probe_at:
+                    self.lidar_driver_probe_at = now + 2.0
+                    last_scan_at = float(self.latest_lidar_scan.get("received_monotonic", 0.0) or 0.0)
+                    scan_stale = last_scan_at <= 0.0 or (now - last_scan_at) > 2.0
+                    restart_due = self.lidar_restart_at <= 0.0 or now >= self.lidar_restart_at
+                    if (
+                        self.lidar_worker is None
+                        and scan_stale
+                        and restart_due
+                        and not self._lidar_driver_running()
+                    ):
+                        self._start_lidar_preview_driver(auto=True)
             time.sleep(0.4)
 
     def _ppm_to_jpeg(self, ppm: bytes) -> bytes | None:
@@ -3339,6 +5367,24 @@ class WebController:
             return encoded.tobytes()
         except Exception:
             return None
+
+    def _lidar_preview_snapshot_locked(self) -> dict[str, Any]:
+        snapshot = dict(self.latest_lidar_scan)
+        received_at = float(snapshot.pop("received_monotonic", 0.0) or 0.0)
+        age_ms: float | None = None
+        if received_at > 0.0:
+            age_ms = max(0.0, (time.monotonic() - received_at) * 1000.0)
+        live = age_ms is not None and age_ms <= 1600.0
+        snapshot["live"] = live
+        snapshot["age_ms"] = round(age_ms, 1) if age_ms is not None else None
+        snapshot["status"] = "Live" if live else self.lidar_status
+        snapshot.setdefault("topic", LIDAR_SCAN_TOPIC)
+        snapshot.setdefault("points", [])
+        snapshot.setdefault("raw_count", 0)
+        snapshot.setdefault("valid_count", 0)
+        snapshot.setdefault("visible_count", 0)
+        snapshot.setdefault("scan_hz", 0.0)
+        return snapshot
 
     def state_snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -3377,6 +5423,7 @@ class WebController:
                 "mission_name": self.mission_name,
                 "settings": dict(self.settings),
                 "vehicle_status": getattr(self, "vehicle_status", {}),
+                "gamepad_control": self._gamepad_state_locked(),
                 "pose_debug": dict(self.pose_debug_state),
             }
 
@@ -3384,8 +5431,15 @@ class WebController:
         with self.lock:
             return self.latest_preview_jpeg
 
+    def lidar_preview_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return self._lidar_preview_snapshot_locked()
+
     def close(self) -> None:
-        self.closing = True
+        with self.lock:
+            if bool(self.gamepad_control.get("enabled", False)) or self._gamepad_output_active:
+                self.release_gamepad_control(reason="Web server stopped")
+            self.closing = True
         if self.task_worker is not None:
             self.task_worker.stop()
         active = self._active_localization_worker()
@@ -3393,8 +5447,14 @@ class WebController:
             active.stop()
         if self.preview_worker is not None:
             self.preview_worker.stop()
+        if self.lidar_worker is not None:
+            self.lidar_worker.stop()
         if self.camera_monitor is not None:
             self.camera_monitor.stop()
+        if self.lidar_monitor is not None:
+            self.lidar_monitor.stop()
+        if self.chassis_charge_monitor is not None:
+            self.chassis_charge_monitor.stop()
         if self.pose_debug_monitor is not None:
             self.pose_debug_monitor.stop()
 
@@ -3429,6 +5489,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Permissions-Policy", "gamepad=(self)")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self._safe_write(body)
@@ -3437,6 +5499,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         body = text.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Permissions-Policy", "gamepad=(self)")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self._safe_write(body)
@@ -3448,6 +5512,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/state":
             self._send_json(APP.state_snapshot())
+            return
+        if parsed.path == "/api/lidar":
+            self._send_json(APP.lidar_preview_snapshot())
             return
         if parsed.path == "/api/preview.jpg":
             preview = APP.preview_jpeg()
@@ -3496,6 +5563,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/connect_can":
                 APP.connect_can(str(payload.get("channel") or ""), str(payload.get("bitrate") or ""))
+                self._send_json({"ok": True})
+                return
+            if self.path == "/api/gamepad/claim":
+                state = APP.claim_gamepad_control(payload)
+                self._send_json({"ok": True, "gamepad_control": state})
+                return
+            if self.path == "/api/gamepad/command":
+                state = APP.update_gamepad_control(payload)
+                self._send_json({"ok": True, "gamepad_control": state})
+                return
+            if self.path == "/api/gamepad/release":
+                APP.release_gamepad_control(payload, reason=str(payload.get("reason") or "Released"))
                 self._send_json({"ok": True})
                 return
             if self.path == "/api/select_map":

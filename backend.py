@@ -1062,6 +1062,24 @@ class LidarDriverProcess(core.ManagedProcess):
         super().__init__(cmd, LIDAR_DRIVER_ROOT, log_path)
 
 
+def _lidar_driver_running() -> bool:
+    patterns = (str(LIDAR_DRIVER_BIN), "ros2 run lidar_pkg lidar_node")
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "args="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception:
+        return False
+    return any(
+        command and any(pattern in command for pattern in patterns)
+        for command in (line.strip() for line in result.stdout.splitlines())
+    )
+
+
 def _wait_for_local_lidar_ready(
     local_controller: DirectLocalLidarController,
     args: argparse.Namespace,
@@ -1675,9 +1693,12 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
             projection = core.anchor_projection_to_pose(projection, pose_raw)
         _pose = core.project_pose_to_ground(pose_raw, projection)
 
-        lidar_driver_proc = LidarDriverProcess(lidar_driver_log)
-        lidar_driver_proc.start()
-        core.log(f"lidar driver subprocess started. Raw log: {lidar_driver_log}")
+        if _lidar_driver_running():
+            core.log("existing lidar driver detected; hybrid autorun will reuse /scan.")
+        else:
+            lidar_driver_proc = LidarDriverProcess(lidar_driver_log)
+            lidar_driver_proc.start()
+            core.log(f"lidar driver subprocess started. Raw log: {lidar_driver_log}")
         time.sleep(1.0)
 
         direct_local_controller = DirectLocalLidarController(args, local_lidar_config)

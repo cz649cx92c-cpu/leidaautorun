@@ -215,12 +215,16 @@ class Ros2NodeThread:
 
 
 _ROS_MONITOR_THREAD: Ros2NodeThread | None = None
+_ROS_MONITOR_THREAD_LOCK = threading.Lock()
 
 
 def ensure_ros_monitor_node() -> Ros2NodeThread:
     global _ROS_MONITOR_THREAD
-    if _ROS_MONITOR_THREAD is None:
-        _ROS_MONITOR_THREAD = Ros2NodeThread(ROS_MONITOR_NODE_NAME)
+    if _ROS_MONITOR_THREAD is not None:
+        return _ROS_MONITOR_THREAD
+    with _ROS_MONITOR_THREAD_LOCK:
+        if _ROS_MONITOR_THREAD is None:
+            _ROS_MONITOR_THREAD = Ros2NodeThread(ROS_MONITOR_NODE_NAME)
     return _ROS_MONITOR_THREAD
 
 
