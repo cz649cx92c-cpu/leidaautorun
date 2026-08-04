@@ -1719,51 +1719,227 @@ HTML_PAGE = """<!doctype html>
     .workspace {
       width: 100%;
     }
-    .dashboard-metrics {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      grid-template-rows: repeat(2, minmax(0, 1fr));
-      gap: 8px;
-      margin: 0;
-      min-height: 0;
-    }
-    .run-metric {
-      position: relative;
-      min-width: 0;
-      min-height: 0;
+    .instrument-cluster {
       height: 100%;
-      padding: 8px 12px;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(190px, .92fr) minmax(145px, .68fr) minmax(220px, 1fr);
+      align-items: stretch;
       overflow: hidden;
       border: 1px solid var(--ui-line);
-      border-radius: 13px;
-      background: linear-gradient(180deg, color-mix(in srgb, var(--ui-panel) 97%, transparent), color-mix(in srgb, var(--ui-panel-2) 94%, transparent));
+      border-radius: 14px;
+      background: linear-gradient(180deg, color-mix(in srgb, var(--ui-panel) 96%, transparent), color-mix(in srgb, var(--ui-panel-2) 92%, transparent));
+    }
+    .instrument-section {
+      min-width: 0;
+      position: relative;
+    }
+    .instrument-section + .instrument-section {
+      border-left: 1px solid var(--ui-line-soft);
+    }
+    .speed-instrument {
+      display: grid;
+      place-items: center;
+      padding: 6px 10px 2px;
+    }
+    .speed-gauge {
+      position: relative;
+      width: min(100%, 224px);
+      aspect-ratio: 220 / 150;
+    }
+    .speed-gauge svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+      overflow: visible;
+    }
+    .gauge-track,
+    .gauge-progress {
+      fill: none;
+      stroke-linecap: round;
+    }
+    .gauge-track {
+      stroke: color-mix(in srgb, var(--ui-muted) 23%, transparent);
+      stroke-width: 3;
+    }
+    .gauge-progress {
+      stroke: var(--ui-accent);
+      stroke-width: 4;
+      filter: drop-shadow(0 0 4px color-mix(in srgb, var(--ui-accent) 25%, transparent));
+      transition: stroke-dasharray .22s ease;
+    }
+    .gauge-ticks line {
+      stroke: color-mix(in srgb, var(--ui-muted) 62%, transparent);
+      stroke-width: 1.2;
+    }
+    .gauge-ticks line.major {
+      stroke: color-mix(in srgb, var(--ui-text) 72%, transparent);
+      stroke-width: 1.8;
+    }
+    .gauge-labels {
+      fill: var(--ui-muted);
+      font: 600 9px ui-sans-serif, system-ui, sans-serif;
+    }
+    .gauge-needle {
+      stroke: var(--ui-text);
+      stroke-width: 2.4;
+      stroke-linecap: round;
+      transition: transform .22s ease;
+    }
+    .gauge-hub {
+      fill: var(--ui-panel);
+      stroke: var(--ui-accent);
+      stroke-width: 2;
+    }
+    .speed-digital {
+      position: absolute;
+      left: 50%;
+      top: 58%;
+      transform: translate(-50%, -50%);
+      display: grid;
+      justify-items: center;
+      color: var(--ui-text);
+      line-height: 1;
+    }
+    .speed-digital strong {
+      font-size: clamp(24px, 2vw, 34px);
+      font-weight: 650;
+      letter-spacing: -.035em;
+    }
+    .speed-digital small {
+      margin-top: 6px;
+      color: var(--ui-muted);
+      font-size: 10px;
+      font-weight: 650;
+    }
+    .mode-instrument {
+      padding: 14px 14px 12px;
       display: grid;
       align-content: center;
+      justify-items: center;
+      text-align: center;
+      gap: 7px;
     }
-    .run-metric::after {
-      content: none;
-    }
-    .run-metric span {
-      display: block;
+    .instrument-kicker {
       color: var(--ui-muted);
       font-size: 9px;
-      font-weight: 650;
-      letter-spacing: .08em;
+      font-weight: 700;
+      letter-spacing: .1em;
       text-transform: uppercase;
     }
-    .run-metric strong {
-      display: block;
-      margin-top: 4px;
-      color: var(--ui-text);
-      font-size: 13px;
-      line-height: 1.1;
-      font-weight: 760;
+    .mode-value {
+      max-width: 100%;
+      color: var(--ui-accent);
+      font-size: clamp(22px, 2vw, 31px);
+      line-height: 1;
+      font-weight: 720;
+      letter-spacing: -.03em;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .run-metric small {
-      margin-left: 4px;
+    .mode-detail {
+      width: 100%;
+      display: grid;
+      gap: 3px;
+      padding-top: 7px;
+      border-top: 1px solid var(--ui-line-soft);
+    }
+    .mode-detail span {
+      color: var(--ui-muted);
+      font-size: 9px;
+    }
+    .mode-detail strong {
+      color: var(--ui-text);
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .charging-state {
+      min-height: 23px;
+      padding: 0 8px;
+      border: 1px solid var(--ui-line-soft);
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--ui-muted);
+      font-size: 9px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .charging-state::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--ui-muted);
+    }
+    .instrument-cluster.is-charging .charging-state {
+      color: color-mix(in srgb, var(--ui-success) 75%, var(--ui-text));
+      border-color: color-mix(in srgb, var(--ui-success) 35%, var(--ui-line));
+      background: color-mix(in srgb, var(--ui-success) 9%, transparent);
+    }
+    .instrument-cluster.is-charging .charging-state::before {
+      background: var(--ui-success);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-success) 15%, transparent);
+    }
+    .instrument-readouts {
+      padding: 8px 12px;
+      display: grid;
+      grid-template-rows: repeat(4, minmax(0, 1fr));
+      align-items: stretch;
+    }
+    .instrument-readout {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1fr);
+      align-items: center;
+      gap: 8px;
+      padding: 5px 2px;
+    }
+    .instrument-readout + .instrument-readout {
+      border-top: 1px solid var(--ui-line-soft);
+    }
+    .instrument-icon {
+      width: 24px;
+      height: 24px;
+      display: grid;
+      place-items: center;
+      color: var(--ui-muted);
+    }
+    .instrument-icon svg {
+      width: 21px;
+      height: 21px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.6;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .instrument-readout-copy {
+      min-width: 0;
+      display: grid;
+      gap: 2px;
+    }
+    .instrument-readout-copy span {
+      color: var(--ui-muted);
+      font-size: 9px;
+      line-height: 1;
+    }
+    .instrument-readout-copy strong {
+      color: var(--ui-text);
+      font-size: 13px;
+      line-height: 1.1;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .instrument-readout-copy small {
+      margin-left: 3px;
       color: var(--ui-muted);
       font-size: 8.5px;
       font-weight: 600;
@@ -1817,57 +1993,7 @@ HTML_PAGE = """<!doctype html>
       min-height: 0;
       padding: 12px 126px 12px 12px;
       border-radius: 16px;
-      display: grid;
-      grid-template-rows: minmax(0, 2fr) minmax(0, 1fr);
-      gap: 8px;
-    }
-    #vehicleStatus {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      grid-template-rows: minmax(0, 1fr);
-      gap: 8px;
-      border-top: 0;
-      min-height: 0;
-    }
-    #vehicleStatus .vehicle-metric {
-      position: relative;
-      min-width: 0;
-      min-height: 0;
-      height: 100%;
-      padding: 8px 12px;
-      overflow: hidden;
-      border: 1px solid var(--ui-line);
-      border-radius: 13px;
-      background: linear-gradient(180deg, color-mix(in srgb, var(--ui-panel) 97%, transparent), color-mix(in srgb, var(--ui-panel-2) 94%, transparent));
-      display: grid;
-      align-content: center;
-      gap: 5px;
-    }
-    #vehicleStatus .vehicle-metric::after {
-      content: none;
-    }
-    #vehicleStatus .vehicle-metric.charging {
-      border-color: var(--ui-line);
-      background: linear-gradient(180deg, color-mix(in srgb, var(--ui-panel) 97%, transparent), color-mix(in srgb, var(--ui-panel-2) 94%, transparent));
-    }
-    #vehicleStatus .vehicle-metric.charging strong {
-      color: color-mix(in srgb, var(--ui-success) 76%, var(--ui-text));
-    }
-    #vehicleStatus .vehicle-metric span {
-      color: var(--ui-muted);
-      font-size: 9px;
-      font-weight: 650;
-      letter-spacing: .06em;
-      text-transform: uppercase;
-    }
-    #vehicleStatus .vehicle-metric strong {
-      min-width: 0;
-      color: var(--ui-text);
-      font-size: 13px;
-      line-height: 1.1;
-      font-weight: 760;
-      text-align: left;
-      overflow-wrap: anywhere;
+      display: block;
     }
     .floating-tools {
       position: absolute;
@@ -1974,17 +2100,9 @@ HTML_PAGE = """<!doctype html>
       }
     }
     @media (max-width: 640px) {
-      .dashboard-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .run-metric {
-        min-height: 72px;
-        padding: 11px;
-      }
       .preview-panel .preview {
         height: auto;
         aspect-ratio: 16 / 9;
-      }
-      #vehicleStatus {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
       .lidar-panel #lidarExampleCanvas {
         height: 250px;
@@ -1994,6 +2112,19 @@ HTML_PAGE = """<!doctype html>
         justify-content: start;
       }
       .status-panel { padding-right: 12px; padding-bottom: 146px; }
+      .instrument-cluster {
+        height: auto;
+        grid-template-columns: minmax(170px, 1fr) minmax(140px, .8fr);
+      }
+      .instrument-readouts {
+        grid-column: 1 / -1;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-rows: repeat(2, minmax(48px, auto));
+        border-left: 0;
+        border-top: 1px solid var(--ui-line-soft);
+      }
+      .instrument-readout:nth-child(2) { border-top: 0; }
+      .instrument-readout:nth-child(even) { border-left: 1px solid var(--ui-line-soft); padding-left: 10px; }
       .floating-tools {
         top: auto;
         left: 12px;
@@ -2188,33 +2319,82 @@ HTML_PAGE = """<!doctype html>
             </div>
 
             <div class="panel status-panel" aria-label="Vehicle instruments">
-              <div class="dashboard-metrics">
-                <article class="run-metric">
-                  <span>Speed</span>
-                  <strong id="metricSpeed">--<small>m/s</small></strong>
-                </article>
-                <article class="run-metric">
-                  <span>Steering</span>
-                  <strong id="metricSteering">--<small>°</small></strong>
-                </article>
-                <article class="run-metric">
-                  <span>Localization</span>
-                  <strong id="metricLocalization">Not started</strong>
-                </article>
-                <article class="run-metric">
-                  <span>Guidance</span>
-                  <strong id="metricGuidance">Waiting /scan</strong>
-                </article>
-                <article class="run-metric">
-                  <span>Center Offset</span>
-                  <strong id="metricCenterOffset">--<small>m</small></strong>
-                </article>
-                <article class="run-metric">
-                  <span>Battery</span>
-                  <strong id="metricBattery">--<small>%</small></strong>
-                </article>
+              <div id="vehicleStatus" class="instrument-cluster">
+                <section class="instrument-section speed-instrument" aria-label="Speed">
+                  <div class="speed-gauge">
+                    <svg viewBox="0 0 220 150" aria-hidden="true">
+                      <path class="gauge-track" pathLength="100" d="M20 125 A90 90 0 0 1 200 125"></path>
+                      <path id="speedGaugeArc" class="gauge-progress" pathLength="100" stroke-dasharray="0 100" d="M20 125 A90 90 0 0 1 200 125"></path>
+                      <g class="gauge-ticks">
+                        <line class="major" x1="110" y1="34" x2="110" y2="46" transform="rotate(-90 110 125)"></line>
+                        <line x1="110" y1="34" x2="110" y2="42" transform="rotate(-72 110 125)"></line>
+                        <line class="major" x1="110" y1="34" x2="110" y2="46" transform="rotate(-54 110 125)"></line>
+                        <line x1="110" y1="34" x2="110" y2="42" transform="rotate(-36 110 125)"></line>
+                        <line class="major" x1="110" y1="34" x2="110" y2="46" transform="rotate(-18 110 125)"></line>
+                        <line x1="110" y1="34" x2="110" y2="42"></line>
+                        <line class="major" x1="110" y1="34" x2="110" y2="46" transform="rotate(18 110 125)"></line>
+                        <line x1="110" y1="34" x2="110" y2="42" transform="rotate(36 110 125)"></line>
+                        <line class="major" x1="110" y1="34" x2="110" y2="46" transform="rotate(54 110 125)"></line>
+                        <line x1="110" y1="34" x2="110" y2="42" transform="rotate(72 110 125)"></line>
+                        <line class="major" x1="110" y1="34" x2="110" y2="46" transform="rotate(90 110 125)"></line>
+                      </g>
+                      <g class="gauge-labels">
+                        <text x="12" y="132">0.0</text>
+                        <text x="27" y="78">0.1</text>
+                        <text x="65" y="42">0.2</text>
+                        <text x="144" y="42">0.3</text>
+                        <text x="181" y="78">0.4</text>
+                        <text x="194" y="132">0.5</text>
+                      </g>
+                      <g id="speedGaugeNeedle" transform="rotate(-90 110 125)">
+                        <line class="gauge-needle" x1="110" y1="125" x2="110" y2="52"></line>
+                      </g>
+                      <circle class="gauge-hub" cx="110" cy="125" r="4"></circle>
+                    </svg>
+                    <div class="speed-digital">
+                      <strong id="metricSpeed">--</strong>
+                      <small>m/s</small>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="instrument-section mode-instrument" aria-label="Drive state">
+                  <span class="instrument-kicker">Current Mode</span>
+                  <strong id="metricCurrentMode" class="mode-value">--</strong>
+                  <div class="mode-detail">
+                    <span>Guidance</span>
+                    <strong id="metricGuidance">Waiting /scan</strong>
+                  </div>
+                  <div class="charging-state"><span id="metricCharging">--</span></div>
+                </section>
+
+                <section class="instrument-section instrument-readouts" aria-label="Vehicle status">
+                  <div class="instrument-readout">
+                    <span class="instrument-icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24"><rect x="7" y="4" width="10" height="17" rx="2"></rect><path d="M10 2h4"></path><path d="M9.5 16.5h5v2h-5z"></path></svg>
+                    </span>
+                    <div class="instrument-readout-copy"><span>Battery</span><strong id="metricBattery">--<small>%</small></strong></div>
+                  </div>
+                  <div class="instrument-readout">
+                    <span class="instrument-icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><circle cx="12" cy="12" r="2"></circle><path d="M3.5 10h17M12 14v7M5.5 6.5 10.5 11M18.5 6.5 13.5 11"></path></svg>
+                    </span>
+                    <div class="instrument-readout-copy"><span>Steering</span><strong id="metricSteering">--<small>°</small></strong></div>
+                  </div>
+                  <div class="instrument-readout">
+                    <span class="instrument-icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="2"></circle><path d="M12 2v5M12 17v5M2 12h5M17 12h5"></path></svg>
+                    </span>
+                    <div class="instrument-readout-copy"><span>Center Offset</span><strong id="metricCenterOffset">--<small>m</small></strong></div>
+                  </div>
+                  <div class="instrument-readout">
+                    <span class="instrument-icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24"><path d="M12 21s6-5.1 6-11a6 6 0 1 0-12 0c0 5.9 6 11 6 11Z"></path><circle cx="12" cy="10" r="2"></circle></svg>
+                    </span>
+                    <div class="instrument-readout-copy"><span>Localization</span><strong id="metricLocalization">Not started</strong></div>
+                  </div>
+                </section>
               </div>
-              <div id="vehicleStatus"></div>
               <nav class="floating-tools" aria-label="Control panels">
                 <button id="tabBtn-tasks" class="secondary" onclick="selectTab('tasks')">Workflow</button>
                 <button id="tabBtn-library" class="secondary" onclick="selectTab('library')">Library</button>
@@ -2884,23 +3064,28 @@ HTML_PAGE = """<!doctype html>
       if (!root) return;
       const vxRaw = Number(status.motion?.vx_mps ?? status.motion?.vx);
       const vyRaw = Number(status.motion?.vy_mps ?? status.motion?.vy);
-      const speed = Number.isFinite(vxRaw) && Number.isFinite(vyRaw)
-        ? formatNumber(Math.hypot(vxRaw, vyRaw), 2)
-        : '--';
+      const speedValue = Number.isFinite(vxRaw) && Number.isFinite(vyRaw)
+        ? Math.hypot(vxRaw, vyRaw)
+        : null;
+      const speed = speedValue !== null ? formatNumber(speedValue, 2) : '--';
       const steering = formatNumber(status.steering?.wheel_angle_deg ?? '--', 1);
       const soc = status.battery?.soc_pct ?? '--';
-      setMetricValue('metricSpeed', speed, 'm/s');
+      setMetricValue('metricSpeed', speed);
       setMetricValue('metricSteering', steering, '°');
       setMetricValue('metricBattery', soc, '%');
+      const gaugeRatio = Math.max(0, Math.min(1, (speedValue ?? 0) / 0.5));
+      const gaugeArc = document.getElementById('speedGaugeArc');
+      const gaugeNeedle = document.getElementById('speedGaugeNeedle');
+      if (gaugeArc) gaugeArc.style.strokeDasharray = `${(gaugeRatio * 100).toFixed(1)} 100`;
+      if (gaugeNeedle) gaugeNeedle.setAttribute('transform', `rotate(${-90 + gaugeRatio * 180} 110 125)`);
       const charging = status.battery?.charging;
       const currentMode = formatDriveMode(status.motion?.gear ?? status.steering?.gear);
-      const entries = [
-        ['Current Mode', currentMode, ''],
-        ['Charging', charging === true ? 'Charging' : charging === false ? 'Not charging' : '--', charging === true ? 'charging' : ''],
-      ];
-      root.innerHTML = entries
-        .map(([k, v, className]) => `<div class="vehicle-metric ${className}"><span>${k}</span><strong>${v}</strong></div>`)
-        .join('');
+      setTextContent('metricCurrentMode', currentMode);
+      setTextContent(
+        'metricCharging',
+        charging === true ? 'Charging' : charging === false ? 'Not charging' : 'Charge unknown',
+      );
+      root.classList.toggle('is-charging', charging === true);
     }
 
     function updateProjectionDebug(debug) {
@@ -3464,7 +3649,19 @@ HTML_PAGE = """<!doctype html>
       ctx.fillStyle = bg;
       ctx.fillRect(0, 0, w, h);
 
-      const bounds = { xMin: -0.48, xMax: 1.78, yMin: -2.5, yMax: 2.5 };
+      // The live points use the lidar origin as (0, 0). The sensor is mounted
+      // at the front-center edge of the 0.62 m chassis, so the vehicle extends
+      // rearward from that origin in this preview. Keep this visualization-only;
+      // control geometry continues to use the calibrated ROS transform.
+      const vehicleLengthM = 0.62;
+      const vehicleHalfWidthM = 0.20;
+      const lidarMountX = 0.0;
+      const lidarMountY = 0.0;
+      const vehicleFrontX = lidarMountX;
+      const vehicleRearX = vehicleFrontX - vehicleLengthM;
+      const vehicleSelfMaskHalfWidthM = 0.30;
+      const vehicleSelfMaskFrontX = vehicleFrontX + 0.04;
+      const bounds = { xMin: -0.72, xMax: 1.78, yMin: -2.5, yMax: 2.5 };
       const pad = { left: 44, right: 24, top: 28, bottom: 28 };
       const plotW = w - pad.left - pad.right;
       const plotH = h - pad.top - pad.bottom;
@@ -3477,7 +3674,8 @@ HTML_PAGE = """<!doctype html>
       const plotOffsetX = pad.left + (plotW - usedPlotW) / 2;
       const plotOffsetY = pad.top + (plotH - usedPlotH) / 2;
       const project = (x, y) => ({
-        x: plotOffsetX + (y - bounds.yMin) * metersToPixels,
+        // ROS body frame: +Y is vehicle-left, so it belongs on screen-left.
+        x: plotOffsetX + (bounds.yMax - y) * metersToPixels,
         y: plotOffsetY + (bounds.xMax - x) * metersToPixels,
       });
       const linePath = (points) => {
@@ -3502,7 +3700,7 @@ HTML_PAGE = """<!doctype html>
       ctx.lineWidth = 1;
       ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
       ctx.textBaseline = 'middle';
-      for (let x = -0.4; x <= 1.61; x += 0.2) {
+      for (let x = -0.6; x <= 1.61; x += 0.2) {
         const major = Math.abs((x * 10) % 5) < 0.01;
         const p0 = project(x, bounds.yMin);
         const p1 = project(x, bounds.yMax);
@@ -3530,11 +3728,15 @@ HTML_PAGE = """<!doctype html>
 
       const cropTopLeft = project(1.60, -0.75);
       const cropBottomRight = project(0.15, 0.75);
+      const cropX = Math.min(cropTopLeft.x, cropBottomRight.x);
+      const cropY = Math.min(cropTopLeft.y, cropBottomRight.y);
+      const cropW = Math.abs(cropBottomRight.x - cropTopLeft.x);
+      const cropH = Math.abs(cropBottomRight.y - cropTopLeft.y);
       ctx.fillStyle = themeDark ? 'rgba(59,130,246,.035)' : 'rgba(59,130,246,.025)';
       ctx.strokeStyle = themeDark ? 'rgba(96,165,250,.28)' : 'rgba(37,99,235,.19)';
       ctx.setLineDash([5, 5]);
-      ctx.fillRect(cropTopLeft.x, cropTopLeft.y, cropBottomRight.x - cropTopLeft.x, cropBottomRight.y - cropTopLeft.y);
-      ctx.strokeRect(cropTopLeft.x, cropTopLeft.y, cropBottomRight.x - cropTopLeft.x, cropBottomRight.y - cropTopLeft.y);
+      ctx.fillRect(cropX, cropY, cropW, cropH);
+      ctx.strokeRect(cropX, cropY, cropW, cropH);
       ctx.setLineDash([]);
 
       const hasLiveScan = !!(lidarFrame && lidarFrame.live);
@@ -3585,6 +3787,14 @@ HTML_PAGE = """<!doctype html>
           const x = Number(point[0]);
           const y = Number(point[1]);
           if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+          // Suppress chassis, wheel, and suspension self-reflections only in the
+          // preview. Points outside the self-vehicle envelope remain visible.
+          const insideVehicleSelfMask = (
+            x >= vehicleRearX - 0.02
+            && x <= vehicleSelfMaskFrontX
+            && Math.abs(y - lidarMountY) <= vehicleSelfMaskHalfWidthM
+          );
+          if (insideVehicleSelfMask) return;
           const inDetectionWindow = x >= 0.15 && x <= 1.60 && Math.abs(y) <= 0.75;
           rawPoint(x, y, inDetectionWindow ? 1.85 : 1.25, inDetectionWindow ? .88 : .46);
         });
@@ -3640,20 +3850,20 @@ HTML_PAGE = """<!doctype html>
       ctx.lineTo(sweepRight.x, sweep.y);
       ctx.stroke();
 
-      const vehicleFrontLeft = project(0.22, -0.20);
-      const vehicleRearRight = project(-0.40, 0.20);
-      const vehicleX = vehicleFrontLeft.x;
-      const vehicleY = vehicleFrontLeft.y;
-      const vehicleW = vehicleRearRight.x - vehicleFrontLeft.x;
-      const vehicleH = vehicleRearRight.y - vehicleFrontLeft.y;
+      const vehicleFrontRight = project(vehicleFrontX, lidarMountY - vehicleHalfWidthM);
+      const vehicleRearLeft = project(vehicleRearX, lidarMountY + vehicleHalfWidthM);
+      const vehicleX = Math.min(vehicleFrontRight.x, vehicleRearLeft.x);
+      const vehicleY = Math.min(vehicleFrontRight.y, vehicleRearLeft.y);
+      const vehicleW = Math.abs(vehicleRearLeft.x - vehicleFrontRight.x);
+      const vehicleH = Math.abs(vehicleRearLeft.y - vehicleFrontRight.y);
       roundedRect(vehicleX, vehicleY, vehicleW, vehicleH, 7);
       ctx.fillStyle = themeDark ? '#17263b' : '#f8fafc';
       ctx.fill();
       ctx.strokeStyle = themeDark ? '#dbeafe' : '#334155';
       ctx.lineWidth = 1.8;
       ctx.stroke();
-      const vehicleCenter = project(-0.09, 0);
-      const vehicleNose = project(0.17, 0);
+      const vehicleCenter = project((vehicleFrontX + vehicleRearX) / 2, lidarMountY);
+      const vehicleNose = project(vehicleFrontX - 0.04, lidarMountY);
       ctx.strokeStyle = '#0ea5e9';
       ctx.lineWidth = 2.2;
       ctx.beginPath();
@@ -3668,7 +3878,7 @@ HTML_PAGE = """<!doctype html>
       ctx.closePath();
       ctx.fill();
 
-      const lidar = project(0.035, 0);
+      const lidar = project(lidarMountX, lidarMountY);
       ctx.fillStyle = '#22d3ee';
       ctx.beginPath();
       ctx.arc(lidar.x, lidar.y, 3.4, 0, Math.PI * 2);
@@ -3695,7 +3905,7 @@ HTML_PAGE = """<!doctype html>
       }
       ctx.fillStyle = muted;
       ctx.font = '9.5px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillText('vehicle 0.40 × 0.62 m', vehicleRearRight.x + 8, vehicleRearRight.y - 8);
+      ctx.fillText('vehicle 0.40 × 0.62 m', vehicleX + vehicleW + 8, vehicleY + vehicleH - 8);
 
       if (renderChannel) {
         const widthX = 1.42;
