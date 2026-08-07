@@ -79,7 +79,8 @@ OTA_REMOTE = "leidaautorun"
 OTA_REPOSITORY = "cz649cx92c-cpu/leidaautorun"
 OTA_RELEASES_URL = f"https://api.github.com/repos/{OTA_REPOSITORY}/releases"
 OTA_BRANCH_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
-APP_VERSION = "v1.0.0"
+APP_VERSION = "v1.1.0"
+OTA_DOWNLOAD_DIR = PROJECT_ROOT / "runtime" / "ota"
 GAMEPAD_SPEED_LIMITS: dict[str, tuple[float, float]] = {
     "low": (0.15, 25.0),
     "medium": (0.30, 50.0),
@@ -477,16 +478,20 @@ HTML_PAGE = """<!doctype html>
     .preview-footer strong { color: var(--text); }
     .toast-stack {
       position: fixed;
-      top: 18px;
-      right: 18px;
+      top: 50%;
+      left: 50%;
+      right: auto;
       z-index: 1200;
       display: grid;
       gap: 10px;
+      width: min(420px, calc(100vw - 32px));
+      transform: translate(-50%, -50%);
       pointer-events: none;
     }
     .toast {
-      min-width: 260px;
-      max-width: 420px;
+      width: 100%;
+      min-width: 0;
+      max-width: none;
       padding: 12px 14px;
       border-radius: 14px;
       border: 1px solid var(--line-strong);
@@ -2022,13 +2027,20 @@ HTML_PAGE = """<!doctype html>
       bottom: 12px;
       width: 102px;
       display: grid;
-      grid-template-rows: repeat(3, minmax(0, 1fr));
+      grid-template-rows: 22px minmax(0, 1fr) 22px;
       align-content: stretch;
-      gap: 8px;
-      padding: 9px;
+      gap: 4px;
+      padding: 6px;
       border: 1px solid var(--ui-line);
       border-radius: 13px;
       background: linear-gradient(180deg, color-mix(in srgb, var(--ui-panel) 97%, transparent), color-mix(in srgb, var(--ui-panel-2) 94%, transparent));
+    }
+    .floating-tools .panel-wheel {
+      display: grid;
+      grid-template-rows: repeat(3, minmax(0, 1fr));
+      min-height: 0;
+      gap: 3px;
+      overflow: hidden;
     }
     .floating-tools button {
       width: 100%;
@@ -2038,6 +2050,38 @@ HTML_PAGE = """<!doctype html>
       border-radius: 9px;
       font-size: 9px;
       font-weight: 650;
+    }
+    .floating-tools .wheel-step {
+      display: grid;
+      place-items: center;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--ui-text);
+      font-size: 14px;
+      line-height: 1;
+    }
+    .floating-tools .panel-wheel button {
+      opacity: .58;
+      transform: scale(.94);
+      transition: opacity 160ms ease, transform 160ms ease, background 160ms ease;
+    }
+    .floating-tools .panel-wheel button.wheel-current {
+      opacity: 1;
+      transform: scale(1);
+      font-size: 11px;
+      font-weight: 750;
+      color: var(--ui-text);
+      border-color: color-mix(in srgb, var(--ui-accent) 35%, var(--ui-line));
+      background: color-mix(in srgb, var(--ui-panel-3) 78%, var(--ui-accent) 8%);
+      box-shadow: 0 5px 14px rgba(0, 0, 0, .16);
+    }
+    .floating-tools .panel-wheel.is-cycling {
+      animation: panelWheelSlide 180ms ease;
+    }
+    @keyframes panelWheelSlide {
+      from { opacity: .38; transform: translateY(7px); }
+      to { opacity: 1; transform: translateY(0); }
     }
     .lidar-panel {
       grid-area: lidar;
@@ -2239,10 +2283,87 @@ HTML_PAGE = """<!doctype html>
     }
     #tab-settings .ota-panel {
       grid-column: 1 / -1;
+      width: min(960px, 100%);
+      justify-self: center;
       padding: 0;
       overflow: hidden;
       border-radius: 14px;
       background: color-mix(in srgb, var(--ui-panel) 96%, transparent);
+    }
+    /* Keep the tuning controls readable without stretching sparse cards. */
+    #tab-settings .tuning-main-stack {
+      align-items: start;
+      gap: 14px;
+    }
+    #tab-settings .tuning-main-stack > .panel {
+      height: auto;
+      align-self: start;
+      padding: 20px;
+    }
+    #tab-settings .tuning-main-stack > .panel .panel-head {
+      margin-bottom: 12px;
+    }
+    #tab-settings .tuning-main-stack > .panel .panel-head h2 {
+      font-size: 20px;
+    }
+    #tab-settings .tuning-main-stack > .panel .subpanel {
+      padding: 18px;
+      gap: 12px;
+    }
+    #tab-settings .tuning-controls-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    #tab-settings .tuning-main-stack > .panel .field-inline {
+      gap: 12px;
+    }
+    #tab-settings .tuning-main-stack > .panel .field {
+      gap: 6px;
+    }
+    #tab-settings .tuning-main-stack > .panel label {
+      font-size: 12px;
+      line-height: 1.2;
+    }
+    #tab-settings .tuning-main-stack > .panel input {
+      min-height: 42px;
+      padding: 8px 12px;
+      font-size: 15px;
+    }
+    #tab-settings .tuning-main-stack > .panel .button-row {
+      gap: 10px;
+      margin-top: 4px;
+    }
+    #tab-settings .tuning-main-stack > .panel .button-row button {
+      min-height: 42px;
+      font-size: 14px;
+    }
+    #tab-settings .ota-panel {
+      width: min(1100px, 100%);
+      padding: 0;
+    }
+    #tab-settings .tuning-main-stack {
+      grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+    }
+    #tab-settings .ota-panel {
+      grid-column: auto;
+      width: 100%;
+      justify-self: stretch;
+      align-self: start;
+    }
+    .toast-stack {
+      top: 50%;
+      right: auto;
+      bottom: auto;
+      left: 50%;
+      width: min(540px, calc(100vw - 32px));
+      transform: translate(-50%, -50%);
+    }
+    .toast {
+      padding: 18px 22px;
+      font-size: 16px;
+      line-height: 1.5;
+      border-radius: 14px;
     }
     #tab-settings .ota-panel:hover { transform: none; }
     .ota-update-head {
@@ -2250,16 +2371,13 @@ HTML_PAGE = """<!doctype html>
       justify-content: space-between;
       gap: 16px;
       align-items: center;
-      padding: 16px 18px;
+      padding: 12px 16px;
       border-bottom: 1px solid var(--ui-line-soft);
     }
-    .ota-update-head h2 { font-size: 16px; }
+    .ota-update-head h2 { font-size: 15px; }
     .ota-update-head .panel-sub { margin-top: 3px; }
-    .ota-overview {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
-    }
-    .ota-version-summary, .ota-release-summary { padding: 18px; }
+    .ota-overview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); }
+    .ota-version-summary, .ota-release-summary { padding: 13px 16px; }
     .ota-version-summary { border-right: 1px solid var(--ui-line-soft); }
     .ota-label {
       color: var(--ui-muted);
@@ -2272,12 +2390,13 @@ HTML_PAGE = """<!doctype html>
       grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr);
       gap: 10px;
       align-items: end;
-      margin-top: 12px;
+      max-width: none;
+      margin: 8px 0 0;
     }
     .ota-version-value {
       margin-top: 5px;
       color: var(--ui-text);
-      font-size: 23px;
+      font-size: 20px;
       line-height: 1;
       font-weight: 760;
     }
@@ -2296,7 +2415,7 @@ HTML_PAGE = """<!doctype html>
       grid-template-columns: auto minmax(0, 1fr) auto;
       gap: 12px;
       align-items: center;
-      padding: 14px 18px;
+      padding: 10px 16px;
       border-top: 1px solid var(--ui-line-soft);
       border-bottom: 1px solid var(--ui-line-soft);
       background: color-mix(in srgb, var(--ui-strong-surface) 64%, transparent);
@@ -2304,19 +2423,24 @@ HTML_PAGE = """<!doctype html>
     .ota-progress-title { color: var(--ui-text); font-size: 12px; font-weight: 700; }
     .ota-progress-track { height: 6px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--ui-muted) 17%, transparent); }
     .ota-progress-fill { width: 0%; height: 100%; border-radius: inherit; background: var(--ui-accent); transition: width 180ms ease; }
-    .ota-progress-value { min-width: 52px; color: var(--ui-accent); font-size: 12px; font-weight: 750; text-align: right; }
+    .ota-progress-value { min-width: 112px; color: var(--ui-accent); font-size: 12px; font-weight: 750; text-align: right; }
     .ota-actions {
       display: flex;
       justify-content: flex-end;
       gap: 10px;
-      padding: 16px 18px;
+      padding: 12px 16px;
     }
-    .ota-actions button { width: auto; min-width: 142px; min-height: 38px; padding: 0 15px; }
+    .ota-actions button { width: auto; min-width: 122px; min-height: 34px; padding: 0 13px; }
     @media (max-width: 820px) {
+      #tab-settings .ota-panel { width: 100%; }
+      #tab-settings .tuning-controls-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .ota-overview { grid-template-columns: 1fr; }
-      .ota-version-summary { border-right: 0; border-bottom: 1px solid var(--ui-line-soft); }
+      .ota-version-summary { border-bottom: 1px solid var(--ui-line-soft); }
       .ota-actions { display: grid; grid-template-columns: 1fr; }
       .ota-actions button { width: 100%; }
+    }
+    @media (max-width: 560px) {
+      #tab-settings .tuning-controls-grid { grid-template-columns: 1fr; }
     }
     body.workflow-overlay-open {
       overflow: hidden;
@@ -2529,9 +2653,13 @@ HTML_PAGE = """<!doctype html>
                 </section>
               </div>
               <nav class="floating-tools" aria-label="Control panels">
-                <button id="tabBtn-tasks" class="secondary" onclick="selectTab('tasks')">Workflow</button>
-                <button id="tabBtn-library" class="secondary" onclick="selectTab('library')">Library</button>
-                <button id="tabBtn-settings" class="secondary" onclick="selectTab('settings')">Tuning</button>
+                <button class="wheel-step" type="button" onclick="cyclePanel(-1)" aria-label="Previous panel">&uarr;</button>
+                <div id="panelWheel" class="panel-wheel">
+                  <button id="tabBtn-tasks" class="secondary" type="button" onclick="openPanelFromWheel('tasks')">Workflow</button>
+                  <button id="tabBtn-library" class="secondary" type="button" onclick="openPanelFromWheel('library')">Library</button>
+                  <button id="tabBtn-settings" class="secondary" type="button" onclick="openPanelFromWheel('settings')">Tuning</button>
+                </div>
+                <button class="wheel-step" type="button" onclick="cyclePanel(1)" aria-label="Next panel">&darr;</button>
               </nav>
             </div>
 
@@ -2727,41 +2855,20 @@ HTML_PAGE = """<!doctype html>
           <button class="secondary overlay-close" onclick="selectTab('dashboard')">Close</button>
           <div class="settings-layout tuning-layout">
             <div class="tuning-main-stack">
-              <div class="panel">
+              <div class="panel tuning-controls-panel">
                 <div class="panel-head tight">
                   <div>
-                    <h2>Line Guidance</h2>
-                    <div class="panel-sub">Normal row-follow speed. Control-source switching is stage based.</div>
+                    <h2>Tuning</h2>
                   </div>
-                  <div class="status-badge">Saved globally</div>
                 </div>
                 <div class="subpanel">
-                  <div class="field-inline">
+                  <div class="tuning-controls-grid">
                     <div class="field"><label for="lineCruiseVx">Cruise vx</label><input id="lineCruiseVx"></div>
-                  </div>
-                  <div class="note"><strong>Control source</strong><br>Normal row travel uses lidar guidance. Startup, row-end, reverse transition, and crab row-change stages use global path control.</div>
-                </div>
-              </div>
-
-              <div class="panel projection-tuning-panel">
-                <div class="panel-head tight">
-                  <div>
-                    <h2>Ground Projection</h2>
-                    <div class="panel-sub">Project sensor pose back to the vehicle center.</div>
-                  </div>
-                </div>
-                <div class="subpanel">
-                  <div class="field-inline">
                     <div class="field"><label for="sensorHeight">Sensor Height (m)</label><input id="sensorHeight"></div>
                     <div class="field"><label for="bodyXOffset">Body X Offset (m)</label><input id="bodyXOffset"></div>
-                  </div>
-                  <div class="field-inline">
                     <div class="field"><label for="bodyYOffset">Body Y Offset (m)</label><input id="bodyYOffset"></div>
                     <div class="field"><label for="rollGain">Roll Gain</label><input id="rollGain"></div>
-                  </div>
-                  <div class="field-inline">
                     <div class="field"><label for="pitchGain">Pitch Gain</label><input id="pitchGain"></div>
-                    <div class="field"></div>
                   </div>
                   <div class="button-row">
                     <button onclick="captureProjectionAnchor()">Capture Anchor</button>
@@ -2774,7 +2881,6 @@ HTML_PAGE = """<!doctype html>
                 <div class="ota-update-head">
                   <div>
                     <h2>Application Update</h2>
-                    <div class="panel-sub">Python and web code from GitHub Releases.</div>
                   </div>
                 </div>
                 <div class="ota-overview">
@@ -2794,16 +2900,16 @@ HTML_PAGE = """<!doctype html>
                   </div>
                   <div class="ota-release-summary">
                     <div class="ota-release-title" id="otaReleaseTitle">Ready to check for updates</div>
-                    <div class="ota-release-copy" id="otaStatus">Only Python and web code are updated. Maps, missions, settings, and logs remain on the vehicle.</div>
                   </div>
                 </div>
                 <div class="ota-progress-row">
-                  <div class="ota-progress-title">Install readiness</div>
+                  <div class="ota-progress-title">Download</div>
                   <div class="ota-progress-track"><div class="ota-progress-fill" id="otaProgressFill"></div></div>
-                  <div class="ota-progress-value" id="otaProgressValue">0%</div>
+                  <div class="ota-progress-value" id="otaProgressValue">Not downloaded</div>
                 </div>
                 <div class="ota-actions">
                   <button class="secondary" onclick="checkAppUpdate()">Check Update</button>
+                  <button class="secondary" id="otaDownloadBtn" onclick="downloadAppUpdate()" disabled>Download Update</button>
                   <button id="otaInstallBtn" onclick="installAppUpdate()" disabled>Install Update</button>
                 </div>
               </div>
@@ -3317,11 +3423,52 @@ HTML_PAGE = """<!doctype html>
       return String(taskStatus || '') === name;
     }
 
+    const panelWheelTabs = ['tasks', 'library', 'settings'];
+    let panelWheelIndex = 0;
+
+    function renderPanelWheel(animate=false) {
+      const wheel = document.getElementById('panelWheel');
+      if (!wheel) return;
+      if (animate) {
+        wheel.classList.remove('is-cycling');
+        void wheel.offsetWidth;
+        wheel.classList.add('is-cycling');
+      }
+      for (const offset of [-1, 0, 1]) {
+        const index = (panelWheelIndex + offset + panelWheelTabs.length) % panelWheelTabs.length;
+        const tab = panelWheelTabs[index];
+        const button = document.getElementById('tabBtn-' + tab);
+        if (!button) continue;
+        button.classList.toggle('wheel-current', offset === 0);
+        button.setAttribute('aria-current', offset === 0 ? 'true' : 'false');
+        wheel.appendChild(button);
+      }
+    }
+
+    function openPanelFromWheel(tabName) {
+      const index = panelWheelTabs.indexOf(tabName);
+      if (index < 0 || index !== panelWheelIndex) return;
+      panelWheelIndex = index;
+      renderPanelWheel();
+      if (activeTab !== tabName) selectTab(tabName);
+    }
+
+    function cyclePanel(direction) {
+      panelWheelIndex = (panelWheelIndex + direction + panelWheelTabs.length) % panelWheelTabs.length;
+      const tabName = panelWheelTabs[panelWheelIndex];
+      renderPanelWheel(true);
+    }
+
     function selectTab(tabName) {
       const overlayTabs = ['tasks', 'library', 'settings', 'logs'];
       const requested = overlayTabs.includes(tabName) ? tabName : 'dashboard';
       const nextTab = requested !== 'dashboard' && activeTab === requested ? 'dashboard' : requested;
       activeTab = nextTab;
+      const wheelIndex = panelWheelTabs.indexOf(nextTab);
+      if (wheelIndex >= 0) {
+        panelWheelIndex = wheelIndex;
+        renderPanelWheel();
+      }
       document.body.classList.toggle('workflow-overlay-open', nextTab === 'tasks');
       document.getElementById('tab-dashboard')?.classList.add('active');
       for (const name of overlayTabs) {
@@ -3621,27 +3768,48 @@ HTML_PAGE = """<!doctype html>
       const title = document.getElementById('otaReleaseTitle');
       const status = document.getElementById('otaStatus');
       const install = document.getElementById('otaInstallBtn');
+      const downloadButton = document.getElementById('otaDownloadBtn');
       const progress = document.getElementById('otaProgressFill');
       const progressValue = document.getElementById('otaProgressValue');
       if (current) current.textContent = data.current_version || '--';
       if (available) available.textContent = data.available_version || '--';
       if (status) status.textContent = data.message || 'Check for an application update.';
       otaCandidate = data.available_version || '';
-      if (install) install.disabled = !otaCandidate || !data.can_install;
+      const download = data.download || {};
+      const downloadState = String(download.state || 'idle');
+      const received = Number(download.received_bytes || 0);
+      const total = Number(download.total_bytes || 0);
+      const speed = Number(download.speed_bps || 0);
+      const percent = total > 0 ? Math.min(100, Math.round(received * 100 / total)) : 0;
+      const formatBytes = value => value >= 1024 * 1024 ? (value / (1024 * 1024)).toFixed(1) + ' MB' : (value / 1024).toFixed(0) + ' KB';
+      const formatSpeed = value => value > 0 ? formatBytes(value) + '/s' : '--';
+      if (downloadButton) downloadButton.disabled = !otaCandidate || downloadState === 'downloading' || downloadState === 'downloaded';
+      if (install) install.disabled = !otaCandidate || downloadState !== 'downloaded';
+      const checked = data.checked === true;
       const ready = !!otaCandidate && !!data.can_install;
       const releaseAvailable = !!otaCandidate;
       if (title) title.textContent = ready
         ? 'A new release is ready to install'
         : releaseAvailable ? 'A release is available'
-          : 'Application is up to date';
-      if (progress) progress.style.width = ready || !releaseAvailable ? '100%' : '0%';
-      if (progressValue) progressValue.textContent = ready ? 'Ready' : releaseAvailable ? 'Blocked' : 'Current';
+          : checked ? 'Application is up to date'
+            : 'No update check has been run';
+      if (progress) progress.style.width = downloadState === 'downloaded' ? '100%' : downloadState === 'downloading' ? percent + '%' : '0%';
+      if (progressValue) progressValue.textContent = downloadState === 'downloading'
+        ? percent + '%  ' + formatSpeed(speed)
+        : downloadState === 'downloaded' ? 'Downloaded'
+          : downloadState === 'failed' ? 'Failed'
+            : 'Not downloaded';
     }
     async function checkAppUpdate() {
       try {
         const data = await api('/api/ota/check', 'POST', {});
         updateOtaPanel(data);
-        if (data.available_version) showToast('Update available: ' + data.available_version, 'success');
+        showToast(
+          data.available_version
+            ? 'Update available: ' + data.available_version
+            : 'Application is already up to date.',
+          'success'
+        );
       } catch (err) {
         showToast('Update check failed: ' + (err?.message || err), 'error');
       }
@@ -3655,6 +3823,16 @@ HTML_PAGE = """<!doctype html>
         showToast('Update installed. Restarting web service.', 'success');
       } catch (err) {
         showToast('Update failed: ' + (err?.message || err), 'error');
+      }
+    }
+    async function downloadAppUpdate() {
+      if (!otaCandidate) return;
+      try {
+        const data = await api('/api/ota/download', 'POST', { version: otaCandidate });
+        updateOtaPanel(data);
+        showToast('Download started.', 'success');
+      } catch (err) {
+        showToast('Download failed: ' + (err?.message || err), 'error');
       }
     }
 
@@ -4192,6 +4370,7 @@ HTML_PAGE = """<!doctype html>
       showToast('This browser cannot read the Xbox controller. Use the latest Chrome or Edge.', 'error');
     }
     setTheme(localStorage.getItem('autorun_final_theme') || defaultTheme);
+    renderPanelWheel();
     setInterval(refreshState, 1000);
     setInterval(refreshLidarPreview, 200);
     setInterval(refreshPreview, 250);
@@ -4569,7 +4748,10 @@ class WebController:
             "current_version": self._current_app_version(),
             "available_version": "",
             "can_install": False,
-            "message": "Check for an application update.",
+            "checked": False,
+            "message": "No update check has been run.",
+            "release_url": "",
+            "download": {"state": "idle", "received_bytes": 0, "total_bytes": 0, "speed_bps": 0.0},
         }
         self.map_paths: dict[str, Path] = {}
         self.mission_paths: dict[str, Path] = {}
@@ -4963,7 +5145,7 @@ class WebController:
                 if not isinstance(releases, list):
                     raise RuntimeError("Update service returned an invalid release list.")
                 versions = [
-                    (number, tag)
+                    (number, tag, str(release.get("tarball_url") or ""))
                     for release in releases
                     if isinstance(release, dict)
                     and not bool(release.get("draft"))
@@ -4974,13 +5156,16 @@ class WebController:
                 ]
                 if not versions:
                     raise RuntimeError("No stable version Releases were found.")
-                _, latest = max(versions)
+                _, latest, release_url = max(versions)
                 available = latest if current_number is None or self._version_number(latest) > current_number else ""
                 can_install, blocked_reason = self._ota_can_install_locked()
                 self.ota_status = {
                     "current_version": current,
                     "available_version": available,
                     "can_install": bool(available and can_install),
+                    "checked": True,
+                    "release_url": release_url if available else "",
+                    "download": {"state": "idle", "received_bytes": 0, "total_bytes": 0, "speed_bps": 0.0},
                     "message": (
                         f"Release {latest} is ready." if available and can_install
                         else blocked_reason if available
@@ -4992,8 +5177,71 @@ class WebController:
                     "current_version": current,
                     "available_version": "",
                     "can_install": False,
+                    "checked": True,
                     "message": f"Update check failed: {exc}",
+                    "release_url": "",
+                    "download": {"state": "failed", "received_bytes": 0, "total_bytes": 0, "speed_bps": 0.0},
                 }
+            return dict(self.ota_status)
+
+    def _download_app_release(self, version: str, release_url: str) -> None:
+        target_dir = OTA_DOWNLOAD_DIR
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{version}.tar.gz"
+        partial = target.with_suffix(".tar.gz.part")
+        received = 0
+        started_at = time.monotonic()
+        try:
+            request = Request(release_url, headers={"Accept": "application/octet-stream", "User-Agent": "autorunlida-ota"})
+            with urlopen(request, timeout=30) as response, partial.open("wb") as output:
+                total = int(response.headers.get("Content-Length") or 0)
+                while True:
+                    chunk = response.read(128 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    received += len(chunk)
+                    elapsed = max(0.001, time.monotonic() - started_at)
+                    with self.lock:
+                        self.ota_status["download"] = {
+                            "state": "downloading",
+                            "received_bytes": received,
+                            "total_bytes": total,
+                            "speed_bps": received / elapsed,
+                        }
+            partial.replace(target)
+            with self.lock:
+                self.ota_status["download"] = {
+                    "state": "downloaded", "received_bytes": received,
+                    "total_bytes": total or received, "speed_bps": 0.0,
+                }
+                self.ota_status["can_install"] = True
+                self.ota_status["message"] = f"Release {version} downloaded and ready to install."
+        except Exception as exc:
+            partial.unlink(missing_ok=True)
+            with self.lock:
+                self.ota_status["download"] = {
+                    "state": "failed", "received_bytes": received,
+                    "total_bytes": 0, "speed_bps": 0.0,
+                }
+                self.ota_status["message"] = f"Download failed: {exc}"
+
+    def download_app_update(self, version: str) -> dict[str, Any]:
+        with self.lock:
+            if version != str(self.ota_status.get("available_version") or ""):
+                raise RuntimeError("Check for updates again before downloading.")
+            release_url = str(self.ota_status.get("release_url") or "")
+            if not release_url:
+                raise RuntimeError("Release download URL is unavailable.")
+            download = self.ota_status.get("download") or {}
+            if str(download.get("state") or "") == "downloading":
+                return dict(self.ota_status)
+            self.ota_status["download"] = {
+                "state": "downloading", "received_bytes": 0, "total_bytes": 0, "speed_bps": 0.0,
+            }
+            self.ota_status["can_install"] = False
+            self.ota_status["message"] = f"Downloading release {version}."
+            threading.Thread(target=self._download_app_release, args=(version, release_url), daemon=True).start()
             return dict(self.ota_status)
 
     def _restart_after_update(self) -> None:
@@ -5012,6 +5260,8 @@ class WebController:
             can_install, reason = self._ota_can_install_locked()
             if not can_install:
                 raise RuntimeError(reason)
+            if str((self.ota_status.get("download") or {}).get("state") or "") != "downloaded":
+                raise RuntimeError("Download the release before installing it.")
             current_number = self._version_number(self._current_app_version())
             if current_number is not None and target_number <= current_number:
                 raise RuntimeError("The requested version is not newer than the current application.")
@@ -5021,7 +5271,10 @@ class WebController:
                 "current_version": version,
                 "available_version": "",
                 "can_install": False,
+                "checked": True,
                 "message": f"Installed {version}. Restarting web service.",
+                "release_url": "",
+                "download": {"state": "installed", "received_bytes": 0, "total_bytes": 0, "speed_bps": 0.0},
             }
             self._log(f"Application update installed: {version}. Restarting web service.")
             threading.Thread(target=self._restart_after_update, daemon=True).start()
@@ -6129,6 +6382,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/ota/check":
                 self._send_json(APP.check_app_update())
+                return
+            if self.path == "/api/ota/download":
+                self._send_json(APP.download_app_update(str(payload.get("version") or "")))
                 return
             if self.path == "/api/ota/install":
                 self._send_json(APP.install_app_update(str(payload.get("version") or "")))
