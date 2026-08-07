@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -1602,6 +1603,22 @@ def _append_hybrid_log(log_path: Path | None, message: str) -> None:
         pass
 
 
+def _append_hybrid_telemetry(log_path: Path | None, payload: dict[str, Any]) -> None:
+    """Append a machine-readable hybrid-drive sample without interrupting control."""
+    if log_path is None:
+        return
+    try:
+        record = {
+            "type": "telemetry",
+            "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            **payload,
+        }
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write("TELEMETRY " + json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
 def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
     core.ensure_can_ready(args.channel, args.bitrate)
     mission = json.loads(Path(args.mission).read_text(encoding="utf-8"))
@@ -1715,6 +1732,9 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
         _append_hybrid_log(hybrid_run_log, f"Map DB: {args.db}")
         last_cmd_log = 0.0
         last_feedback_log = 0.0
+        last_telemetry_log = 0.0
+        last_web_status = ""
+        last_web_unlock_state: tuple[bool, bool] | None = None
         last_crab_align_log = 0.0
         last_reverse_state: bool | None = None
         current_gear = "4t4d"
@@ -2801,16 +2821,91 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     f"lidar_reverse_sign={_safe_float(local_payload.get('reverse_steer_sign'), -1.0):.1f} "
                     f"reverse={reversing_here}"
                 )
-                core.log(cmd_log)
                 _append_hybrid_log(hybrid_run_log, cmd_log)
                 runtime = snapshot.get("_runtime", {}) if isinstance(snapshot, dict) else {}
                 waiting_unlock = bool(runtime.get("waiting_unlock", False))
                 unlock_now = bool(runtime.get("unlock_now", False))
-                if waiting_unlock or unlock_now:
+                web_status = f"{control_mode}:{current_cmd_gear}"
+                if web_status != last_web_status:
+                    core.log(f"Hybrid status: mode={control_mode} gear={current_cmd_gear}.")
+                    last_web_status = web_status
+                unlock_state = (waiting_unlock, unlock_now)
+                if unlock_state != last_web_unlock_state and (waiting_unlock or unlock_now):
                     unlock_log = f"Hybrid unlock: waiting_unlock={waiting_unlock} unlock_pulse={unlock_now}"
                     core.log(unlock_log)
                     _append_hybrid_log(hybrid_run_log, unlock_log)
+                last_web_unlock_state = unlock_state
                 last_cmd_log = now
+            if now - last_telemetry_log >= 0.5:
+                local_payload = local_status.payload if isinstance(local_status.payload, dict) else {}
+                motion = snapshot.get("motion", {}) if isinstance(snapshot, dict) else {}
+                steering = snapshot.get("steering", {}) if isinstance(snapshot, dict) else {}
+                io_fb = snapshot.get("io", {}) if isinstance(snapshot, dict) else {}
+                err_fb = snapshot.get("error", {}) if isinstance(snapshot, dict) else {}
+                runtime = snapshot.get("_runtime", {}) if isinstance(snapshot, dict) else {}
+                if global_control_active:
+                    control_mode = "global_path"
+                elif row_entry_assist.lidar_tracking:
+                    control_mode = "lidar_entry"
+                elif row_entry_assist.lidar_pending:
+                    control_mode = "lidar_entry_wait"
+                else:
+                    control_mode = "lidar_centerline"
+                _append_hybrid_telemetry(
+                    hybrid_run_log,
+                    {
+                        "mission_index": start_index,
+                        "control_mode": control_mode,
+                        "command": {
+                            "gear": current_cmd_gear,
+                            "vx_mps": round(float(local_cmd.vx), 4),
+                            "vy_mps": round(float(local_cmd.vy), 4),
+                            "wz_deg_s": round(math.degrees(float(local_cmd.wz)), 3),
+                            "fresh": bool(local_cmd.fresh),
+                        },
+                        "feedback": {
+                            "body_gear": motion.get("gear"),
+                            "vx_mps": _safe_float(motion.get("vx_mps"), 0.0),
+                            "vy_mps": _safe_float(motion.get("vy_mps"), 0.0),
+                            "wz_deg_s": _safe_float(motion.get("wz_dps"), 0.0),
+                            "steering_gear": steering.get("gear"),
+                            "steering_angle_deg": _safe_float(steering.get("wheel_angle_deg"), 0.0),
+                            "steering_speed_mps": _safe_float(steering.get("wheel_speed_mps"), 0.0),
+                            "unlock_ok": bool(io_fb.get("unlock_ok", False)),
+                            "remote_control": bool(io_fb.get("remote_control", False)),
+                            "estop": bool(io_fb.get("estop", False)),
+                            "error_level": err_fb.get("level"),
+                            "error_type": err_fb.get("type"),
+                            "waiting_unlock": bool(runtime.get("waiting_unlock", False)),
+                        },
+                        "pose": {
+                            "x_m": round(float(pose.x), 4),
+                            "y_m": round(float(pose.y), 4),
+                            "yaw_deg": round(math.degrees(float(pose.yaw)), 3),
+                        },
+                        "global_path": {
+                            "target_distance_m": round(float(dist), 4),
+                            "lateral_error_m": round(float(lateral_err), 4),
+                            "heading_error_deg": round(float(heading_err_deg), 3),
+                            "row_end_zone": bool(in_row_end_zone),
+                            "reverse": bool(reversing_here),
+                        },
+                        "local_centerline": {
+                            "state": local_status.state,
+                            "fresh": bool(local_status.fresh),
+                            "found": bool(local_status.found),
+                            "mode": str(local_payload.get("line_mode") or local_payload.get("mode") or ""),
+                            "center_offset_m": _safe_float(local_payload.get("center_error_m"), 0.0),
+                            "tracking_offset_m": _safe_float(local_payload.get("lateral_error"), 0.0),
+                            "heading_error_deg": _safe_float(local_payload.get("heading_error_deg"), 0.0),
+                            "row_width_m": _safe_float(local_payload.get("row_width_m"), 0.0),
+                            "left_clearance_m": _safe_float(local_payload.get("left_clearance_m"), 0.0),
+                            "right_clearance_m": _safe_float(local_payload.get("right_clearance_m"), 0.0),
+                            "reject_reason": str(local_payload.get("reject_reason") or ""),
+                        },
+                    },
+                )
+                last_telemetry_log = now
             if now - last_feedback_log >= 1.0:
                 motion = snapshot.get("motion", {})
                 steering = snapshot.get("steering", {})
@@ -2830,8 +2925,6 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     f"blocked={local_status.obstacle_blocked} lost_frames={local_status.lost_frames} "
                     f"fresh={local_status.fresh}"
                 )
-                core._log_feedback("Hybrid autorun", snapshot, pose)
-                core.log(local_log)
                 _append_hybrid_log(hybrid_run_log, feedback_log)
                 _append_hybrid_log(hybrid_run_log, pose_log)
                 _append_hybrid_log(hybrid_run_log, local_log)

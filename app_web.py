@@ -1802,27 +1802,27 @@ HTML_PAGE = """<!doctype html>
       line-height: 1;
     }
     .speed-digital strong {
-      font-size: clamp(24px, 2vw, 34px);
+      font-size: clamp(30px, 2.35vw, 40px);
       font-weight: 650;
       letter-spacing: -.035em;
     }
     .speed-digital small {
       margin-top: 6px;
       color: var(--ui-muted);
-      font-size: 10px;
+      font-size: 12px;
       font-weight: 650;
     }
     .mode-instrument {
-      padding: 14px 14px 12px;
+      padding: 12px 16px;
       display: grid;
       align-content: center;
       justify-items: center;
       text-align: center;
-      gap: 7px;
+      gap: 9px;
     }
     .instrument-kicker {
       color: var(--ui-muted);
-      font-size: 9px;
+      font-size: 11px;
       font-weight: 700;
       letter-spacing: .1em;
       text-transform: uppercase;
@@ -1830,7 +1830,7 @@ HTML_PAGE = """<!doctype html>
     .mode-value {
       max-width: 100%;
       color: var(--ui-accent);
-      font-size: clamp(22px, 2vw, 31px);
+      font-size: clamp(28px, 2.25vw, 38px);
       line-height: 1;
       font-weight: 720;
       letter-spacing: -.03em;
@@ -1841,39 +1841,39 @@ HTML_PAGE = """<!doctype html>
     .mode-detail {
       width: 100%;
       display: grid;
-      gap: 3px;
-      padding-top: 7px;
+      gap: 4px;
+      padding-top: 9px;
       border-top: 1px solid var(--ui-line-soft);
     }
     .mode-detail span {
       color: var(--ui-muted);
-      font-size: 9px;
+      font-size: 11px;
     }
     .mode-detail strong {
       color: var(--ui-text);
-      font-size: 11px;
+      font-size: 14px;
       font-weight: 700;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
     .charging-state {
-      min-height: 23px;
-      padding: 0 8px;
+      min-height: 30px;
+      padding: 0 11px;
       border: 1px solid var(--ui-line-soft);
       border-radius: 999px;
       display: inline-flex;
       align-items: center;
       gap: 6px;
       color: var(--ui-muted);
-      font-size: 9px;
+      font-size: 12px;
       font-weight: 700;
       white-space: nowrap;
     }
     .charging-state::before {
       content: "";
-      width: 6px;
-      height: 6px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
       background: var(--ui-muted);
     }
@@ -1895,53 +1895,67 @@ HTML_PAGE = """<!doctype html>
     .instrument-readout {
       min-width: 0;
       display: grid;
-      grid-template-columns: 28px minmax(0, 1fr);
+      grid-template-columns: 31px minmax(0, 1fr);
       align-items: center;
-      gap: 8px;
-      padding: 5px 2px;
+      gap: 9px;
+      padding: 6px 2px;
     }
     .instrument-readout + .instrument-readout {
       border-top: 1px solid var(--ui-line-soft);
     }
     .instrument-icon {
-      width: 24px;
-      height: 24px;
+      width: 27px;
+      height: 27px;
       display: grid;
       place-items: center;
       color: var(--ui-muted);
     }
     .instrument-icon svg {
-      width: 21px;
-      height: 21px;
+      width: 24px;
+      height: 24px;
       fill: none;
       stroke: currentColor;
       stroke-width: 1.6;
       stroke-linecap: round;
       stroke-linejoin: round;
     }
+    .battery-level-track {
+      fill: color-mix(in srgb, var(--ui-muted) 18%, transparent);
+      stroke: none;
+      fill-opacity: 0;
+      transition: fill .25s ease;
+    }
+    .battery-level {
+      fill: var(--ui-success);
+      stroke: none;
+      transition: y .25s ease, height .25s ease, fill .25s ease;
+    }
     .instrument-readout-copy {
       min-width: 0;
       display: grid;
-      gap: 2px;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
     }
     .instrument-readout-copy span {
       color: var(--ui-muted);
-      font-size: 9px;
+      font-size: 11px;
       line-height: 1;
     }
     .instrument-readout-copy strong {
       color: var(--ui-text);
-      font-size: 13px;
+      font-size: 16px;
       line-height: 1.1;
       font-weight: 700;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+      text-align: right;
     }
     .instrument-readout-copy small {
       margin-left: 3px;
       color: var(--ui-muted);
-      font-size: 8.5px;
+      font-size: 10px;
       font-weight: 600;
     }
     .overview-grid {
@@ -2185,6 +2199,38 @@ HTML_PAGE = """<!doctype html>
       color: color-mix(in srgb, var(--ui-warn) 90%, var(--ui-text));
       box-shadow: none;
     }
+    #tab-settings .projection-tuning-panel {
+      padding: 14px 16px;
+    }
+    #tab-settings .projection-tuning-panel .panel-head.tight {
+      margin-bottom: 8px;
+    }
+    #tab-settings .projection-tuning-panel .subpanel {
+      gap: 6px;
+    }
+    #tab-settings .projection-tuning-panel .field-inline {
+      gap: 6px;
+    }
+    #tab-settings .projection-tuning-panel .field {
+      gap: 4px;
+    }
+    #tab-settings .projection-tuning-panel label {
+      font-size: 10px;
+      line-height: 1.1;
+    }
+    #tab-settings .projection-tuning-panel input {
+      min-height: 32px;
+      padding: 5px 9px;
+      border-radius: 8px;
+      font-size: 12px;
+    }
+    #tab-settings .projection-tuning-panel .button-row {
+      gap: 6px;
+      margin-top: 2px;
+    }
+    #tab-settings .projection-tuning-panel .button-row button {
+      min-height: 32px;
+    }
     body.workflow-overlay-open {
       overflow: hidden;
     }
@@ -2371,7 +2417,7 @@ HTML_PAGE = """<!doctype html>
                 <section class="instrument-section instrument-readouts" aria-label="Vehicle status">
                   <div class="instrument-readout">
                     <span class="instrument-icon" aria-hidden="true">
-                      <svg viewBox="0 0 24 24"><rect x="7" y="4" width="10" height="17" rx="2"></rect><path d="M10 2h4"></path><path d="M9.5 16.5h5v2h-5z"></path></svg>
+                      <svg viewBox="0 0 24 24"><rect id="metricBatteryTrack" class="battery-level-track" x="7" y="4" width="10" height="17" rx="2"></rect><rect id="metricBatteryLevel" class="battery-level" x="7" y="21" width="10" height="0" rx="2"></rect><rect x="7" y="4" width="10" height="17" rx="2"></rect><path d="M10 2h4"></path></svg>
                     </span>
                     <div class="instrument-readout-copy"><span>Battery</span><strong id="metricBattery">--<small>%</small></strong></div>
                   </div>
@@ -2610,7 +2656,7 @@ HTML_PAGE = """<!doctype html>
                 </div>
               </div>
 
-              <div class="panel">
+              <div class="panel projection-tuning-panel">
                 <div class="panel-head tight">
                   <div>
                     <h2>Ground Projection</h2>
@@ -3022,13 +3068,13 @@ HTML_PAGE = """<!doctype html>
       const labels = {
         '1': 'Park',
         '2': 'Neutral',
-        '5': '4-wheel steer',
-        '6': '4-wheel steer',
+        '5': '4T4D',
+        '6': '4T4D',
         '7': 'Crab',
         '8': 'Crab',
         park: 'Park',
         neutral: 'Neutral',
-        '4t4d': '4-wheel steer',
+        '4t4d': '4T4D',
         crab: 'Crab',
       };
       return labels[normalized] || (normalized ? String(value) : '--');
@@ -3073,6 +3119,24 @@ HTML_PAGE = """<!doctype html>
       setMetricValue('metricSpeed', speed);
       setMetricValue('metricSteering', steering, '°');
       setMetricValue('metricBattery', soc, '%');
+      const batteryLevel = document.getElementById('metricBatteryLevel');
+      const batteryTrack = document.getElementById('metricBatteryTrack');
+      const batteryPercent = Number(soc);
+      if (batteryLevel) {
+        const batteryRatio = Number.isFinite(batteryPercent)
+          ? Math.max(0, Math.min(1, batteryPercent / 100))
+          : 0;
+        const levelHeight = 17 * batteryRatio;
+        batteryLevel.setAttribute('y', String(21 - levelHeight));
+        batteryLevel.setAttribute('height', String(levelHeight));
+        const batteryColor = !Number.isFinite(batteryPercent)
+          ? 'transparent'
+          : batteryPercent <= 20 ? 'var(--ui-warn)'
+            : batteryPercent <= 50 ? '#d99b35'
+              : 'var(--ui-success)';
+        batteryLevel.style.fill = batteryColor;
+        if (batteryTrack) batteryTrack.style.fill = batteryColor;
+      }
       const gaugeRatio = Math.max(0, Math.min(1, (speedValue ?? 0) / 0.5));
       const gaugeArc = document.getElementById('speedGaugeArc');
       const gaugeNeedle = document.getElementById('speedGaugeNeedle');
