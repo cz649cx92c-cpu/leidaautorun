@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
@@ -74,6 +75,11 @@ LIDAR_DRIVER_PARAMS = (
 )
 GAMEPAD_COMMAND_TIMEOUT_S = 0.45
 GAMEPAD_CONTROL_PERIOD_S = 0.05
+OTA_REMOTE = "leidaautorun"
+OTA_REPOSITORY = "cz649cx92c-cpu/leidaautorun"
+OTA_RELEASES_URL = f"https://api.github.com/repos/{OTA_REPOSITORY}/releases"
+OTA_BRANCH_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+APP_VERSION = "v1.0.0"
 GAMEPAD_SPEED_LIMITS: dict[str, tuple[float, float]] = {
     "low": (0.15, 25.0),
     "medium": (0.30, 50.0),
@@ -2231,6 +2237,87 @@ HTML_PAGE = """<!doctype html>
     #tab-settings .projection-tuning-panel .button-row button {
       min-height: 32px;
     }
+    #tab-settings .ota-panel {
+      grid-column: 1 / -1;
+      padding: 0;
+      overflow: hidden;
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--ui-panel) 96%, transparent);
+    }
+    #tab-settings .ota-panel:hover { transform: none; }
+    .ota-update-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--ui-line-soft);
+    }
+    .ota-update-head h2 { font-size: 16px; }
+    .ota-update-head .panel-sub { margin-top: 3px; }
+    .ota-overview {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+    }
+    .ota-version-summary, .ota-release-summary { padding: 18px; }
+    .ota-version-summary { border-right: 1px solid var(--ui-line-soft); }
+    .ota-label {
+      color: var(--ui-muted);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .ota-version-line {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr);
+      gap: 10px;
+      align-items: end;
+      margin-top: 12px;
+    }
+    .ota-version-value {
+      margin-top: 5px;
+      color: var(--ui-text);
+      font-size: 23px;
+      line-height: 1;
+      font-weight: 760;
+    }
+    .ota-version-value.available { color: var(--ui-accent); }
+    .ota-version-arrow {
+      color: var(--ui-muted);
+      font-size: 20px;
+      line-height: 1;
+      text-align: center;
+    }
+    .ota-release-summary { display: grid; align-content: center; gap: 8px; }
+    .ota-release-title { color: var(--ui-text); font-size: 13px; font-weight: 720; }
+    .ota-release-copy { color: var(--ui-muted); font-size: 12px; line-height: 1.45; }
+    .ota-progress-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 18px;
+      border-top: 1px solid var(--ui-line-soft);
+      border-bottom: 1px solid var(--ui-line-soft);
+      background: color-mix(in srgb, var(--ui-strong-surface) 64%, transparent);
+    }
+    .ota-progress-title { color: var(--ui-text); font-size: 12px; font-weight: 700; }
+    .ota-progress-track { height: 6px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--ui-muted) 17%, transparent); }
+    .ota-progress-fill { width: 0%; height: 100%; border-radius: inherit; background: var(--ui-accent); transition: width 180ms ease; }
+    .ota-progress-value { min-width: 52px; color: var(--ui-accent); font-size: 12px; font-weight: 750; text-align: right; }
+    .ota-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 16px 18px;
+    }
+    .ota-actions button { width: auto; min-width: 142px; min-height: 38px; padding: 0 15px; }
+    @media (max-width: 820px) {
+      .ota-overview { grid-template-columns: 1fr; }
+      .ota-version-summary { border-right: 0; border-bottom: 1px solid var(--ui-line-soft); }
+      .ota-actions { display: grid; grid-template-columns: 1fr; }
+      .ota-actions button { width: 100%; }
+    }
     body.workflow-overlay-open {
       overflow: hidden;
     }
@@ -2683,10 +2770,44 @@ HTML_PAGE = """<!doctype html>
                 </div>
               </div>
 
-              <div class="notes-grid tuning-notes">
-                <div class="note">Fields remain editable while background refresh runs. Unsaved values are preserved until you press <code>Save Tuning</code>.</div>
-                <div class="note">Saved values are written into <code>gui_settings.json</code> and reused by mapping, recording, and hybrid drive.</div>
+              <div class="panel ota-panel">
+                <div class="ota-update-head">
+                  <div>
+                    <h2>Application Update</h2>
+                    <div class="panel-sub">Python and web code from GitHub Releases.</div>
+                  </div>
+                </div>
+                <div class="ota-overview">
+                  <div class="ota-version-summary">
+                    <div class="ota-label">Version</div>
+                    <div class="ota-version-line">
+                      <div>
+                        <div class="ota-label">Current</div>
+                        <div class="ota-version-value" id="otaCurrentVersion">--</div>
+                      </div>
+                      <div class="ota-version-arrow" aria-hidden="true">&rarr;</div>
+                      <div>
+                        <div class="ota-label">Available</div>
+                        <div class="ota-version-value available" id="otaAvailableVersion">--</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="ota-release-summary">
+                    <div class="ota-release-title" id="otaReleaseTitle">Ready to check for updates</div>
+                    <div class="ota-release-copy" id="otaStatus">Only Python and web code are updated. Maps, missions, settings, and logs remain on the vehicle.</div>
+                  </div>
+                </div>
+                <div class="ota-progress-row">
+                  <div class="ota-progress-title">Install readiness</div>
+                  <div class="ota-progress-track"><div class="ota-progress-fill" id="otaProgressFill"></div></div>
+                  <div class="ota-progress-value" id="otaProgressValue">0%</div>
+                </div>
+                <div class="ota-actions">
+                  <button class="secondary" onclick="checkAppUpdate()">Check Update</button>
+                  <button id="otaInstallBtn" onclick="installAppUpdate()" disabled>Install Update</button>
+                </div>
               </div>
+
             </div>
           </div>
         </section>
@@ -3432,6 +3553,7 @@ HTML_PAGE = """<!doctype html>
       updateFieldIfClean('bodyYOffset', data.settings.body_y_offset_m || '');
       updateFieldIfClean('rollGain', data.settings.roll_gain || '');
       updateFieldIfClean('pitchGain', data.settings.pitch_gain || '');
+      updateOtaPanel(data.ota || {});
 
       updateConsoleBox(data.logs || []);
 
@@ -3490,6 +3612,50 @@ HTML_PAGE = """<!doctype html>
     async function connectCan() {
       await api('/api/connect_can', 'POST', {});
       await refreshState();
+    }
+
+    let otaCandidate = '';
+    function updateOtaPanel(data) {
+      const current = document.getElementById('otaCurrentVersion');
+      const available = document.getElementById('otaAvailableVersion');
+      const title = document.getElementById('otaReleaseTitle');
+      const status = document.getElementById('otaStatus');
+      const install = document.getElementById('otaInstallBtn');
+      const progress = document.getElementById('otaProgressFill');
+      const progressValue = document.getElementById('otaProgressValue');
+      if (current) current.textContent = data.current_version || '--';
+      if (available) available.textContent = data.available_version || '--';
+      if (status) status.textContent = data.message || 'Check for an application update.';
+      otaCandidate = data.available_version || '';
+      if (install) install.disabled = !otaCandidate || !data.can_install;
+      const ready = !!otaCandidate && !!data.can_install;
+      const releaseAvailable = !!otaCandidate;
+      if (title) title.textContent = ready
+        ? 'A new release is ready to install'
+        : releaseAvailable ? 'A release is available'
+          : 'Application is up to date';
+      if (progress) progress.style.width = ready || !releaseAvailable ? '100%' : '0%';
+      if (progressValue) progressValue.textContent = ready ? 'Ready' : releaseAvailable ? 'Blocked' : 'Current';
+    }
+    async function checkAppUpdate() {
+      try {
+        const data = await api('/api/ota/check', 'POST', {});
+        updateOtaPanel(data);
+        if (data.available_version) showToast('Update available: ' + data.available_version, 'success');
+      } catch (err) {
+        showToast('Update check failed: ' + (err?.message || err), 'error');
+      }
+    }
+    async function installAppUpdate() {
+      if (!otaCandidate) return;
+      if (!window.confirm('Install ' + otaCandidate + '? The web service will restart.')) return;
+      try {
+        const data = await api('/api/ota/install', 'POST', { version: otaCandidate });
+        updateOtaPanel(data);
+        showToast('Update installed. Restarting web service.', 'success');
+      } catch (err) {
+        showToast('Update failed: ' + (err?.message || err), 'error');
+      }
     }
 
     async function deleteSelectedMap() {
@@ -4399,6 +4565,12 @@ class WebController:
         }
         self._gamepad_output_active = False
         self._gamepad_last_published_gear = ""
+        self.ota_status: dict[str, Any] = {
+            "current_version": self._current_app_version(),
+            "available_version": "",
+            "can_install": False,
+            "message": "Check for an application update.",
+        }
         self.map_paths: dict[str, Path] = {}
         self.mission_paths: dict[str, Path] = {}
         self.library_mission_paths: dict[str, Path] = {}
@@ -4742,6 +4914,118 @@ class WebController:
     def _log(self, text: str) -> None:
         line = f"{now_text()} {text}"
         self.logs.append(line)
+
+    @staticmethod
+    def _git_output(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=PROJECT_ROOT, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or "Git command failed.").strip())
+        return result.stdout.strip()
+
+    def _current_app_version(self) -> str:
+        return APP_VERSION
+
+    def _ota_can_install_locked(self) -> tuple[bool, str]:
+        if self.task_worker is not None or self._active_localization_worker() is not None:
+            return False, "Stop mapping, recording, driving, and localization before updating."
+        if bool(self.gamepad_control.get("enabled")):
+            return False, "Release web gamepad control before updating."
+        try:
+            if self._git_output("status", "--porcelain"):
+                return False, "Commit or discard local code changes before updating."
+        except Exception as exc:
+            return False, f"Cannot verify application worktree: {exc}"
+        return True, ""
+
+    @staticmethod
+    def _version_number(name: str) -> tuple[int, int, int] | None:
+        match = OTA_BRANCH_PATTERN.fullmatch(name.strip())
+        return tuple(int(value) for value in match.groups()) if match else None
+
+    def ota_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return dict(self.ota_status)
+
+    def check_app_update(self) -> dict[str, Any]:
+        with self.lock:
+            current = self._current_app_version()
+            current_number = self._version_number(current)
+            try:
+                request = Request(
+                    OTA_RELEASES_URL,
+                    headers={"Accept": "application/vnd.github+json", "User-Agent": "autorunlida-ota"},
+                )
+                with urlopen(request, timeout=12) as response:
+                    releases = json.loads(response.read().decode("utf-8"))
+                if not isinstance(releases, list):
+                    raise RuntimeError("Update service returned an invalid release list.")
+                versions = [
+                    (number, tag)
+                    for release in releases
+                    if isinstance(release, dict)
+                    and not bool(release.get("draft"))
+                    and not bool(release.get("prerelease"))
+                    for tag in [str(release.get("tag_name") or "")]
+                    for number in [self._version_number(tag)]
+                    if number is not None
+                ]
+                if not versions:
+                    raise RuntimeError("No stable version Releases were found.")
+                _, latest = max(versions)
+                available = latest if current_number is None or self._version_number(latest) > current_number else ""
+                can_install, blocked_reason = self._ota_can_install_locked()
+                self.ota_status = {
+                    "current_version": current,
+                    "available_version": available,
+                    "can_install": bool(available and can_install),
+                    "message": (
+                        f"Release {latest} is ready." if available and can_install
+                        else blocked_reason if available
+                        else f"Application {current} is current."
+                    ),
+                }
+            except Exception as exc:
+                self.ota_status = {
+                    "current_version": current,
+                    "available_version": "",
+                    "can_install": False,
+                    "message": f"Update check failed: {exc}",
+                }
+            return dict(self.ota_status)
+
+    def _restart_after_update(self) -> None:
+        time.sleep(0.8)
+        subprocess.Popen(
+            ["/bin/bash", str(PROJECT_ROOT / "run_web.sh")], cwd=PROJECT_ROOT,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def install_app_update(self, version: str) -> dict[str, Any]:
+        with self.lock:
+            target_number = self._version_number(version)
+            if target_number is None:
+                raise RuntimeError("Invalid update version.")
+            can_install, reason = self._ota_can_install_locked()
+            if not can_install:
+                raise RuntimeError(reason)
+            current_number = self._version_number(self._current_app_version())
+            if current_number is not None and target_number <= current_number:
+                raise RuntimeError("The requested version is not newer than the current application.")
+            self._git_output("fetch", OTA_REMOTE, f"refs/tags/{version}")
+            self._git_output("switch", "-c", version, "FETCH_HEAD")
+            self.ota_status = {
+                "current_version": version,
+                "available_version": "",
+                "can_install": False,
+                "message": f"Installed {version}. Restarting web service.",
+            }
+            self._log(f"Application update installed: {version}. Restarting web service.")
+            threading.Thread(target=self._restart_after_update, daemon=True).start()
+            return dict(self.ota_status)
 
     def _odin_usb_attached(self) -> bool:
         usb_root = Path("/sys/bus/usb/devices")
@@ -5673,6 +5957,7 @@ class WebController:
                 "camera_status": self.camera_status,
                 "can_status": self.can_status,
                 "preview_source": self.preview_source,
+                "ota": dict(self.ota_status),
                 "logs": list(self.logs),
                 "maps": [
                     {"id": key, "label": f"{path.name}  |  {path.parent.name}"}
@@ -5790,6 +6075,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/lidar":
             self._send_json(APP.lidar_preview_snapshot())
             return
+        if parsed.path == "/api/ota/status":
+            self._send_json(APP.ota_snapshot())
+            return
         if parsed.path == "/api/preview.jpg":
             preview = APP.preview_jpeg()
             if preview is None:
@@ -5838,6 +6126,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             if self.path == "/api/connect_can":
                 APP.connect_can(str(payload.get("channel") or ""), str(payload.get("bitrate") or ""))
                 self._send_json({"ok": True})
+                return
+            if self.path == "/api/ota/check":
+                self._send_json(APP.check_app_update())
+                return
+            if self.path == "/api/ota/install":
+                self._send_json(APP.install_app_update(str(payload.get("version") or "")))
                 return
             if self.path == "/api/gamepad/claim":
                 state = APP.claim_gamepad_control(payload)
