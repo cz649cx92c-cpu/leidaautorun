@@ -24,6 +24,15 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from dual_lidar_config import (
+    DualLidarConfig,
+    LidarConfig,
+    legacy_lidar_driver_running,
+    lidar_driver_running,
+    lidar_driver_start_lock,
+    load_dual_lidar_config,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -392,8 +401,6 @@ def request_map_save(target_file: Path, timeout_sec: float = 25.0, raw_log: Path
 
 def cleanup_stale_odin_processes() -> None:
     patterns = [
-        "install/lidar_pkg/lib/lidar_pkg/lidar_node",
-        " lidar_node",
         "host_sdk_sample",
         "odin1_ros2.launch.py",
         "pcd2depth_node",
@@ -619,12 +626,18 @@ def _local_lidar_drive_settings(config: dict[str, Any], *, reverse: bool, args: 
 
 
 class DirectLocalLidarController:
-    def __init__(self, args: argparse.Namespace, local_lidar_config: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        local_lidar_config: dict[str, Any] | None = None,
+        dual_lidar_config: DualLidarConfig | None = None,
+    ) -> None:
         self._status_lock = threading.Lock()
         self._cmd_lock = threading.Lock()
         self._status = LineStatus()
         self._cmd = TwistCommand()
         self._module = self._load_standalone_module()
+        self._dual_lidar_config = dual_lidar_config or load_dual_lidar_config()
         self._node = self._build_node(args, local_lidar_config or {})
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._node)
@@ -662,7 +675,11 @@ class DirectLocalLidarController:
                 calibration = {}
         except Exception:
             calibration = {}
-        follower_args.scan_topic = str(args.lidar_scan_topic)
+        front_lidar = self._dual_lidar_config.front
+        rear_lidar = self._dual_lidar_config.rear
+        follower_args.scan_topic = str(front_lidar.scan_topic)
+        follower_args.front_scan_topic = str(front_lidar.scan_topic)
+        follower_args.rear_scan_topic = str(rear_lidar.scan_topic)
         follower_args.status_topic = str(args.ros_status_topic)
         follower_args.speed = abs(float(cruise_vx))
         follower_args.min_speed = float(args.lidar_min_speed)
@@ -703,6 +720,16 @@ class DirectLocalLidarController:
         follower_args.lidar_y_offset_m = float(
             calibration.get("lidar_y_offset_m", float(args.lidar_y_offset_m))
         )
+        follower_args.front_sensor_yaw_deg = float(front_lidar.sensor_yaw_deg)
+        follower_args.front_lidar_yaw_correction_deg = float(front_lidar.lidar_yaw_correction_deg)
+        follower_args.front_lidar_x_offset_m = float(front_lidar.lidar_x_offset_m)
+        follower_args.front_lidar_y_offset_m = float(front_lidar.lidar_y_offset_m)
+        follower_args.front_extrinsics_confirmed = bool(front_lidar.extrinsics_confirmed)
+        follower_args.rear_sensor_yaw_deg = float(rear_lidar.sensor_yaw_deg)
+        follower_args.rear_lidar_yaw_correction_deg = float(rear_lidar.lidar_yaw_correction_deg)
+        follower_args.rear_lidar_x_offset_m = float(rear_lidar.lidar_x_offset_m)
+        follower_args.rear_lidar_y_offset_m = float(rear_lidar.lidar_y_offset_m)
+        follower_args.rear_extrinsics_confirmed = bool(rear_lidar.extrinsics_confirmed)
         follower_args.control_deadband_y = float(args.lidar_control_deadband_y)
         follower_args.slow_error_y = float(args.lidar_slow_error_y)
         follower_args.stop_error_y = float(args.lidar_stop_error_y)
@@ -861,6 +888,8 @@ class DirectLocalLidarController:
                 state = "IDLE"
                 if self.drive_enable:
                     state = "TRACK" if estimate.found else "SEARCH"
+                    if bool(self.waiting_for_new_scan):
+                        state = "HOLD"
                 payload = {
                     "state": state,
                     "found": bool(estimate.found),
@@ -908,6 +937,7 @@ class DirectLocalLidarController:
                     "reverse_steer_sign": _safe_float(self.last_debug.get("reverse_steer_sign"), -1.0),
                     "line_mode": str(self.last_debug.get("line_mode", estimate.mode) or ""),
                 }
+                payload.update(self._lidar_debug_fields())
                 with controller._status_lock:
                     controller._status = LineStatus(
                         state=state,
@@ -965,7 +995,9 @@ class DirectLocalLidarController:
             not bool(self._node.drive_enable) or bool(reverse) != bool(self._node.args.reverse)
         )
         if mode_changed:
-            self._node.clear_motion_history()
+            self._node.drive_enable = False
+            self._node.args.reverse = bool(reverse)
+            self._node.prepare_lidar_switch(bool(reverse))
         self._node.drive_enable = bool(enable)
         self._node.args.reverse = bool(reverse)
         self._node.args.low_beam = bool(low_beam)
@@ -1052,33 +1084,44 @@ class DirectLocalLidarController:
 
 
 class LidarDriverProcess(core.ManagedProcess):
-    def __init__(self, log_path: Path) -> None:
+    def __init__(self, sensor: LidarConfig, log_path: Path) -> None:
         if not LIDAR_DRIVER_BIN.exists():
             raise RuntimeError(f"Lidar driver binary not found: {LIDAR_DRIVER_BIN}")
-        cmd = [
-            str(LIDAR_DRIVER_BIN),
-        ]
-        if LIDAR_DRIVER_PARAMS.exists():
-            cmd.extend(["--ros-args", "--params-file", str(LIDAR_DRIVER_PARAMS)])
+        self.sensor = sensor
+        cmd = sensor.driver_args(LIDAR_DRIVER_BIN)
         super().__init__(cmd, LIDAR_DRIVER_ROOT, log_path)
 
 
-def _lidar_driver_running() -> bool:
-    patterns = (str(LIDAR_DRIVER_BIN), "ros2 run lidar_pkg lidar_node")
-    try:
-        result = subprocess.run(
-            ["ps", "-eo", "args="],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-    except Exception:
-        return False
-    return any(
-        command and any(pattern in command for pattern in patterns)
-        for command in (line.strip() for line in result.stdout.splitlines())
-    )
+def _ensure_dual_lidar_drivers(
+    config: DualLidarConfig,
+    timestamp: str,
+) -> list[LidarDriverProcess]:
+    started: list[LidarDriverProcess] = []
+    with lidar_driver_start_lock():
+        if legacy_lidar_driver_running(LIDAR_DRIVER_BIN):
+            raise RuntimeError(
+                "legacy single lidar driver is running without explicit device/topic parameters; "
+                "stop it before starting dual-lidar autorun"
+            )
+        for sensor in config.sensors():
+            if lidar_driver_running(LIDAR_DRIVER_BIN, sensor):
+                core.log(
+                    f"existing {sensor.role} lidar driver detected; reusing "
+                    f"device={sensor.device} topic={sensor.scan_topic}"
+                )
+                continue
+            if not Path(sensor.device).exists():
+                raise RuntimeError(f"{sensor.role} lidar device not found: {sensor.device}")
+            log_path = LOG_DIR / f"lidar_driver_{sensor.role}_{timestamp}.log"
+            process = LidarDriverProcess(sensor, log_path)
+            process.start()
+            started.append(process)
+            core.log(
+                f"{sensor.role} lidar driver started device={sensor.device} "
+                f"node={sensor.node_name} topic={sensor.scan_topic} frame={sensor.frame_id} log={log_path}"
+            )
+        time.sleep(0.25)
+    return started
 
 
 def _wait_for_local_lidar_ready(
@@ -1660,12 +1703,13 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
 
     session: LocalizationSession | None = None
     tracker: core.TFPoseTracker | None = None
-    lidar_driver_proc: LidarDriverProcess | None = None
+    lidar_driver_procs: list[LidarDriverProcess] = []
     direct_local_controller: DirectLocalLidarController | None = None
     local_controller: DirectLocalLidarController | None = None
-    lidar_driver_log = LOG_DIR / f"lidar_driver_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    lidar_driver_timestamp = time.strftime("%Y%m%d_%H%M%S")
     hybrid_run_log = LOG_DIR / f"hybrid_autorun_{time.strftime('%Y%m%d_%H%M%S')}.log"
     local_lidar_config = _load_local_lidar_gui_config()
+    dual_lidar_config = load_dual_lidar_config()
 
     # Align autorunlida with the standalone lidarun calibration file so the
     # lidar flip, yaw correction, and offsets match the user's working setup.
@@ -1710,15 +1754,10 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
             projection = core.anchor_projection_to_pose(projection, pose_raw)
         _pose = core.project_pose_to_ground(pose_raw, projection)
 
-        if _lidar_driver_running():
-            core.log("existing lidar driver detected; hybrid autorun will reuse /scan.")
-        else:
-            lidar_driver_proc = LidarDriverProcess(lidar_driver_log)
-            lidar_driver_proc.start()
-            core.log(f"lidar driver subprocess started. Raw log: {lidar_driver_log}")
+        lidar_driver_procs = _ensure_dual_lidar_drivers(dual_lidar_config, lidar_driver_timestamp)
         time.sleep(1.0)
 
-        direct_local_controller = DirectLocalLidarController(args, local_lidar_config)
+        direct_local_controller = DirectLocalLidarController(args, local_lidar_config, dual_lidar_config)
         local_controller = direct_local_controller
         if not _wait_for_local_lidar_ready(local_controller, args, local_lidar_config=local_lidar_config):
             raise RuntimeError("Pure local lidar control was not ready before autorun start.")
@@ -2956,7 +2995,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
         except Exception:
             pass
         controller.close()
-        if lidar_driver_proc is not None:
+        for lidar_driver_proc in lidar_driver_procs:
             lidar_driver_proc.stop()
         if session is not None:
             session.stop()

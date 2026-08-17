@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -381,9 +381,19 @@ class PlantRowFollower(Node):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__("plant_lidar_centerline_follower")
         self.args = args
+        self.mode_lock = threading.RLock()
         self.scan_lock = threading.Lock()
-        self.last_scan: LaserScan | None = None
-        self.last_scan_time = 0.0
+        self.front_scan: LaserScan | None = None
+        self.front_scan_time = 0.0
+        self.front_scan_seq = 0
+        self.rear_scan: LaserScan | None = None
+        self.rear_scan_time = 0.0
+        self.rear_scan_seq = 0
+        self.active_lidar = "front"
+        self.waiting_for_new_scan = False
+        self.waiting_for_new_scan_reason = ""
+        self.switch_scan_seq = 0
+        self.lidar_switch_count = 0
         self.last_estimate = RowEstimate(found=False)
         self.last_good_row_width = float(args.row_width)
         self.last_found_time = 0.0
@@ -408,7 +418,7 @@ class PlantRowFollower(Node):
         self.last_good_mode = ""
         self.last_following_wz_deg = 0.0
         self.send_state = MotionSendState.create()
-        self.row_cfg = RowFollowerConfig(
+        base_row_cfg = RowFollowerConfig(
             row_width=float(args.row_width),
             min_row_width=float(args.min_row_width),
             max_row_width=float(args.max_row_width),
@@ -426,10 +436,10 @@ class PlantRowFollower(Node):
             center_deadband=float(args.center_deadband),
             left_percentile=float(args.left_percentile),
             right_percentile=float(args.right_percentile),
-            sensor_yaw_deg=float(args.sensor_yaw_deg),
-            lidar_yaw_correction_deg=float(args.lidar_yaw_correction_deg),
-            lidar_x_offset_m=float(args.lidar_x_offset_m),
-            lidar_y_offset_m=float(args.lidar_y_offset_m),
+            sensor_yaw_deg=float(args.front_sensor_yaw_deg),
+            lidar_yaw_correction_deg=float(args.front_lidar_yaw_correction_deg),
+            lidar_x_offset_m=float(args.front_lidar_x_offset_m),
+            lidar_y_offset_m=float(args.front_lidar_y_offset_m),
             boundary_max_gap_x=0.45,
             boundary_width_tolerance_m=float(args.boundary_width_tolerance_m),
             vehicle_half_width=0.5 * float(args.vehicle_width),
@@ -437,6 +447,15 @@ class PlantRowFollower(Node):
             center_jump_reject=float(args.center_jump_reject),
             one_side_center_jump_reject=float(args.one_side_center_jump_reject),
         )
+        self.front_row_cfg = base_row_cfg
+        self.rear_row_cfg = replace(
+            base_row_cfg,
+            sensor_yaw_deg=float(args.rear_sensor_yaw_deg),
+            lidar_yaw_correction_deg=float(args.rear_lidar_yaw_correction_deg),
+            lidar_x_offset_m=float(args.rear_lidar_x_offset_m),
+            lidar_y_offset_m=float(args.rear_lidar_y_offset_m),
+        )
+        self.row_cfg = self.front_row_cfg
         initial_gear = self._normalized_gear()
         self.sender = CommandSender(
             args.interface,
@@ -454,15 +473,19 @@ class PlantRowFollower(Node):
         self.sender.start()
         self.can_reader = CANFeedbackReader(args.interface, args.channel, args.bitrate)
         self.status_pub = self.create_publisher(String, args.status_topic, 10)
-        self.create_subscription(LaserScan, args.scan_topic, self._on_scan, 10)
+        self.create_subscription(LaserScan, args.front_scan_topic, self._on_front_scan, 10)
+        self.create_subscription(LaserScan, args.rear_scan_topic, self._on_rear_scan, 10)
         self.control_timer = self.create_timer(max(0.02, float(args.control_period)), self._on_control)
         self.create_timer(max(0.1, float(args.status_period)), self._publish_status)
         self._stopping = False
         self.get_logger().info(
-            f"started scan_topic={args.scan_topic} speed={args.speed:.2f} row_width={args.row_width:.2f}"
+            f"started front_scan_topic={args.front_scan_topic} rear_scan_topic={args.rear_scan_topic} "
+            f"speed={args.speed:.2f} row_width={args.row_width:.2f}"
         )
 
     def clear_motion_history(self) -> None:
+        self.last_estimate = RowEstimate(found=False)
+        self.last_good_row_width = float(self.args.row_width)
         self.last_found_time = 0.0
         self.last_good_time = 0.0
         self.last_filtered_center_y = 0.0
@@ -483,10 +506,90 @@ class PlantRowFollower(Node):
         self.wz_not_following_count = 0
         self.last_debug = {}
 
-    def _on_scan(self, msg: LaserScan) -> None:
+    def prepare_lidar_switch(self, reverse: bool) -> None:
+        target = "rear" if reverse else "front"
+        with self.mode_lock:
+            with self.scan_lock:
+                self.active_lidar = target
+                self.row_cfg = self.rear_row_cfg if reverse else self.front_row_cfg
+                self.args.sensor_yaw_deg = float(self.row_cfg.sensor_yaw_deg)
+                self.args.lidar_yaw_correction_deg = float(self.row_cfg.lidar_yaw_correction_deg)
+                self.args.lidar_x_offset_m = float(self.row_cfg.lidar_x_offset_m)
+                self.args.lidar_y_offset_m = float(self.row_cfg.lidar_y_offset_m)
+                self.switch_scan_seq = self.rear_scan_seq if reverse else self.front_scan_seq
+                confirmed = (
+                    bool(self.args.rear_extrinsics_confirmed)
+                    if reverse
+                    else bool(self.args.front_extrinsics_confirmed)
+                )
+                self.waiting_for_new_scan = True
+                self.waiting_for_new_scan_reason = (
+                    f"{target}_extrinsics_unconfirmed" if not confirmed else f"waiting_for_new_{target}_scan"
+                )
+                self.lidar_switch_count += 1
+            self.clear_motion_history()
+            waiting_reason = self.waiting_for_new_scan_reason
+            switch_scan_seq = self.switch_scan_seq
+        self.get_logger().info(
+            f"lidar source selected active_lidar={target} switch_seq={switch_scan_seq} "
+            f"waiting_reason={waiting_reason}"
+        )
+
+    def _on_front_scan(self, msg: LaserScan) -> None:
+        self._store_scan("front", msg)
+
+    def _on_rear_scan(self, msg: LaserScan) -> None:
+        self._store_scan("rear", msg)
+
+    def _store_scan(self, role: str, msg: LaserScan) -> None:
+        became_ready = False
         with self.scan_lock:
-            self.last_scan = msg
-            self.last_scan_time = time.monotonic()
+            now = time.monotonic()
+            if role == "rear":
+                self.rear_scan = msg
+                self.rear_scan_time = now
+                self.rear_scan_seq += 1
+                seq = self.rear_scan_seq
+                confirmed = bool(self.args.rear_extrinsics_confirmed)
+            else:
+                self.front_scan = msg
+                self.front_scan_time = now
+                self.front_scan_seq += 1
+                seq = self.front_scan_seq
+                confirmed = bool(self.args.front_extrinsics_confirmed)
+            if self.active_lidar == role and self.waiting_for_new_scan and confirmed and seq > self.switch_scan_seq:
+                self.waiting_for_new_scan = False
+                self.waiting_for_new_scan_reason = ""
+                became_ready = True
+        if became_ready:
+            self.get_logger().info(f"fresh scan gate released active_lidar={role} scan_seq={seq}")
+
+    def _active_scan_snapshot(self, now: float) -> tuple[LaserScan | None, float, bool, str]:
+        with self.scan_lock:
+            if self.active_lidar == "rear":
+                scan = self.rear_scan
+                scan_time = self.rear_scan_time
+            else:
+                scan = self.front_scan
+                scan_time = self.front_scan_time
+            scan_age = now - scan_time if scan is not None else float("inf")
+            return scan, scan_age, self.waiting_for_new_scan, self.waiting_for_new_scan_reason
+
+    def _lidar_debug_fields(self, now: float | None = None) -> dict[str, Any]:
+        current = time.monotonic() if now is None else now
+        with self.scan_lock:
+            return {
+                "active_lidar": self.active_lidar,
+                "front_scan_age": current - self.front_scan_time if self.front_scan is not None else None,
+                "rear_scan_age": current - self.rear_scan_time if self.rear_scan is not None else None,
+                "front_scan_seq": int(self.front_scan_seq),
+                "rear_scan_seq": int(self.rear_scan_seq),
+                "waiting_for_new_scan": bool(self.waiting_for_new_scan),
+                "waiting_for_new_scan_reason": self.waiting_for_new_scan_reason,
+                "lidar_switch_count": int(self.lidar_switch_count),
+                "front_scan_topic": str(self.args.front_scan_topic),
+                "rear_scan_topic": str(self.args.rear_scan_topic),
+            }
 
     def _estimate_row(self, scan: LaserScan) -> RowEstimate:
         estimate, _debug = estimate_row(scan, self.row_cfg, self.last_good_row_width)
@@ -635,6 +738,7 @@ class PlantRowFollower(Node):
             "right_consecutive_bins": int(getattr(estimate, "right_consecutive_bins", 0) or 0),
             "boundary_source": str(getattr(estimate, "boundary_source", "") or ""),
         }
+        payload.update(self._lidar_debug_fields())
         payload.update(extra)
         self.last_debug = payload
 
@@ -1097,10 +1201,25 @@ class PlantRowFollower(Node):
             self.send_state.last_cmd_log_ts = now
 
     def _on_control(self) -> None:
+        with self.mode_lock:
+            self._on_control_locked()
+
+    def _on_control_locked(self) -> None:
         now = time.monotonic()
-        with self.scan_lock:
-            scan = self.last_scan
-            scan_age = now - self.last_scan_time if self.last_scan is not None else float("inf")
+        scan, scan_age, waiting_for_new_scan, waiting_reason = self._active_scan_snapshot(now)
+        if bool(self.drive_enable) and waiting_for_new_scan:
+            self.last_estimate = RowEstimate(found=False, mode="waiting_for_new_scan", reject_reason=waiting_reason)
+            self._set_debug_snapshot(
+                estimate=self.last_estimate,
+                found=False,
+                control_phase="lidar_switch_hold",
+                stop_reason=waiting_reason,
+                warning=waiting_reason,
+                final_vx=0.0,
+                final_wz=0.0,
+            )
+            self._send_stop(force_brake=bool(self.args.reverse))
+            return
         if not bool(self.drive_enable):
             if scan is None or scan_age > float(self.args.scan_timeout):
                 self.last_estimate = RowEstimate(found=False, mode="scan_timeout")
@@ -1335,6 +1454,8 @@ class PlantRowFollower(Node):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Use lidar to find plant-row centerline and follow it")
     parser.add_argument("--scan-topic", default="/scan")
+    parser.add_argument("--front-scan-topic", default="/front/scan")
+    parser.add_argument("--rear-scan-topic", default="/rear/scan")
     parser.add_argument("--status-topic", default="/plant_row/status")
     parser.add_argument("--interface", default="socketcan")
     parser.add_argument("--channel", default="can0")
@@ -1373,6 +1494,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lidar-yaw-correction-deg", type=float, default=0.0)
     parser.add_argument("--lidar-x-offset-m", type=float, default=0.0)
     parser.add_argument("--lidar-y-offset-m", type=float, default=0.0)
+    parser.add_argument("--front-sensor-yaw-deg", type=float, default=180.0)
+    parser.add_argument("--front-lidar-yaw-correction-deg", type=float, default=0.0)
+    parser.add_argument("--front-lidar-x-offset-m", type=float, default=0.0)
+    parser.add_argument("--front-lidar-y-offset-m", type=float, default=0.0)
+    parser.add_argument("--front-extrinsics-confirmed", action="store_true")
+    parser.add_argument("--rear-sensor-yaw-deg", type=float, default=0.0)
+    parser.add_argument("--rear-lidar-yaw-correction-deg", type=float, default=0.0)
+    parser.add_argument("--rear-lidar-x-offset-m", type=float, default=0.0)
+    parser.add_argument("--rear-lidar-y-offset-m", type=float, default=0.0)
+    parser.add_argument("--rear-extrinsics-confirmed", action="store_true")
     parser.add_argument("--control-deadband-y", type=float, default=0.001)
     parser.add_argument("--slow-error-y", type=float, default=0.04)
     parser.add_argument("--stop-error-y", type=float, default=0.065)

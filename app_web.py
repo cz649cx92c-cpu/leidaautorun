@@ -56,6 +56,13 @@ from app import (  # type: ignore
 from control.official_fwmini_compat import get_bridge
 from row_geometry import RowFollowerConfig, estimate_row
 from yhs_can_interfaces.msg import ChassisInfoFb
+from dual_lidar_config import (
+    LidarConfig,
+    legacy_lidar_driver_running,
+    lidar_driver_running,
+    lidar_driver_start_lock,
+    load_dual_lidar_config,
+)
 
 
 HOST = "0.0.0.0"
@@ -66,7 +73,8 @@ ODIN_USB_PRODUCT = "0019"
 DEFAULT_LIDAR_YAW_CORRECTION_DEG = "-3.0"
 DEFAULT_LIDAR_X_OFFSET_M = "0.035"
 DEFAULT_LIDAR_Y_OFFSET_M = "0.0"
-LIDAR_SCAN_TOPIC = "/scan"
+DUAL_LIDAR_CONFIG = load_dual_lidar_config()
+LIDAR_SCAN_TOPIC = DUAL_LIDAR_CONFIG.front.scan_topic
 LIDAR_CALIBRATION_PATH = PROJECT_ROOT / "config" / "lidar_calibration.json"
 LIDAR_DRIVER_ROOT = Path("/home/orangepi/ugv")
 LIDAR_DRIVER_BIN = LIDAR_DRIVER_ROOT / "install" / "lidar_pkg" / "lib" / "lidar_pkg" / "lidar_node"
@@ -79,7 +87,7 @@ OTA_REMOTE = "leidaautorun"
 OTA_REPOSITORY = "cz649cx92c-cpu/leidaautorun"
 OTA_RELEASES_URL = f"https://api.github.com/repos/{OTA_REPOSITORY}/releases"
 OTA_BRANCH_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
-APP_VERSION = "v1.1.0"
+APP_VERSION = "v1.3.0"
 OTA_DOWNLOAD_DIR = PROJECT_ROOT / "runtime" / "ota"
 GAMEPAD_SPEED_LIMITS: dict[str, tuple[float, float]] = {
     "low": (0.15, 25.0),
@@ -4702,7 +4710,7 @@ class WebController:
         self.replay_localization_worker: ProcessWorker | None = None
         self.preview_worker: ProcessWorker | None = None
         self.preview_restart_at = 0.0
-        self.lidar_worker: ProcessWorker | None = None
+        self.lidar_workers: dict[str, ProcessWorker] = {}
         self.lidar_restart_at = 0.0
         self.lidar_driver_probe_at = 0.0
         self.camera_monitor: RosImageMonitor | None = None
@@ -5744,34 +5752,13 @@ class WebController:
             "--publish-fps", "6.0",
         ]
 
-    def _lidar_driver_running(self) -> bool:
-        patterns = (str(LIDAR_DRIVER_BIN), "ros2 run lidar_pkg lidar_node")
-        try:
-            result = subprocess.run(
-                ["ps", "-eo", "args="],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-        except Exception:
-            return False
-        for line in result.stdout.splitlines():
-            command = line.strip()
-            if command and any(pattern in command for pattern in patterns):
-                return True
-        return False
+    def _lidar_driver_running(self, sensor: LidarConfig) -> bool:
+        return lidar_driver_running(LIDAR_DRIVER_BIN, sensor)
 
-    def _lidar_driver_args(self) -> list[str]:
+    def _lidar_driver_args(self, sensor: LidarConfig) -> list[str]:
         if not LIDAR_DRIVER_BIN.exists():
             raise RuntimeError(f"Lidar driver binary not found: {LIDAR_DRIVER_BIN}")
-        args = [str(LIDAR_DRIVER_BIN)]
-        if LIDAR_DRIVER_PARAMS.exists():
-            args.extend(["--ros-args", "--params-file", str(LIDAR_DRIVER_PARAMS)])
-        else:
-            port = "/dev/lidar" if Path("/dev/lidar").exists() else "/dev/ttyACM0"
-            args.extend(["--ros-args", "-p", f"port_name:={port}", "-p", "frame_id:=laser"])
-        return args
+        return sensor.driver_args(LIDAR_DRIVER_BIN)
 
     def _start_lidar_monitor(self) -> None:
         if self.lidar_monitor is not None:
@@ -5787,26 +5774,36 @@ class WebController:
         self.chassis_charge_monitor.start()
 
     def _start_lidar_preview_driver(self, auto: bool = False) -> None:
-        if self.lidar_worker is not None:
-            return
         self.lidar_restart_at = 0.0
-        if self._lidar_driver_running():
-            self.lidar_status = "Waiting for existing lidar driver"
-            if not self.latest_lidar_scan:
-                self._log("Existing lidar driver detected; preview monitor will reuse /scan.")
-            return
-        try:
-            args = self._lidar_driver_args()
-        except Exception as exc:
-            self.lidar_status = "Driver unavailable"
-            self._log(f"Lidar preview driver unavailable: {exc}")
-            self.lidar_restart_at = time.monotonic() + 5.0
-            return
-        worker = ProcessWorker(args, LIDAR_DRIVER_ROOT, "Lidar Preview", self.events)
-        self.lidar_worker = worker
-        self.lidar_status = "Driver starting"
-        worker.start()
-        self._log("Lidar preview driver auto-started." if auto else "Lidar preview driver started.")
+        with lidar_driver_start_lock():
+            if legacy_lidar_driver_running(LIDAR_DRIVER_BIN):
+                self.lidar_status = "Legacy lidar driver conflict"
+                self._log("Legacy single lidar driver detected; dual lidar drivers were not started.")
+                self.lidar_restart_at = time.monotonic() + 5.0
+                return
+            for sensor in DUAL_LIDAR_CONFIG.sensors():
+                if sensor.role in self.lidar_workers or self._lidar_driver_running(sensor):
+                    continue
+                try:
+                    if not Path(sensor.device).exists():
+                        raise RuntimeError(f"device not found: {sensor.device}")
+                    args = self._lidar_driver_args(sensor)
+                except Exception as exc:
+                    self.lidar_status = "Driver unavailable"
+                    self._log(f"{sensor.role} lidar driver unavailable: {exc}")
+                    self.lidar_restart_at = time.monotonic() + 5.0
+                    continue
+                label = f"Lidar {sensor.role.title()}"
+                worker = ProcessWorker(args, LIDAR_DRIVER_ROOT, label, self.events)
+                self.lidar_workers[sensor.role] = worker
+                self.lidar_status = "Drivers starting"
+                worker.start()
+                action = "auto-started" if auto else "started"
+                self._log(
+                    f"{sensor.role} lidar driver {action}: device={sensor.device} "
+                    f"node={sensor.node_name} topic={sensor.scan_topic} frame={sensor.frame_id}"
+                )
+            time.sleep(0.25)
 
     def _start_camera_monitor(self) -> None:
         if self.camera_monitor is not None:
@@ -6097,9 +6094,11 @@ class WebController:
                         self.preview_restart_at = time.monotonic() + 3.0
             self._log(f"{label} {'stopped' if stopped else 'finished'} with exit code {code}")
             return
-        if label == "Lidar Preview":
-            if self.lidar_worker is not None and self.lidar_worker.worker_id == worker_id:
-                self.lidar_worker = None
+        if label in {"Lidar Front", "Lidar Rear"}:
+            role = label.removeprefix("Lidar ").lower()
+            worker = self.lidar_workers.get(role)
+            if worker is not None and worker.worker_id == worker_id:
+                self.lidar_workers.pop(role, None)
                 if not self.closing:
                     self.lidar_status = "Driver restarting"
                     self.lidar_restart_at = time.monotonic() + 3.0
@@ -6159,10 +6158,14 @@ class WebController:
                     scan_stale = last_scan_at <= 0.0 or (now - last_scan_at) > 2.0
                     restart_due = self.lidar_restart_at <= 0.0 or now >= self.lidar_restart_at
                     if (
-                        self.lidar_worker is None
-                        and scan_stale
+                        (
+                            scan_stale
+                            or any(
+                                not self._lidar_driver_running(sensor)
+                                for sensor in DUAL_LIDAR_CONFIG.sensors()
+                            )
+                        )
                         and restart_due
-                        and not self._lidar_driver_running()
                     ):
                         self._start_lidar_preview_driver(auto=True)
             time.sleep(0.4)
@@ -6259,8 +6262,8 @@ class WebController:
             active.stop()
         if self.preview_worker is not None:
             self.preview_worker.stop()
-        if self.lidar_worker is not None:
-            self.lidar_worker.stop()
+        for worker in tuple(self.lidar_workers.values()):
+            worker.stop()
         if self.camera_monitor is not None:
             self.camera_monitor.stop()
         if self.lidar_monitor is not None:
