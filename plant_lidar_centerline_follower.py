@@ -389,7 +389,16 @@ class PlantRowFollower(Node):
         self.rear_scan: LaserScan | None = None
         self.rear_scan_time = 0.0
         self.rear_scan_seq = 0
+        self.primary_lidar = "front"
         self.active_lidar = "front"
+        self.fallback_valid_frames = 0
+        self.primary_recovery_frames = 0
+        self.both_lidars_lost_frames = 0
+        self.lidar_fallback_active = False
+        self.fallback_last_seq = -1
+        self.primary_recovery_last_seq = -1
+        # Only row-boundary phases may use the opposite lidar as a rescue.
+        self.cross_lidar_fallback_allowed = False
         self.drive_enable = True
         self.waiting_for_new_scan = False
         self.waiting_for_new_scan_reason = ""
@@ -518,7 +527,15 @@ class PlantRowFollower(Node):
         target = "rear" if reverse else "front"
         with self.mode_lock:
             with self.scan_lock:
+                self.primary_lidar = target
                 self.active_lidar = target
+                self.fallback_valid_frames = 0
+                self.primary_recovery_frames = 0
+                self.both_lidars_lost_frames = 0
+                self.lidar_fallback_active = False
+                self.fallback_last_seq = -1
+                self.primary_recovery_last_seq = -1
+                self.cross_lidar_fallback_allowed = False
                 self.row_cfg = self.rear_row_cfg if reverse else self.front_row_cfg
                 self.args.sensor_yaw_deg = float(self.row_cfg.sensor_yaw_deg)
                 self.args.lidar_yaw_correction_deg = float(self.row_cfg.lidar_yaw_correction_deg)
@@ -583,11 +600,188 @@ class PlantRowFollower(Node):
             scan_age = now - scan_time if scan is not None else float("inf")
             return scan, scan_age, self.waiting_for_new_scan, self.waiting_for_new_scan_reason
 
+    def _scan_snapshot(self, role: str, now: float) -> tuple[LaserScan | None, float, int]:
+        with self.scan_lock:
+            if role == "rear":
+                scan = self.rear_scan
+                scan_time = self.rear_scan_time
+                scan_seq = self.rear_scan_seq
+            else:
+                scan = self.front_scan
+                scan_time = self.front_scan_time
+                scan_seq = self.front_scan_seq
+        return scan, now - scan_time if scan is not None else float("inf"), int(scan_seq)
+
+    @staticmethod
+    def _reverse_estimate_direction(estimate: RowEstimate) -> RowEstimate:
+        for field in ("left_line", "right_line", "center_line"):
+            line = getattr(estimate, field, None)
+            if line is not None:
+                setattr(estimate, field, (-float(line[0]), float(line[1])))
+        if estimate.center_line is not None:
+            estimate.heading_rad = math.atan(float(estimate.center_line[0]))
+        else:
+            estimate.heading_rad = -float(estimate.heading_rad)
+        return estimate
+
+    def _fallback_estimate(self, role: str, scan: LaserScan) -> RowEstimate:
+        cfg = self.rear_row_cfg if role == "rear" else self.front_row_cfg
+        estimate, _debug = estimate_row(scan, cfg, self.last_good_row_width)
+        if not estimate.found:
+            return estimate
+        estimate = self._reverse_estimate_direction(estimate)
+        if estimate.center_line is not None:
+            reference_x = abs(float(self.args.forward_lookahead_x))
+            estimate.center_y = (
+                float(estimate.center_line[0]) * reference_x
+                + float(estimate.center_line[1])
+            )
+            estimate.raw_center_y = float(estimate.center_y)
+        mode = str(getattr(estimate, "effective_mode", estimate.mode) or "")
+        if mode not in {"both_sides", "left_only", "right_only"}:
+            estimate.found = False
+            estimate.reject_reason = "fallback_invalid_mode"
+            return estimate
+        if abs(float(estimate.center_y)) > 0.20:
+            estimate.found = False
+            estimate.reject_reason = "fallback_center_out_of_range"
+            return estimate
+        if self.last_good_center_line is not None:
+            reference_x = abs(float(self.args.forward_lookahead_x))
+            fallback_y = (
+                float(estimate.center_line[0]) * reference_x + float(estimate.center_line[1])
+                if estimate.center_line is not None
+                else float(estimate.center_y)
+            )
+            previous_y = (
+                float(self.last_good_center_line[0]) * reference_x
+                + float(self.last_good_center_line[1])
+            )
+            heading_delta = abs(
+                math.degrees(float(estimate.heading_rad)) - float(self.last_good_heading_deg)
+            )
+            if abs(fallback_y - previous_y) > 0.12 or heading_delta > 8.0:
+                estimate.found = False
+                estimate.reject_reason = "fallback_line_inconsistent"
+        return estimate
+
+    def _primary_candidate(self, role: str, scan: LaserScan) -> RowEstimate:
+        cfg = self.rear_row_cfg if role == "rear" else self.front_row_cfg
+        estimate, _debug = estimate_row(scan, cfg, self.last_good_row_width)
+        mode = str(getattr(estimate, "effective_mode", estimate.mode) or "")
+        if estimate.found and mode not in {"both_sides", "left_only", "right_only"}:
+            estimate.found = False
+            estimate.reject_reason = "primary_invalid_mode"
+        if estimate.found and abs(float(estimate.center_y)) > 0.20:
+            estimate.found = False
+            estimate.reject_reason = "primary_center_out_of_range"
+        return estimate
+
+    def _select_dual_lidar_estimate(
+        self,
+        now: float,
+        primary_estimate: RowEstimate,
+    ) -> RowEstimate:
+        primary = self.primary_lidar
+        fallback = "rear" if primary == "front" else "front"
+        if not self.cross_lidar_fallback_allowed:
+            self.fallback_valid_frames = 0
+            self.both_lidars_lost_frames = 0
+            if self.lidar_fallback_active:
+                self._set_active_lidar_for_control(primary, fallback=False)
+            return primary_estimate
+        fallback_scan, fallback_age, fallback_seq = self._scan_snapshot(fallback, now)
+        fallback_estimate = RowEstimate(found=False, mode="fallback_scan_timeout")
+        if fallback_scan is not None and fallback_age <= float(self.args.scan_timeout):
+            fallback_estimate = self._fallback_estimate(fallback, fallback_scan)
+
+        if self.lidar_fallback_active:
+            primary_scan, primary_age, primary_seq = self._scan_snapshot(primary, now)
+            primary_candidate = primary_estimate
+            if primary_seq != self.primary_recovery_last_seq:
+                self.primary_recovery_last_seq = primary_seq
+                self.primary_recovery_frames = (
+                    self.primary_recovery_frames + 1 if primary_candidate.found else 0
+                )
+            if self.primary_recovery_frames >= 5:
+                self._set_active_lidar_for_control(primary, fallback=False)
+                self.fallback_valid_frames = 0
+                self.primary_recovery_frames = 0
+                self.both_lidars_lost_frames = 0
+                if primary_scan is not None:
+                    recovered = self._estimate_row(primary_scan)
+                    if recovered.found:
+                        self.get_logger().info(
+                            f"primary lidar recovered role={primary} after 5 frames"
+                        )
+                        return recovered
+            if fallback_estimate.found:
+                self.both_lidars_lost_frames = 0
+                return fallback_estimate
+            if primary_candidate.found:
+                self.both_lidars_lost_frames = 0
+            else:
+                self.both_lidars_lost_frames += 1
+            return fallback_estimate
+
+        if primary_estimate.found:
+            self.fallback_valid_frames = 0
+            self.primary_recovery_frames = 0
+            self.both_lidars_lost_frames = 0
+            return primary_estimate
+
+        if fallback_seq != self.fallback_last_seq:
+            self.fallback_last_seq = fallback_seq
+            self.fallback_valid_frames = (
+                self.fallback_valid_frames + 1 if fallback_estimate.found else 0
+            )
+        if self.fallback_valid_frames >= 3:
+            self._set_active_lidar_for_control(fallback, fallback=True)
+            self.primary_recovery_frames = 0
+            self.both_lidars_lost_frames = 0
+            self.get_logger().warning(
+                f"primary lidar lost role={primary}; fallback role={fallback} accepted after 3 frames"
+            )
+            return fallback_estimate
+
+        if not fallback_estimate.found:
+            self.both_lidars_lost_frames += 1
+        else:
+            self.both_lidars_lost_frames = 0
+        return primary_estimate
+
+    def _set_active_lidar_for_control(self, role: str, *, fallback: bool) -> None:
+        self.active_lidar = role
+        self.row_cfg = self.rear_row_cfg if role == "rear" else self.front_row_cfg
+        self.args.sensor_yaw_deg = float(self.row_cfg.sensor_yaw_deg)
+        self.args.lidar_yaw_correction_deg = float(self.row_cfg.lidar_yaw_correction_deg)
+        self.args.lidar_x_offset_m = float(self.row_cfg.lidar_x_offset_m)
+        self.args.lidar_y_offset_m = float(self.row_cfg.lidar_y_offset_m)
+        self.lidar_fallback_active = bool(fallback)
+
+    def set_cross_lidar_fallback_allowed(self, allowed: bool) -> None:
+        allowed = bool(allowed)
+        if allowed == self.cross_lidar_fallback_allowed:
+            return
+        self.cross_lidar_fallback_allowed = allowed
+        if not allowed:
+            self.fallback_valid_frames = 0
+            self.primary_recovery_frames = 0
+            self.both_lidars_lost_frames = 0
+            if self.lidar_fallback_active:
+                self._set_active_lidar_for_control(self.primary_lidar, fallback=False)
+
     def _lidar_debug_fields(self, now: float | None = None) -> dict[str, Any]:
         current = time.monotonic() if now is None else now
         with self.scan_lock:
             return {
                 "active_lidar": self.active_lidar,
+                "primary_lidar": self.primary_lidar,
+                "lidar_fallback_active": bool(self.lidar_fallback_active),
+                "fallback_valid_frames": int(self.fallback_valid_frames),
+                "primary_recovery_frames": int(self.primary_recovery_frames),
+                "both_lidars_lost_frames": int(self.both_lidars_lost_frames),
+                "both_lidars_lost": bool(self.both_lidars_lost_frames >= 3),
                 "front_scan_age": current - self.front_scan_time if self.front_scan is not None else None,
                 "rear_scan_age": current - self.rear_scan_time if self.rear_scan is not None else None,
                 "front_scan_seq": int(self.front_scan_seq),
@@ -1106,7 +1300,9 @@ class PlantRowFollower(Node):
 
     def _on_control_locked(self) -> None:
         now = time.monotonic()
-        scan, scan_age, waiting_for_new_scan, waiting_reason = self._active_scan_snapshot(now)
+        primary_scan, primary_age, _primary_seq = self._scan_snapshot(self.primary_lidar, now)
+        waiting_for_new_scan = self.waiting_for_new_scan
+        waiting_reason = self.waiting_for_new_scan_reason
         if bool(self.drive_enable) and waiting_for_new_scan:
             self.last_estimate = RowEstimate(found=False, mode="waiting_for_new_scan", reject_reason=waiting_reason)
             self._set_debug_snapshot(
@@ -1121,35 +1317,25 @@ class PlantRowFollower(Node):
             self._send_stop(force_brake=bool(self.args.reverse))
             return
         if not bool(self.drive_enable):
-            if scan is None or scan_age > float(self.args.scan_timeout):
-                self.last_estimate = RowEstimate(found=False, mode="scan_timeout")
+            if primary_scan is None or primary_age > float(self.args.scan_timeout):
+                primary_estimate = RowEstimate(found=False, mode="scan_timeout")
+            elif self.lidar_fallback_active:
+                primary_estimate = self._primary_candidate(self.primary_lidar, primary_scan)
             else:
-                self.last_estimate = self._estimate_row(scan)
-            return
-        if scan is None or scan_age > float(self.args.scan_timeout):
-            self.last_estimate = RowEstimate(found=False, mode="scan_timeout")
-            if self._hold_last_good_command(
-                estimate=self.last_estimate,
-                control_phase="scan_timeout_hold_shared",
-                stop_reason="scan_timeout_hold_shared",
-                warning="scan_timeout_hold_shared",
-                wz_limit_deg=float(self.args.forward_lost_hold_max_wz_deg),
-                wz_scale=float(self.args.forward_lost_hold_wz_scale),
-                max_age_s=float(self.args.forward_lost_hold_sec),
-            ):
-                return
-            self._set_debug_snapshot(
-                estimate=self.last_estimate,
-                found=False,
-                control_phase="emergency_stop",
-                stop_reason="scan_timeout",
-                final_vx=0.0,
-                final_wz=0.0,
-            )
-            self._send_stop(force_brake=bool(self.args.reverse))
+                self._set_active_lidar_for_control(self.primary_lidar, fallback=False)
+                primary_estimate = self._estimate_row(primary_scan)
+            self.last_estimate = self._select_dual_lidar_estimate(now, primary_estimate)
             return
 
-        estimate = self._estimate_row(scan)
+        if primary_scan is None or primary_age > float(self.args.scan_timeout):
+            primary_estimate = RowEstimate(found=False, mode="scan_timeout", reject_reason="primary_scan_timeout")
+        elif self.lidar_fallback_active:
+            primary_estimate = self._primary_candidate(self.primary_lidar, primary_scan)
+        else:
+            self._set_active_lidar_for_control(self.primary_lidar, fallback=False)
+            primary_estimate = self._estimate_row(primary_scan)
+
+        estimate = self._select_dual_lidar_estimate(now, primary_estimate)
         self.last_estimate = estimate
         if estimate.found:
             self.last_found_time = now

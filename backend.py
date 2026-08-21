@@ -995,16 +995,23 @@ class DirectLocalLidarController:
         low_beam: bool,
         target_center_offset_px: float = 0.0,
         vehicle_direction_angle_deg: float = 0.0,
+        allow_cross_lidar_fallback: bool = False,
     ) -> None:
         del gear, target_center_offset_px, vehicle_direction_angle_deg
+        was_enabled = bool(self._node.drive_enable)
+        if was_enabled and not bool(enable):
+            self._node.send_direct_drive("4t4d", 0.0, 0.0, force_brake=True)
         mode_changed = bool(enable) and (
-            not bool(self._node.drive_enable) or bool(reverse) != bool(self._node.args.reverse)
+            not was_enabled or bool(reverse) != bool(self._node.args.reverse)
         )
         if mode_changed:
             self._node.drive_enable = False
             self._node.args.reverse = bool(reverse)
             self._node.prepare_lidar_switch(bool(reverse))
         self._node.drive_enable = bool(enable)
+        self._node.set_cross_lidar_fallback_allowed(
+            bool(enable) and bool(allow_cross_lidar_fallback)
+        )
         self._node.args.reverse = bool(reverse)
         self._node.args.low_beam = bool(low_beam)
         if reverse:
@@ -1955,7 +1962,10 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 forward_global_window = (
                     not reversing_here
                     and abs(lateral) <= 0.80
-                    and remaining_along <= 2.5
+                    # Keep the forward row-end global window as a stop gate
+                    # only.  The opposite lidar is allowed to rescue the
+                    # centerline while approaching this final 35 cm.
+                    and remaining_along <= 0.35
                     and remaining_along >= -0.30
                 )
                 row_entry_global_window = (
@@ -2180,6 +2190,10 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     reverse_entry_global_active
                     or row_end_reverse.reverse_exit_global_active
                 )
+            # Losing both scans is a local lidar fault, not a global-control
+            # request.  Global is reserved for row entry/change and the
+            # explicit row-end stop/exit gates below.
+            dual_lidar_global_fallback = False
             global_control_active = (
                 row_entry_global_window
                 or forward_global_window
@@ -2203,6 +2217,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     low_beam=args.line_low_beam,
                     target_center_offset_px=offset_px,
                     vehicle_direction_angle_deg=direction_angle_deg,
+                    allow_cross_lidar_fallback=False,
                 )
                 time.sleep(0.05)
                 continue
@@ -2798,6 +2813,15 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     low_beam=args.line_low_beam,
                     target_center_offset_px=offset_px,
                     vehicle_direction_angle_deg=direction_angle_deg,
+                    allow_cross_lidar_fallback=(
+                        (not reversing_here and current_segment is not None and remaining_along <= 2.5)
+                        or (
+                            reversing_here
+                            and reverse_remaining_m <= max(
+                                float(args.lidar_reverse_exit_global_distance), 4.0
+                            )
+                        )
+                    ),
                 )
                 local_status = local_controller.status_snapshot()
                 local_cmd = local_controller.cmd_snapshot()
@@ -2877,6 +2901,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     f"entry_window={row_entry_global_window} end_window={forward_global_window} "
                     f"row_change_window={row_change_global_window} "
                     f"global_window={global_control_active} dist={dist:.2f} "
+                    f"dual_lidar_global_fallback={dual_lidar_global_fallback} "
                     f"post_row_change_lock={post_row_change_locked} "
                     f"force_global_entry_only={force_global_entry_only} "
                     f"entry_handoff={row_entry_handoff_ready} "
