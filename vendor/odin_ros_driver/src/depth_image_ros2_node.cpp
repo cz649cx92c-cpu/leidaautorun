@@ -1,61 +1,158 @@
 /*
 Copyright 2025 Manifold Tech Ltd.(www.manifoldtech.com.co)
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-   http://www.apache.org/licenses/LICENSE-2.0
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+Licensed under the Apache License, Version 2.0.
 */
 
 #include "depth_image_ros2_node.hpp"
-#include <functional>
 
-DepthImageRos2Node::DepthImageRos2Node(const rclcpp::NodeOptions & options)
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <functional>
+#include <stdexcept>
+#include <vector>
+
+#include <pcl_conversions/pcl_conversions.h>
+#include <sensor_msgs/image_encodings.hpp>
+
+DepthImageRos2Node::DepthImageRos2Node(const rclcpp::NodeOptions &options)
     : Node("depth_image_ros2_node", options)
 {
-    PointCloudToDepthConverter::CameraParams camera_params = loadCameraParams();
+    depth_converter_ =
+        std::make_unique<PointCloudToDepthConverter>(loadCameraParams());
 
-    depth_converter_ = std::make_unique<PointCloudToDepthConverter>(camera_params);
-    
-    cloud_raw_topic_ = this->declare_parameter<std::string>("cloud_raw_topic", "/odin1/cloud_raw");
-    color_compressed_topic_ = this->declare_parameter<std::string>("color_compressed_topic", "/odin1/image/compressed");
-    color_raw_topic_ = this->declare_parameter<std::string>("color_raw_topic", "/odin1/image");
-    depth_image_topic_ = this->declare_parameter<std::string>("depth_image_topic", "/odin1/depth_img_competetion");
-    depth_cloud_topic_ = this->declare_parameter<std::string>("depth_cloud_topic", "/odin1/depth_img_competetion_cloud");
+    cloud_raw_topic_ = this->declare_parameter<std::string>(
+        "cloud_raw_topic", "/odin1/cloud_raw");
+    depth_image_topic_ = this->declare_parameter<std::string>(
+        "depth_image_topic", "/odin1/depth_img_competetion");
 
-    RCLCPP_INFO_STREAM(this->get_logger(), 
-                       "\n  cloud_raw_topic: " << cloud_raw_topic_
-                       << "\n  color_compressed_topic: " << color_compressed_topic_
-                       << "\n  color_raw_topic: " << color_raw_topic_
-                       << "\n  depth_image_topic: " << depth_image_topic_
-                       << "\n  depth_cloud_topic: " << depth_cloud_topic_);
+    RCLCPP_INFO(this->get_logger(),
+                "Low-compute depth: %s -> %s (64x40, 32FC1)",
+                cloud_raw_topic_.c_str(), depth_image_topic_.c_str());
 }
 
 void DepthImageRos2Node::initialize()
 {
-    cloud_sub_.subscribe(this, cloud_raw_topic_);
-    color_compressed_sub_.subscribe(this, color_compressed_topic_);
-    color_sub_.subscribe(this, color_raw_topic_);
+    depth_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
+        depth_image_topic_, rclcpp::SensorDataQoS().keep_last(1));
 
-    sync_ = std::make_shared<Sync>(MySyncPolicy(10), cloud_sub_, color_sub_);
-    sync_->registerCallback(std::bind(&DepthImageRos2Node::syncCallback, this, 
-                                     std::placeholders::_1, std::placeholders::_2));
+    // cloud_raw is a large, fragmented PointCloud2 stream whose vendor
+    // publisher is RELIABLE. BEST_EFFORT can discard a whole cloud when one
+    // fragment is lost, producing long depth gaps. Keep only the newest frame
+    // while retaining reliable delivery.
+    const auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(1))
+                               .reliable()
+                               .durability_volatile();
+    cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+        cloud_raw_topic_, cloud_qos,
+        std::bind(&DepthImageRos2Node::cloudCallback, this,
+                  std::placeholders::_1));
 
-    it_ = std::make_shared<image_transport::ImageTransport>(shared_from_this());
-    depth_image_pub_ = it_->advertise(depth_image_topic_, 1);
-    depth_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(depth_cloud_topic_, 1);
+    last_report_time_ = std::chrono::steady_clock::now();
 
-    RCLCPP_INFO(this->get_logger(), "DepthImageRos2Node initialized successfully");
+    RCLCPP_INFO(this->get_logger(),
+                "Low-compute SRU depth node initialized (cloud QoS: "
+                "reliable, keep_last=1)");
+}
+
+void DepthImageRos2Node::cloudCallback(
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud_msg)
+{
+    const auto callback_start = std::chrono::steady_clock::now();
+    ++received_count_;
+
+    if (last_receive_time_.time_since_epoch().count() != 0) {
+        const double gap_ms = std::chrono::duration<double, std::milli>(
+                                  callback_start - last_receive_time_)
+                                  .count();
+        max_receive_gap_ms_ = std::max(max_receive_gap_ms_, gap_ms);
+        if (gap_ms > 300.0) {
+            RCLCPP_WARN(this->get_logger(),
+                        "cloud_raw receive gap %.1f ms", gap_ms);
+        }
+    }
+    last_receive_time_ = callback_start;
+
+    const int64_t sensor_stamp_ns =
+        static_cast<int64_t>(cloud_msg->header.stamp.sec) * 1000000000LL +
+        static_cast<int64_t>(cloud_msg->header.stamp.nanosec);
+    if (last_sensor_stamp_ns_ != 0 && sensor_stamp_ns > last_sensor_stamp_ns_) {
+        const double sensor_gap_ms =
+            static_cast<double>(sensor_stamp_ns - last_sensor_stamp_ns_) /
+            1000000.0;
+        max_sensor_gap_ms_ = std::max(max_sensor_gap_ms_, sensor_gap_ms);
+    }
+    last_sensor_stamp_ns_ = sensor_stamp_ns;
+
+    pcl::PointCloud<pcl::PointXYZ> cloud;
+    pcl::fromROSMsg(*cloud_msg, cloud);
+    if (cloud.empty()) {
+        ++failed_count_;
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Empty point cloud received");
+        recordProcessingTime(callback_start);
+        reportMetrics(std::chrono::steady_clock::now());
+        return;
+    }
+
+    const auto result =
+        depth_converter_->processCloudAndImage(cloud, cv::Mat());
+    if (!result.success) {
+        ++failed_count_;
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Depth conversion failed: %s",
+                             result.error_message.c_str());
+        recordProcessingTime(callback_start);
+        reportMetrics(std::chrono::steady_clock::now());
+        return;
+    }
+
+    publishDepthImage(result.depth_image, cloud_msg->header);
+    ++published_count_;
+    recordProcessingTime(callback_start);
+    reportMetrics(std::chrono::steady_clock::now());
+}
+
+void DepthImageRos2Node::recordProcessingTime(
+    const std::chrono::steady_clock::time_point &callback_start)
+{
+    const double processing_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() -
+                                     callback_start)
+                                     .count();
+    max_processing_ms_ = std::max(max_processing_ms_, processing_ms);
+}
+
+void DepthImageRos2Node::reportMetrics(
+    const std::chrono::steady_clock::time_point &now)
+{
+    const double elapsed_s =
+        std::chrono::duration<double>(now - last_report_time_).count();
+    if (elapsed_s < 5.0) {
+        return;
+    }
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Depth metrics: rx=%.2f Hz, published=%llu, failed=%llu, "
+        "max_rx_gap=%.1f ms, max_sensor_gap=%.1f ms, max_processing=%.1f ms",
+        static_cast<double>(received_count_) / elapsed_s,
+        static_cast<unsigned long long>(published_count_),
+        static_cast<unsigned long long>(failed_count_), max_receive_gap_ms_,
+        max_sensor_gap_ms_, max_processing_ms_);
+
+    last_report_time_ = now;
+    received_count_ = 0;
+    published_count_ = 0;
+    failed_count_ = 0;
+    max_receive_gap_ms_ = 0.0;
+    max_sensor_gap_ms_ = 0.0;
+    max_processing_ms_ = 0.0;
 }
 
 PointCloudToDepthConverter::CameraParams DepthImageRos2Node::loadCameraParams()
 {
     PointCloudToDepthConverter::CameraParams params;
-
     params.image_width = this->declare_parameter<int>("cam_0.image_width", 1600);
     params.image_height = this->declare_parameter<int>("cam_0.image_height", 1296);
     params.A11 = this->declare_parameter<double>("cam_0.A11", 0.0);
@@ -63,110 +160,53 @@ PointCloudToDepthConverter::CameraParams DepthImageRos2Node::loadCameraParams()
     params.A22 = this->declare_parameter<double>("cam_0.A22", 0.0);
     params.u0 = this->declare_parameter<double>("cam_0.u0", 0.0);
     params.v0 = this->declare_parameter<double>("cam_0.v0", 0.0);
-
     params.k2 = this->declare_parameter<double>("cam_0.k2", 0.0);
     params.k3 = this->declare_parameter<double>("cam_0.k3", 0.0);
     params.k4 = this->declare_parameter<double>("cam_0.k4", 0.0);
     params.k5 = this->declare_parameter<double>("cam_0.k5", 0.0);
     params.k6 = this->declare_parameter<double>("cam_0.k6", 0.0);
     params.k7 = this->declare_parameter<double>("cam_0.k7", 0.0);
-
     params.scale = this->declare_parameter<double>("scale", 7.0);
-    params.point_sampling_rate = this->declare_parameter<int>("point_sampling_rate", 5);
+    params.point_sampling_rate =
+        this->declare_parameter<int>("point_sampling_rate", 5);
 
-    std::vector<double> Tcl_vec_param = this->declare_parameter<std::vector<double>>("Tcl_0", std::vector<double>(16, 0.0));
-    if (Tcl_vec_param.size() == 16)
-    {
-        for (int i = 0; i < 4; ++i)
-        {
-            for (int j = 0; j < 4; ++j)
-            {
-                params.Tcl(i, j) = Tcl_vec_param[i * 4 + j];
-            }
+    const auto Tcl = this->declare_parameter<std::vector<double>>(
+        "Tcl_0", std::vector<double>(16, 0.0));
+    if (Tcl.size() != 16) {
+        throw std::runtime_error("Tcl_0 must contain 16 values");
+    }
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            params.Tcl(row, col) = Tcl[row * 4 + col];
         }
     }
-    else
-    {
-        RCLCPP_ERROR(this->get_logger(), "Tcl_0 param missing or invalid, colored reproject cloud disabled.");
-        rclcpp::shutdown();
+
+    if (params.image_width <= 0 || params.image_height <= 0 ||
+        params.scale <= 0.0 ||
+        params.A11 < 1e-6 || params.A22 < 1e-6) {
+        throw std::runtime_error("Invalid Odin camera dimensions/intrinsics");
     }
-
-    if (params.A11 < 1e-6 || params.A22 < 1e-6 || params.u0 < 1e-6 || params.v0 < 1e-6)
-    {
-        RCLCPP_ERROR(this->get_logger(), "Invalid camera intrinsics A11 or A22");
-        rclcpp::shutdown();
-    }
-
-    RCLCPP_INFO(this->get_logger(), "Camera intrinsics:");
-    RCLCPP_INFO(this->get_logger(), "Image size: %dx%d", params.image_width, params.image_height);
-    RCLCPP_INFO(this->get_logger(), "Intrinsics: A11=%f A12=%f A22=%f u0=%f v0=%f",
-             params.A11, params.A12, params.A22, params.u0, params.v0);
-    RCLCPP_INFO(this->get_logger(), "Distortions: k2=%f k3=%f k4=%f k5=%f k6=%f k7=%f",
-             params.k2, params.k3, params.k4, params.k5, params.k6, params.k7);
-    RCLCPP_INFO(this->get_logger(), "Scale: %f, Point sampling rate: %d", params.scale, params.point_sampling_rate);
-    RCLCPP_INFO_STREAM(this->get_logger(), "Extrinsics (Tcl):\n" << params.Tcl);
-
     return params;
 }
 
-void DepthImageRos2Node::syncCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud_msg,
-                                     // const sensor_msgs::msg::CompressedImage::ConstSharedPtr image_msg,
-                                     const sensor_msgs::msg::Image::ConstSharedPtr color_msg)
+void DepthImageRos2Node::publishDepthImage(
+    const cv::Mat &image, const std_msgs::msg::Header &header)
 {
-    pcl::PointCloud<pcl::PointXYZ> cloud;
-    pcl::fromROSMsg(*cloud_msg, cloud);
-    if (cloud.empty())
-    {
-        RCLCPP_WARN(this->get_logger(), "Empty point cloud received");
+    if (image.empty() || image.type() != CV_32FC1 ||
+        !image.isContinuous()) {
+        RCLCPP_ERROR(this->get_logger(), "Invalid low-resolution depth image");
         return;
     }
 
-    cv::Mat img_raw;
-    try
-    {
-        // img_raw = cv::imdecode(cv::Mat(image_msg->data), cv::IMREAD_COLOR);
-        cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(color_msg, "bgr8");
-        img_raw = cv_ptr->image;
-        if (img_raw.empty())
-        {
-            RCLCPP_WARN(this->get_logger(), "Failed to decode compressed image");
-            return;
-        }
-    }
-    catch (const cv_bridge::Exception &e)
-    {
-        RCLCPP_ERROR(this->get_logger(), "cv_bridge: %s", e.what());
-        return;
-    }
-
-    auto result = depth_converter_->processCloudAndImage(cloud, img_raw);
-
-    if (!result.success)
-    {
-        RCLCPP_WARN(this->get_logger(), "Data processing failed: %s", result.error_message.c_str());
-        return;
-    }
-
-    publishDepthImage(result.depth_image, cloud_msg->header);
-    publishDepthCloud(result.colored_cloud, cloud_msg->header);
-}
-
-void DepthImageRos2Node::publishDepthImage(const cv::Mat &img,
-                                          const std_msgs::msg::Header &header,
-                                          const std::string &encoding)
-{
-    sensor_msgs::msg::Image::SharedPtr depth_msg = cv_bridge::CvImage(header, encoding, img).toImageMsg();
-    depth_image_pub_.publish(*depth_msg);
-}
-
-void DepthImageRos2Node::publishDepthCloud(const pcl::PointCloud<pcl::PointXYZRGB> &colored_cloud,
-                                          const std_msgs::msg::Header &header)
-{
-    if (!colored_cloud.points.empty())
-    {
-        sensor_msgs::msg::PointCloud2 cloud_msg;
-        pcl::toROSMsg(colored_cloud, cloud_msg);
-        cloud_msg.header = header;
-        depth_cloud_pub_->publish(cloud_msg);
-    }
+    sensor_msgs::msg::Image message;
+    message.header = header;
+    message.height = static_cast<uint32_t>(image.rows);
+    message.width = static_cast<uint32_t>(image.cols);
+    message.encoding = sensor_msgs::image_encodings::TYPE_32FC1;
+    message.is_bigendian = false;
+    message.step = static_cast<sensor_msgs::msg::Image::_step_type>(
+        image.cols * sizeof(float));
+    message.data.resize(static_cast<size_t>(message.step) * message.height);
+    std::memcpy(message.data.data(), image.ptr<float>(), message.data.size());
+    depth_image_pub_->publish(message);
 }

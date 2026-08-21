@@ -1,88 +1,158 @@
-# autorunlida
+# 激光雷达植株行间中线循迹
 
-`autorunlida` 把定位、录制、混合驱动收成一个可直接使用的工程：
+这个目录是一套基于激光雷达的植株行间中线循迹程序，适合小车在两排较为笔直的植株中间行驶。
 
-- Odin / 全局定位与任务执行
-- 激光雷达 / 行间局部中线约束
+它包含：
 
-## 设计原则
+- 从 `/scan` 提取雷达点
+- 从左右植株边界拟合出中线
+- 通过 `control/fw_mini_controller.py` 直接控制底盘
+- 一个用于手动驾驶和自动循迹切换的 GUI
+- 一个实时顶视图，可显示雷达点、左右边界和中线
 
-- 行间正常前进时：
-  - 使用激光雷达局部中线控制
-- 起步、行尾、倒车过渡和横移换行时：
-  - 使用分阶段的全局路径控制
-- 横移完成准备入行时：
-  - 停车确认双侧边界，再由激光低速入行
+## 文件说明
 
-## 目录
+- `plant_lidar_centerline_follower.py`
+  主循迹程序
+- `plant_lidar_centerline_gui.py`
+  手动控制 + 自动循迹 GUI
+- `row_geometry.py`
+  共享的雷达行边界拟合与中线计算逻辑
 
-- 任务与日志写入 `autorunlida/`
-- Mission 录制、定位、混合驱动都直接由 `autorunlida` 提供
+## 运行前提
 
-## 常用命令
+你当前需要满足：
 
-### 建图
+- 雷达驱动已经启动，并且在发布 `/scan`
+- CAN 底盘控制可以正常使用
+- `control/fw_mini_controller.py` 已经可以控制这台车
 
-```bash
-cd /home/orangepi/ugv/autorunlida
-python3 main.py map --map-name lab_map
-```
-
-### 纯定位
-
-```bash
-python3 main.py localization \
-  --db /home/orangepi/ugv/autorunlida/maps/lab_map/lab_map.bin
-```
-
-### 录制全局任务
+如果 CAN 还没有配置好，可以先执行：
 
 ```bash
-python3 main.py record \
-  --db /home/orangepi/ugv/autorunlida/maps/lab_map/lab_map.bin \
-  --mission-name mission_a
+python3 /home/orangepi/ugv/control/headless_control.py setup-can
 ```
 
-### 混合驱动
+## 运行主程序
 
 ```bash
-python3 main.py autorun \
-  --db /home/orangepi/ugv/autorunlida/maps/lab_map/lab_map.bin \
-  --mission /home/orangepi/ugv/autorunlida/missions/mission_a.json
+source /opt/ros/humble/setup.bash
+python3 /home/orangepi/ugv/plant_lidar_centerline/plant_lidar_centerline_follower.py
 ```
 
-### 网页手柄控制
+## 运行 GUI
 
 ```bash
-cd /home/orangepi/ugv/autorunlida
-./run_web.sh
+source /opt/ros/humble/setup.bash
+python3 /home/orangepi/ugv/plant_lidar_centerline/plant_lidar_centerline_gui.py
 ```
 
-用电脑或手机打开网页，把 Xbox/XInput 手柄连接到打开网页的设备。浏览器检测到手柄后会自动取得控制，无需点击启用按钮；首次连接后按一下手柄按键让浏览器识别设备。
+GUI 当前包含：
 
-- `A`: 四轮转向
-- `B`: 横移
-- `X`: 驻车
-- `Y`: 空挡
-- `RT`: 持续按住才允许运动
-- 右摇杆上下：前进、后退
-- 四轮转向模式下，左摇杆左右控制转向
-- 横移模式下，左摇杆左右只连续控制轮胎角度，满量程对应左右 `90°`、回中即 `0°`；右摇杆只控制前进/后退，两根摇杆互不锁存
+- `Connect` / `Disconnect` CAN
+- 手动 `Forward`、`Back`、`Left`、`Right`、`STOP`
+- 自动循迹参数输入
+- 自动前进 / 自动倒车切换
+- `Start Auto` / `Stop Auto`
+- 底盘反馈与日志
+- 实时雷达顶视图
 
-网页手柄超过 0.45 秒没有新指令会自动发送零速停车。实物遥控器、急停和自动驾驶拥有更高优先级；启动混合驱动时会自动释放网页手柄控制。
+## 建议初始测试命令
 
-网页服务启动后会持续打开中间的 UVC 相机预览，不需要先启动自动驾驶；停止任务不会关闭预览，相机发布进程意外退出时会自动重试。
+```bash
+source /opt/ros/humble/setup.bash
+python3 /home/orangepi/ugv/plant_lidar_centerline/plant_lidar_centerline_follower.py \
+  --row-width 0.8 \
+  --speed 0.20 \
+  --forward-max 1.8
+```
 
-网页服务启动时还会按照 `gui_settings.json` 中的 `can_channel` 和 `can_bitrate` 自动连接CAN；如果接口已经启动则直接复用，不会先关闭再重连。默认使用 `can0`、`500000` bps。
+## 参数说明
 
-## 关键参数
+- `--scan-topic`
+  使用的 ROS2 `sensor_msgs/LaserScan` 话题名。
+- `--status-topic`
+  发布循迹状态 JSON 字符串的话题名。
+- `--row-width`
+  预计两排植株之间的距离，单位米。这个参数在“只能看到一侧植株”的情况下尤其重要。
+- `--min-row-width`
+  最小允许行宽。如果左右边界拟合出来的距离比这个还小，就认为结果不可信。
+- `--max-row-width`
+  最大允许行宽。如果左右边界拟合出来的距离比这个还大，就认为结果不可信。
+- `--speed`
+  自动循迹模式下的目标前进速度，单位 m/s。
+- `--reverse`
+  自动模式改为沿着检测到的中线倒车行驶。开启后会发送负速度，并自动调整转向修正方向。
+- `--min-speed`
+  自动模式因为误差而减速时，允许保留的最小前进速度。
+- `--max-wz`
+  最大角速度，单位 `deg/s`，用来限制转向过猛。当前默认值为 `1.2`，程序内部会自动转换成 `rad/s` 再做控制计算。
+- `--k-lat`
+  横向偏差增益。值越大，小车对左右偏离中线的修正越快。
+- `--k-heading`
+  朝向误差增益。值越大，小车对路线方向不对正的修正越积极。
+- `--lookahead-x`
+  在前方多远的位置上评估中线偏差。
+- `--forward-min`
+  参与拟合的最近前向距离，用来忽略太靠近车头的杂点。
+- `--forward-max`
+  参与拟合的最远前向距离。设小一点可以减少远处杂点影响，设大一点可以看得更远。
+- `--lateral-limit`
+  参与处理中，车体左右两侧允许纳入计算的最大横向距离。
+- `--range-min`
+  雷达量测允许的最小距离。
+- `--range-max`
+  雷达量测允许的最大距离。
+- `--bin-size`
+  沿前进方向分箱的长度，单位米。算法会在每个箱里提取一个代表性的左右边界点。
+- `--min-points`
+  在处理窗口中，至少要有多少个扫描点才尝试做行检测。
+- `--min-bins`
+  某一侧至少要有多少个有效分箱，才会把这一侧拟合成一条线。
+- `--center-deadband`
+  忽略靠近车辆中心线附近的点，避免把中心杂物误判成植株边界。
+- `--left-percentile`
+  每个前向分箱中，选取左边界点时使用的百分位数。
+- `--right-percentile`
+  每个前向分箱中，选取右边界点时使用的百分位数。
+- `--slow-error-y`
+  当横向误差超过这个值时，自动模式开始减速。
+- `--stop-error-y`
+  当横向误差超过这个值时，前进速度直接降为 0，优先保证安全。
+- `--slow-heading-rad`
+  当朝向误差超过这个值时，自动模式开始减速。
+- `--control-period`
+  控制循环周期，单位秒。
+- `--status-period`
+  状态发布周期，单位秒。
+- `--scan-timeout`
+  距离上一帧雷达数据超过这个时间，就认为雷达超时并停车。
+- `--lost-hold-s`
+  丢失行中线后保持停车的时间。
 
-- `--line-cruise-vx`: 正常行内巡航速度
-- `--lidar-row-entry-*`: 换行后的停车识别和低速入行参数
-- `--lidar-*`: 激光雷达局部中线跟踪参数
+## 调参建议
 
-## 当前实现说明
+如果车左右摆动比较明显：
 
-- 局部控制由进程内的 `plant_lidar_centerline_follower.py` 提供
-- 正常行内使用激光控制；任务过渡阶段使用全局路径控制
-- 最终底盘 CAN 命令由 `autorunlida` 统一下发
+- 降低 `--k-lat`
+- 降低 `--k-heading`
+- 降低 `--speed`
+
+如果车回正太慢：
+
+- 提高 `--k-lat`
+
+如果车对路线方向修正不够：
+
+- 提高 `--k-heading`
+
+如果远处杂点太多，影响中线检测：
+
+- 减小 `--forward-max`
+- 减小 `--lateral-limit`
+
+## 安全建议
+
+- 丢失中线或雷达超时后，程序会停车
+- 第一次实车测试建议把速度设在 `0.15 ~ 0.20 m/s`
+- 第一次测试时务必有人在车旁边随时接管

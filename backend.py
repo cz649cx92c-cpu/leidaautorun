@@ -757,7 +757,13 @@ class DirectLocalLidarController:
         follower_args.reverse_k_lat = float(args.lidar_reverse_k_lat)
         follower_args.reverse_k_heading = float(args.lidar_reverse_k_heading)
         follower_args.reverse_max_wz_deg = float(args.lidar_reverse_max_wz_deg)
-        follower_args.reverse_steer_sign = float(args.lidar_reverse_steer_sign)
+        follower_args.reverse_min_wz_deg = float(args.lidar_reverse_min_wz_deg)
+        follower_args.reverse_min_wz_error_y = float(args.lidar_reverse_min_wz_error_y)
+        follower_args.reverse_wz_enable_heading_deg = float(args.lidar_reverse_wz_enable_heading_deg)
+        # Keep the reverse steering convention identical to the text
+        # reference follower.  A positive/negative override here would make
+        # the rear-lidar correction turn the wrong way.
+        follower_args.reverse_steer_sign = -1.0
         follower_args.reverse_wz_filter_alpha = float(args.lidar_reverse_wz_filter_alpha)
         follower_args.enable_4t4d_steering_assist = bool(args.lidar_enable_4t4d_steering_assist)
         follower_args.steering_assist_wheelbase_m = float(args.lidar_steering_assist_wheelbase_m)
@@ -1334,6 +1340,7 @@ class RowEntryAssistState:
     lidar_tracking: bool = False
     settle_until: float = 0.0
     stable_frames: int = 0
+    detected_frames: int = 0
     last_status_at: float = 0.0
     last_log_at: float = 0.0
     lidar_start_along_m: float = 0.0
@@ -1810,11 +1817,14 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_end_reverse.reverse_end_index,
             )
             row_end_reverse.reverse_exit_global_active = False
-            row_end_reverse.force_global_only = True
+            # An initially reversing mission starts under rear-lidar local
+            # control as well; never reserve the first meter for global path
+            # control.
+            row_end_reverse.force_global_only = False
             row_end_reverse.stop_until = time.monotonic()
             init_message = (
                 f"Initial reverse stage armed from sample #{start_index} to #{initial_reverse_end}; "
-                "the first meter will use global path control before lidar handoff."
+                "rear lidar local control is active from the first moving command."
             )
             core.log(init_message)
             _append_hybrid_log(hybrid_run_log, init_message)
@@ -1970,6 +1980,20 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     )
                     if entry_lidar_status.updated_at > row_entry_assist.last_status_at:
                         row_entry_assist.last_status_at = entry_lidar_status.updated_at
+                        entry_mode = str(
+                            (entry_lidar_status.payload or {}).get("mode", "")
+                            if isinstance(entry_lidar_status.payload, dict)
+                            else ""
+                        )
+                        entry_detected = bool(
+                            entry_lidar_status.fresh
+                            and entry_lidar_status.found
+                            and entry_mode in {"both_sides", "left_only", "right_only"}
+                        )
+                        if entry_detected:
+                            row_entry_assist.detected_frames += 1
+                        else:
+                            row_entry_assist.detected_frames = 0
                         if entry_reliable:
                             row_entry_assist.stable_frames += 1
                         else:
@@ -1998,8 +2022,11 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_entry_handoff_ready = (
                     row_entry_assist.start_along_valid
                     and row_entry_progress_m >= max(0.40, float(args.lidar_row_entry_distance))
-                    and row_entry_assist.stable_frames
-                    >= max(1, int(args.lidar_row_entry_stable_frames))
+                    and (
+                        row_entry_assist.stable_frames
+                        >= max(1, int(args.lidar_row_entry_stable_frames))
+                        or row_entry_assist.detected_frames >= 5
+                    )
                 )
                 if row_entry_handoff_ready:
                     row_entry_assist.active = False
@@ -2013,7 +2040,8 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     entry_message = (
                         "Global low-speed row entry finished; handing control to lidar guidance "
                         f"after {row_entry_progress_m:.2f}m with "
-                        f"{row_entry_assist.stable_frames} stable lidar frames."
+                        f"{max(row_entry_assist.stable_frames, row_entry_assist.detected_frames)} "
+                        "continuous lidar frames."
                     )
                     core.log(entry_message)
                     _append_hybrid_log(hybrid_run_log, entry_message)
@@ -2046,7 +2074,10 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_end_reverse.triggered_at_index = start_index
                 row_end_reverse.hard_stop_sent = False
                 row_end_reverse.pending_next_index = -1
-                row_end_reverse.force_global_only = True
+                # Reverse motion is local-lidar controlled from its first
+                # moving command. Do not claim the chassis with the global
+                # path controller at the start of the reverse segment.
+                row_end_reverse.force_global_only = False
                 row_end_reverse.reverse_global_progress_m = 0.0
                 reverse_start_index = current_segment.end_index + 1
                 reverse_end_index = reverse_start_index
@@ -2111,19 +2142,29 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     0.0,
                     row_end_reverse.reverse_total_length_m - reverse_progress_m,
                 )
-                reverse_entry_global_active = (
-                    row_end_reverse.force_global_only
-                    and reverse_progress_m < 1.0
-                )
-                if row_end_reverse.force_global_only and not reverse_entry_global_active:
-                    row_end_reverse.force_global_only = False
+                # The rear lidar owns the complete reverse segment. Global
+                # control remains available only for the configured reverse
+                # exit handoff near the end of the segment.
+                reverse_entry_global_active = False
                 reverse_exit_distance_m = max(
                     0.50,
                     float(args.lidar_reverse_exit_global_distance),
                 )
+                # Near a row change, a sparse rear scan can lose both
+                # boundaries and the local follower will deliberately output
+                # zero. Allow the global path to finish this tail instead of
+                # waiting forever for a fresh centerline.
+                reverse_lidar_lost_near_exit = (
+                    reverse_remaining_m <= max(reverse_exit_distance_m, 4.00)
+                    and (not entry_lidar_status.found or not entry_lidar_status.fresh)
+                )
                 if (
                     not row_end_reverse.reverse_exit_global_active
-                    and reverse_remaining_m <= reverse_exit_distance_m
+                    and reverse_progress_m >= 1.0
+                    and (
+                        reverse_remaining_m <= reverse_exit_distance_m
+                        or reverse_lidar_lost_near_exit
+                    )
                 ):
                     row_end_reverse.reverse_exit_global_active = True
                     local_controller.clear_motion_history()
@@ -2203,6 +2244,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_entry_assist.lidar_tracking = False
                 row_entry_assist.settle_until = 0.0
                 row_entry_assist.stable_frames = 0
+                row_entry_assist.detected_frames = 0
                 row_entry_assist.last_status_at = 0.0
                 row_entry_assist.last_log_at = 0.0
                 row_entry_assist.lidar_start_along_m = 0.0
@@ -2262,6 +2304,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                             row_entry_assist.stable_frames += 1
                         else:
                             row_entry_assist.stable_frames = 0
+                            row_entry_assist.detected_frames = 0
 
                     required_frames = max(1, int(args.lidar_row_entry_stable_frames))
                     if row_entry_assist.stable_frames < required_frames:
@@ -2342,6 +2385,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                         row_entry_assist.handed_off = True
                         row_entry_assist.lidar_start_along_valid = False
                         row_entry_assist.stable_frames = 0
+                        row_entry_assist.detected_frames = 0
                         finish_msg = (
                             "Lidar constrained row entry finished. "
                             f"progress={entry_progress_m:.2f}m; restoring normal lidar cruise."
@@ -2616,6 +2660,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                             row_entry_assist.lidar_tracking = False
                             row_entry_assist.settle_until = 0.0
                             row_entry_assist.stable_frames = 0
+                            row_entry_assist.detected_frames = 0
                             row_entry_assist.last_status_at = 0.0
                             row_entry_assist.last_log_at = 0.0
                             row_entry_assist.lidar_start_along_m = 0.0
@@ -2724,6 +2769,11 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 local_status = local_controller.status_snapshot()
                 local_cmd = TwistCommand(vx=cmd_vx, vy=cmd_vy, wz=math.radians(cmd_wz), updated_at=time.monotonic(), fresh=True)
             else:
+                # Direct global commands use a short hold window to bridge
+                # intentional handoffs. Clear it before enabling local lidar
+                # control so an old global command cannot win the race at a
+                # direction change or reverse start.
+                local_controller.release_direct_control()
                 if row_end_reverse.force_global_only:
                     row_end_reverse.force_global_only = False
                     row_end_reverse.last_global_lateral_err = 0.0
@@ -3093,6 +3143,9 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-reverse-k-lat", type=float, default=14.0)
     parser.add_argument("--lidar-reverse-k-heading", type=float, default=0.10)
     parser.add_argument("--lidar-reverse-max-wz-deg", type=float, default=2.5)
+    parser.add_argument("--lidar-reverse-min-wz-deg", type=float, default=2.0)
+    parser.add_argument("--lidar-reverse-min-wz-error-y", type=float, default=0.025)
+    parser.add_argument("--lidar-reverse-wz-enable-heading-deg", type=float, default=1.0)
     parser.add_argument("--lidar-reverse-steer-sign", type=float, default=-1.0)
     parser.add_argument("--lidar-reverse-wz-filter-alpha", type=float, default=0.30)
     parser.add_argument("--lidar-reverse-exit-global-distance", type=float, default=1.50)

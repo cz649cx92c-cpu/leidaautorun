@@ -390,6 +390,7 @@ class PlantRowFollower(Node):
         self.rear_scan_time = 0.0
         self.rear_scan_seq = 0
         self.active_lidar = "front"
+        self.drive_enable = True
         self.waiting_for_new_scan = False
         self.waiting_for_new_scan_reason = ""
         self.switch_scan_seq = 0
@@ -454,6 +455,9 @@ class PlantRowFollower(Node):
             lidar_yaw_correction_deg=float(args.rear_lidar_yaw_correction_deg),
             lidar_x_offset_m=float(args.rear_lidar_x_offset_m),
             lidar_y_offset_m=float(args.rear_lidar_y_offset_m),
+            scan_view_center_deg=0.0,
+            scan_view_angle_deg=180.0,
+            reflect_x_axis=True,
         )
         self.row_cfg = self.front_row_cfg
         initial_gear = self._normalized_gear()
@@ -474,12 +478,16 @@ class PlantRowFollower(Node):
         self.can_reader = CANFeedbackReader(args.interface, args.channel, args.bitrate)
         self.status_pub = self.create_publisher(String, args.status_topic, 10)
         self.create_subscription(LaserScan, args.front_scan_topic, self._on_front_scan, 10)
-        self.create_subscription(LaserScan, args.rear_scan_topic, self._on_rear_scan, 10)
+        if args.rear_scan_topic:
+            self.create_subscription(LaserScan, args.rear_scan_topic, self._on_rear_scan, 10)
+        # Select the requested lidar before the control timer can run. The
+        # switch gate holds the vehicle stopped until a fresh frame arrives.
+        self.prepare_lidar_switch(bool(args.reverse))
         self.control_timer = self.create_timer(max(0.02, float(args.control_period)), self._on_control)
         self.create_timer(max(0.1, float(args.status_period)), self._publish_status)
         self._stopping = False
         self.get_logger().info(
-            f"started front_scan_topic={args.front_scan_topic} rear_scan_topic={args.rear_scan_topic} "
+            f"started front_scan_topic={args.front_scan_topic} rear_scan_topic={args.rear_scan_topic or 'disabled'} "
             f"speed={args.speed:.2f} row_width={args.row_width:.2f}"
         )
 
@@ -751,21 +759,14 @@ class PlantRowFollower(Node):
         max_heading_wz_deg = max(0.0, float(self.args.max_heading_wz_deg))
         max_heading_wz_rad = math.radians(max_heading_wz_deg)
         requested_max_wz_deg = max_wz_deg
-        target_speed = float(self.args.reverse_speed if reverse else self.args.speed)
+        target_speed = float(self.args.speed)
         center_y_target = float(self.args.center_y_target)
         line_fit = getattr(estimate, "center_line", None)
-        # Reuse the same fitted lines in both directions.  The lidar is mounted
-        # at the front of this vehicle, so its unshifted scan origin is about
-        # one complete body length ahead of the rear edge.  Extend the straight
-        # plant-boundary fits rearward by that full length and control the
-        # virtual centerline at the rear edge.  Lateral safety margin is handled
-        # separately by the rear-corner clearance calculation below.
+        # Both lidar roles are normalized so +X points in the current travel
+        # direction. Use the same lookahead and controller in both directions.
         forward_lookahead_x = abs(float(self.args.forward_lookahead_x))
-        reverse_rear_x = -(
-            abs(float(ROBOT_FRAME_FRONT))
-            + abs(float(ROBOT_FRAME_BACK))
-        )
-        effective_lookahead_x = reverse_rear_x if reverse else forward_lookahead_x
+        reverse_rear_x = forward_lookahead_x
+        effective_lookahead_x = forward_lookahead_x
         target_y = float(estimate.center_y)
         center_y_direct_error = float(estimate.center_y)
         direct_error_y = float(center_y_direct_error - center_y_target)
@@ -791,7 +792,7 @@ class PlantRowFollower(Node):
         reverse_rear_min_clearance_m = 0.0
         reverse_rear_guard_active = False
 
-        if not reverse and abs(error_y) <= float(self.args.control_deadband_y):
+        if abs(error_y) <= float(self.args.control_deadband_y):
             error_y = 0.0
 
         k_lat_eff = float(self.args.k_lat)
@@ -802,81 +803,12 @@ class PlantRowFollower(Node):
         wz_raw = 0.0
         vx = -abs(target_speed) if reverse else max(float(self.args.min_speed), float(target_speed))
 
-        if estimate.reject_reason and not reverse:
+        if estimate.reject_reason:
             stop_reason = f"reject:{estimate.reject_reason}"
             control_phase = "emergency_stop"
             vx = 0.0
             wz_raw = 0.0
-        elif reverse:
-            if line_fit is not None:
-                line_y_at_track = float(line_fit[0] * track_x + line_fit[1])
-                track_error_y = float(line_y_at_track - center_y_target)
-                target_y = line_y_at_track
-                error_y = track_error_y
-                heading_error = float(math.atan(line_fit[0]))
-                heading_error_deg = math.degrees(heading_error)
-
-            # Check the two leading rear corners against the left/right plant
-            # boundaries after extending those straight fitted lines rearward.
-            # One-side detection already supplies a virtual opposite boundary,
-            # so the same footprint calculation works in all valid line modes.
-            left_line = getattr(estimate, "left_line", None)
-            right_line = getattr(estimate, "right_line", None)
-            half_row_width = 0.5 * float(getattr(estimate, "row_width", 0.0) or self.args.row_width)
-            if line_fit is not None:
-                if left_line is None:
-                    left_line = (float(line_fit[0]), float(line_fit[1]) + half_row_width)
-                if right_line is None:
-                    right_line = (float(line_fit[0]), float(line_fit[1]) - half_row_width)
-            rear_half_width = float(self.row_cfg.vehicle_half_width)
-            if left_line is not None:
-                left_norm = math.hypot(1.0, float(left_line[0]))
-                left_y_at_rear = float(left_line[0]) * track_x + float(left_line[1])
-                reverse_rear_left_clearance_m = (
-                    left_y_at_rear - rear_half_width
-                ) / left_norm
-            if right_line is not None:
-                right_norm = math.hypot(1.0, float(right_line[0]))
-                right_y_at_rear = float(right_line[0]) * track_x + float(right_line[1])
-                reverse_rear_right_clearance_m = (
-                    -rear_half_width - right_y_at_rear
-                ) / right_norm
-            reverse_rear_min_clearance_m = min(
-                reverse_rear_left_clearance_m,
-                reverse_rear_right_clearance_m,
-            )
-            reverse_rear_guard_active = (
-                math.isfinite(reverse_rear_min_clearance_m)
-                and reverse_rear_min_clearance_m < float(self.row_cfg.safety_margin)
-            )
-
-            # One centerline, one proportional controller, one kinematic sign.
-            # No reverse deadband, minimum turn, recenter scaling, sign-flip
-            # clearing, slew limiter, start ramp, or speed reduction is applied.
-            vx = -abs(target_speed)
-            k_lat_eff = float(self.args.reverse_k_lat)
-            k_heading_eff = float(self.args.reverse_k_heading)
-            max_wz_deg = abs(float(self.args.reverse_max_wz_deg))
-            requested_max_wz_deg = max_wz_deg
-            max_wz_rad = math.radians(max_wz_deg)
-            lat_term_deg = k_lat_eff * track_error_y
-            heading_term_raw_deg = k_heading_eff * heading_error_deg
-            # When a rear corner is already inside the safety margin, heading
-            # correction must not cancel the turn that moves the rear back
-            # toward the corridor center.  Speed remains the requested fixed
-            # reverse speed; only the priority of the two P terms changes.
-            heading_term_deg = 0.0 if reverse_rear_guard_active else heading_term_raw_deg
-            target_wz_deg = active_reverse_steer_sign * (lat_term_deg + heading_term_deg)
-            last_wz_deg = math.degrees(float(self.last_cmd_wz))
-            smoothing_alpha = max(0.0, min(0.40, float(self.args.reverse_wz_filter_alpha)))
-            filtered_wz_deg = (
-                smoothing_alpha * last_wz_deg
-                + (1.0 - smoothing_alpha) * target_wz_deg
-            )
-            filtered_wz_deg = max(-max_wz_deg, min(max_wz_deg, filtered_wz_deg))
-            base_wz_deg = target_wz_deg
-            wz_raw = math.radians(target_wz_deg)
-            wz = math.radians(filtered_wz_deg)
+            wz = 0.0
         else:
             if line_fit is not None:
                 track_x = float(self.args.forward_lookahead_x)
@@ -886,7 +818,6 @@ class PlantRowFollower(Node):
                 error_y = track_error_y
                 heading_error = float(math.atan(line_fit[0]))
                 heading_error_deg = math.degrees(heading_error)
-                heading_deg = heading_error_deg
             if one_side_mode:
                 max_wz_deg = min(max_wz_deg, 0.8)
                 max_wz_rad = math.radians(max_wz_deg)
@@ -905,24 +836,24 @@ class PlantRowFollower(Node):
             lat_term_deg = math.degrees(k_lat_eff * error_y)
             heading_term_deg = math.degrees(heading_term_limited)
             wz_raw = base_wz
-            vx = max(float(self.args.min_speed), float(target_speed))
-
-        if not reverse:
-            base_wz_deg = math.degrees(base_wz)
-        if not reverse and abs(error_y) < 0.012:
-            base_wz = 0.0
-            base_wz_deg = 0.0
-            wz_raw = 0.0
-            wz_zeroed_reason = "forward_deadband"
-        if not reverse:
+            if abs(error_y) < 0.012:
+                base_wz = 0.0
+                wz_raw = 0.0
+                wz_zeroed_reason = "shared_deadband"
             wz_raw = max(-max_wz_rad, min(max_wz_rad, wz_raw))
             wz = wz_raw
-            # Never let the minimum useful forward correction exceed the
-            # configured maximum.  The old ordering produced 2 deg/s even when
-            # row entry or one-side tracking was explicitly capped at 0.8-1.2.
-            min_forward_wz_rad = min(math.radians(2.0), max_wz_rad)
-            if abs(wz) > 1e-9 and abs(wz) < min_forward_wz_rad:
-                wz = math.copysign(min_forward_wz_rad, wz)
+            min_useful_wz_rad = min(math.radians(2.0), max_wz_rad)
+            if abs(wz) > 1e-9 and abs(wz) < min_useful_wz_rad:
+                wz = math.copysign(min_useful_wz_rad, wz)
+            if reverse:
+                wz_raw *= active_reverse_steer_sign
+                wz *= active_reverse_steer_sign
+                vx = -max(float(self.args.min_speed), abs(float(target_speed)))
+            else:
+                vx = max(float(self.args.min_speed), float(target_speed))
+            base_wz_deg = math.degrees(base_wz) * (
+                active_reverse_steer_sign if reverse else 1.0
+            )
             target_wz_deg = math.degrees(wz_raw)
             filtered_wz_deg = math.degrees(wz)
 
@@ -1004,8 +935,12 @@ class PlantRowFollower(Node):
         warning: str,
         wz_limit_deg: float,
         wz_scale: float = 1.0,
+        max_age_s: float | None = None,
     ) -> bool:
         if self.last_good_time <= 0.0:
+            return False
+        last_good_age = time.monotonic() - self.last_good_time
+        if max_age_s is not None and last_good_age > max(0.0, float(max_age_s)):
             return False
         hold_vx = float(self.last_good_cmd.vx)
         hold_wz_deg = math.degrees(float(self.last_good_cmd.wz)) * float(wz_scale)
@@ -1027,7 +962,7 @@ class PlantRowFollower(Node):
             final_wz=float(hold_cmd.wz),
             warning=warning,
             lost_hold_forward=(control_phase == "lost_hold_forward"),
-            last_good_age_sec=time.monotonic() - self.last_good_time if self.last_good_time > 0.0 else -1.0,
+            last_good_age_sec=last_good_age,
             last_good_error_y=float(self.last_error_y),
             last_good_heading_deg=float(self.last_good_heading_deg),
             last_good_cmd_wz_deg=math.degrees(float(self.last_good_cmd.wz)),
@@ -1037,40 +972,6 @@ class PlantRowFollower(Node):
         )
         self._send_drive(hold_cmd.gear, float(hold_cmd.vx), float(hold_cmd.wz))
         return True
-
-    def _continue_reverse_command(self, estimate: RowEstimate) -> None:
-        """Keep moving on fresh scans when centerline fitting misses briefly."""
-        previous_debug = dict(self.last_debug)
-        hold_vx = -abs(float(self.args.reverse_speed))
-        hold_wz_deg = (
-            math.degrees(float(self.last_good_cmd.wz))
-            if self.last_good_time > 0.0
-            else 0.0
-        )
-        max_wz_deg = abs(float(self.args.reverse_max_wz_deg))
-        hold_wz_deg = max(-max_wz_deg, min(max_wz_deg, hold_wz_deg))
-        hold_wz = math.radians(hold_wz_deg)
-        self.last_cmd_vx = hold_vx
-        self.last_cmd_wz = hold_wz
-        self._set_debug_snapshot(
-            estimate=estimate,
-            found=False,
-            control_phase="reverse_transient_line_hold",
-            stop_reason="",
-            final_vx=hold_vx,
-            final_wz=hold_wz,
-            warning=str(getattr(estimate, "warning", "") or "transient_centerline_loss"),
-            lateral_error=float(previous_debug.get("lateral_error", self.last_error_y)),
-            heading_error_deg=float(previous_debug.get("heading_error_deg", self.last_good_heading_deg)),
-            lateral_term_deg=float(previous_debug.get("lateral_term_deg", 0.0)),
-            heading_term_deg=float(previous_debug.get("heading_term_deg", 0.0)),
-            wz_target_deg=float(previous_debug.get("wz_target_deg", hold_wz_deg)),
-            wz_filtered_deg=hold_wz_deg,
-            reverse_steer_sign=float(self.args.reverse_steer_sign),
-            line_mode=str(getattr(estimate, "effective_mode", estimate.mode) or ""),
-            control_using_last_good_line=self.last_good_time > 0.0,
-        )
-        self._send_drive(self._normalized_gear(), hold_vx, hold_wz)
 
     def _normalized_gear(self) -> str:
         gear = str(self.args.gear).strip().lower()
@@ -1090,7 +991,6 @@ class PlantRowFollower(Node):
         steering_zeroed = True
         steering_assist_active = False
         cmd_wz_deg_s = math.degrees(wz)
-        reverse_motion = float(vx) < -1e-6
         auto_reverse_steering_assist = False
         assist_enabled = bool(self.args.enable_4t4d_steering_assist)
         if gear == "4t4d" and assist_enabled:
@@ -1228,13 +1128,14 @@ class PlantRowFollower(Node):
             return
         if scan is None or scan_age > float(self.args.scan_timeout):
             self.last_estimate = RowEstimate(found=False, mode="scan_timeout")
-            if not bool(self.args.reverse) and self._hold_last_good_command(
+            if self._hold_last_good_command(
                 estimate=self.last_estimate,
-                control_phase="scan_timeout_hold_forward",
-                stop_reason="scan_timeout_hold_forward",
-                warning="scan_timeout_hold_forward",
+                control_phase="scan_timeout_hold_shared",
+                stop_reason="scan_timeout_hold_shared",
+                warning="scan_timeout_hold_shared",
                 wz_limit_deg=float(self.args.forward_lost_hold_max_wz_deg),
                 wz_scale=float(self.args.forward_lost_hold_wz_scale),
+                max_age_s=float(self.args.forward_lost_hold_sec),
             ):
                 return
             self._set_debug_snapshot(
@@ -1266,17 +1167,15 @@ class PlantRowFollower(Node):
             self.last_cmd_wz = float(cmd.wz)
             self._send_drive(cmd.gear, float(cmd.vx), float(cmd.wz))
         else:
-            if bool(self.args.reverse):
-                self._continue_reverse_command(estimate)
-                return
             last_good_age = now - self.last_good_time if self.last_good_time > 0.0 else float("inf")
-            if not bool(self.args.reverse) and self._hold_last_good_command(
+            if self._hold_last_good_command(
                 estimate=estimate,
-                control_phase="lost_hold_forward",
-                stop_reason="lost_hold_forward",
-                warning="lost_hold_forward",
+                control_phase="lost_hold_shared",
+                stop_reason="lost_hold_shared",
+                warning="lost_hold_shared",
                 wz_limit_deg=float(self.args.forward_lost_hold_max_wz_deg),
                 wz_scale=float(self.args.forward_lost_hold_wz_scale),
+                max_age_s=float(self.args.forward_lost_hold_sec),
             ):
                 return
             self._set_debug_snapshot(
@@ -1499,7 +1398,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--front-lidar-x-offset-m", type=float, default=0.0)
     parser.add_argument("--front-lidar-y-offset-m", type=float, default=0.0)
     parser.add_argument("--front-extrinsics-confirmed", action="store_true")
-    parser.add_argument("--rear-sensor-yaw-deg", type=float, default=0.0)
+    parser.add_argument("--rear-sensor-yaw-deg", type=float, default=180.0)
     parser.add_argument("--rear-lidar-yaw-correction-deg", type=float, default=0.0)
     parser.add_argument("--rear-lidar-x-offset-m", type=float, default=0.0)
     parser.add_argument("--rear-lidar-y-offset-m", type=float, default=0.0)
@@ -1534,6 +1433,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reverse-k-lat", type=float, default=14.0)
     parser.add_argument("--reverse-k-heading", type=float, default=0.10)
     parser.add_argument("--reverse-max-wz-deg", type=float, default=2.5)
+    parser.add_argument("--reverse-min-wz-deg", type=float, default=2.0)
+    parser.add_argument("--reverse-min-wz-error-y", type=float, default=0.025)
+    parser.add_argument("--reverse-wz-enable-heading-deg", type=float, default=1.0)
     parser.add_argument("--reverse-steer-sign", type=float, default=-1.0)
     parser.add_argument("--reverse-wz-filter-alpha", type=float, default=0.30)
     parser.add_argument("--enable-4t4d-steering-assist", action="store_true")

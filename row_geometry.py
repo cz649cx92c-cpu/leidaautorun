@@ -41,6 +41,9 @@ class RowFollowerConfig:
     lidar_y_offset_m: float = 0.0
     boundary_max_gap_x: float = 0.45
     boundary_width_tolerance_m: float = 0.0
+    scan_view_center_deg: float = 0.0
+    scan_view_angle_deg: float = 360.0
+    reflect_x_axis: bool = False
 
 
 @dataclass
@@ -119,14 +122,16 @@ def _empty_debug(raw_points: np.ndarray, web_points: np.ndarray, points: np.ndar
     )
 
 
-def _exclude_robot_frame(points: np.ndarray) -> np.ndarray:
+def _exclude_robot_frame(points: np.ndarray, *, reflect_x_axis: bool = False) -> np.ndarray:
     if points.size == 0:
         return points
     x = points[:, 0]
     y = points[:, 1]
+    x_min = -ROBOT_FRAME_FRONT if reflect_x_axis else -ROBOT_FRAME_BACK
+    x_max = ROBOT_FRAME_BACK if reflect_x_axis else ROBOT_FRAME_FRONT
     mask = ~(
-        (x > -ROBOT_FRAME_BACK)
-        & (x < ROBOT_FRAME_FRONT)
+        (x > x_min)
+        & (x < x_max)
         & (y > -ROBOT_FRAME_RIGHT)
         & (y < ROBOT_FRAME_LEFT)
     )
@@ -146,6 +151,11 @@ def raw_scan_to_points(scan, cfg: RowFollowerConfig) -> np.ndarray:
         return np.empty((0, 2), dtype=np.float64)
     angles = scan.angle_min + np.arange(ranges.size, dtype=np.float64) * scan.angle_increment
     valid = np.isfinite(ranges)
+    view_angle_deg = max(0.0, min(360.0, float(cfg.scan_view_angle_deg)))
+    if view_angle_deg < 360.0:
+        center = math.radians(float(cfg.scan_view_center_deg))
+        delta = np.arctan2(np.sin(angles - center), np.cos(angles - center))
+        valid &= np.abs(delta) <= math.radians(0.5 * view_angle_deg)
     valid &= ranges >= max(float(scan.range_min), float(cfg.range_min))
     valid &= ranges <= min(float(scan.range_max), float(cfg.range_max))
     if not np.any(valid):
@@ -155,13 +165,17 @@ def raw_scan_to_points(scan, cfg: RowFollowerConfig) -> np.ndarray:
     x = ranges * np.cos(angles)
     y = ranges * np.sin(angles)
     points = np.column_stack((x, y))
-    return transform_lidar_points(
+    transformed = transform_lidar_points(
         points,
         sensor_yaw_deg=float(cfg.sensor_yaw_deg),
         lidar_yaw_correction_deg=float(cfg.lidar_yaw_correction_deg),
         lidar_x_offset_m=float(cfg.lidar_x_offset_m),
         lidar_y_offset_m=float(cfg.lidar_y_offset_m),
     )
+    if bool(cfg.reflect_x_axis) and transformed.size:
+        transformed = transformed.copy()
+        transformed[:, 0] *= -1.0
+    return transformed
 
 
 def transform_lidar_points(
@@ -313,8 +327,15 @@ def estimate_row_from_points(
     cfg: RowFollowerConfig,
     last_good_row_width: float,
 ) -> tuple[RowEstimate, RowDebugData]:
-    web_points = _downsample_points(_exclude_robot_frame(raw_points), max_points=180)
-    points = filter_points_for_row(raw_points, cfg)
+    body_filtered = _exclude_robot_frame(
+        raw_points,
+        reflect_x_axis=bool(cfg.reflect_x_axis),
+    )
+    web_points = _downsample_points(body_filtered, max_points=180)
+    # Remove returns from the vehicle body before fitting boundaries.  The same
+    # body-frame mask is used for both lidar roles; rear-lidar data has already
+    # been rotated into this frame by raw_scan_to_points().
+    points = filter_points_for_row(body_filtered, cfg)
     empty = _empty_debug(raw_points, web_points, points)
     if len(points) < int(cfg.min_points):
         return (

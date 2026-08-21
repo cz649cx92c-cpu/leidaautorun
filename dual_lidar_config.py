@@ -47,6 +47,7 @@ class DualLidarConfig:
     rear: LidarConfig
 
     def sensors(self) -> tuple[LidarConfig, LidarConfig]:
+        # Both drivers stay available; consumers explicitly subscribe to front.
         return self.front, self.rear
 
 

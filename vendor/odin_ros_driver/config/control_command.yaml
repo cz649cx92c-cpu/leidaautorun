@@ -11,11 +11,11 @@ register_keys:
   streamctrl: 1           # 0: off; 1: on
 
   # original rgb data in jpeg format from device
-  sendrgbcompressed: 1    # 0: off; 1: on
+  sendrgbcompressed: 0    # 0: off; 1: on
 
   # RGB data, decoded from original jpeg data from device, bgr8 format
   # Processed on host device
-  sendrgb: 1              # 0: off; 1: on
+  sendrgb: 0              # 0: off; 1: on
 
   # undistort rgb image processed from decoded rgb data.
   # depends on sendrgb. related camera parameters can be found in ws/src/odin_ros_driver/config/calib.yaml
@@ -50,16 +50,16 @@ register_keys:
   dtof_fps: 100           # 100: 10fps; 145: 14.5fps
 
   # slam cloud data
-  sendcloudslam: 1        # 0: off; 1: on
+  sendcloudslam: 0        # 0: off; 1: on
 
   # processed with raw point cloud, rgb image, and calib.yaml from device
   # Processed on host device
-  sendcloudrender: 1      # 0: off; 1: on
+  sendcloudrender: 0      # 0: off; 1: on
 
   # depth completion demo, high computing resource usage. 
   # for more information please refer to the readme file.
   # Processed on host device
-  senddepth: 0            # 0: off; 1: on
+  senddepth: 1            # 0: off; 1: on
 
   # cloud reprojection demo, projects cloud_slam to camera image using odometry
   # Processed on host device
@@ -91,7 +91,7 @@ register_keys:
   
   custom_map_mode: 2
   custom_init_pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-  relocalization_map_abs_path: "/home/orangepi/ugv/autorunlida/maps/map_20260720_154921/map_20260720_154921.bin"
+  relocalization_map_abs_path: "/home/orangepi/ugv/autorunlida/maps/map_20260820_181300/map_20260820_181300.bin"
 
   # To get the mapping result file, please use the set_param.sh script provided: "./set_param.sh save_map 1"
   mapping_result_dest_dir: ""

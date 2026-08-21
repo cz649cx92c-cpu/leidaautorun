@@ -15,10 +15,10 @@
     "device": "/dev/serial/by-path/platform-fc800000.usb-usb-0:1.2.4:1.0",
     "scan_topic": "/rear/scan",
     "frame_id": "rear_laser",
-    "sensor_yaw_deg": 0.0,
-    "lidar_yaw_correction_deg": 0.0,
+    "sensor_yaw_deg": 180.0,
+    "lidar_yaw_correction_deg": -6.0,
     "lidar_x_offset_m": 0.0,
     "lidar_y_offset_m": 0.0,
-    "extrinsics_confirmed": false
+    "extrinsics_confirmed": true
   }
 }
