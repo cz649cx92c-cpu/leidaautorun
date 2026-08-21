@@ -939,6 +939,13 @@ class PlantRowFollower(Node):
             "left_consecutive_bins": int(getattr(estimate, "left_consecutive_bins", 0) or 0),
             "right_consecutive_bins": int(getattr(estimate, "right_consecutive_bins", 0) or 0),
             "boundary_source": str(getattr(estimate, "boundary_source", "") or ""),
+            "paired_bins": int(getattr(estimate, "paired_bins", 0) or 0),
+            "paired_residual_median": float(
+                getattr(estimate, "paired_residual_median", 0.0) or 0.0
+            ),
+            "paired_width_median": float(
+                getattr(estimate, "paired_width_median", 0.0) or 0.0
+            ),
         }
         payload.update(self._lidar_debug_fields())
         payload.update(extra)
@@ -1490,6 +1497,13 @@ class PlantRowFollower(Node):
                         "left_consecutive_bins": int(self.last_debug.get("left_consecutive_bins", 0)),
                         "right_consecutive_bins": int(self.last_debug.get("right_consecutive_bins", 0)),
                         "boundary_source": self.last_debug.get("boundary_source", ""),
+                        "paired_bins": int(self.last_debug.get("paired_bins", 0)),
+                        "paired_residual_median": round(
+                            float(self.last_debug.get("paired_residual_median", 0.0)), 4
+                        ),
+                        "paired_width_median": round(
+                            float(self.last_debug.get("paired_width_median", 0.0)), 4
+                        ),
                         "control_using_last_good_line": bool(self.last_debug.get("control_using_last_good_line", False)),
                         "final_vx": round(float(self.last_debug.get("final_vx", 0.0)), 4),
                         "final_wz_deg": round(float(self.last_debug.get("final_wz_deg", 0.0)), 4),

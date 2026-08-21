@@ -959,6 +959,14 @@ class DirectLocalLidarController:
                     "final_wz_deg": _safe_float(self.last_debug.get("final_wz_deg"), 0.0),
                     "reverse_steer_sign": _safe_float(self.last_debug.get("reverse_steer_sign"), -1.0),
                     "line_mode": str(self.last_debug.get("line_mode", estimate.mode) or ""),
+                    "boundary_source": str(self.last_debug.get("boundary_source", "") or ""),
+                    "paired_bins": int(self.last_debug.get("paired_bins", 0) or 0),
+                    "paired_residual_median": _safe_float(
+                        self.last_debug.get("paired_residual_median"), 0.0
+                    ),
+                    "paired_width_median": _safe_float(
+                        self.last_debug.get("paired_width_median"), 0.0
+                    ),
                 }
                 payload.update(self._lidar_debug_fields())
                 with controller._status_lock:
@@ -3096,6 +3104,10 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     f"lidar_active={local_payload.get('active_lidar', '-')} "
                     f"lidar_fallback={bool(local_payload.get('lidar_fallback_active', False))} "
                     f"lidar_line_mode={local_payload.get('line_mode', '')} "
+                    f"lidar_boundary_source={local_payload.get('boundary_source', '-')} "
+                    f"lidar_paired_bins={int(_safe_float(local_payload.get('paired_bins'), 0.0))} "
+                    f"lidar_paired_residual={_safe_float(local_payload.get('paired_residual_median'), 0.0):.3f} "
+                    f"lidar_paired_width={_safe_float(local_payload.get('paired_width_median'), 0.0):.3f} "
                     f"lidar_track_x={_safe_float(local_payload.get('track_x'), 0.0):.2f} "
                     f"lidar_lateral_err={_safe_float(local_payload.get('lateral_error'), 0.0):.3f} "
                     f"lidar_heading_err={_safe_float(local_payload.get('heading_error_deg'), 0.0):.1f} "

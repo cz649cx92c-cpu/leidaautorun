@@ -83,6 +83,9 @@ class RowEstimate:
     left_consecutive_bins: int = 0
     right_consecutive_bins: int = 0
     boundary_source: str = ""
+    paired_bins: int = 0
+    paired_residual_median: float = 0.0
+    paired_width_median: float = 0.0
 
 
 @dataclass
@@ -290,6 +293,53 @@ def _validate_side(points: np.ndarray, line: tuple[float, float] | None, bin_siz
     return True, "", residual_median, consecutive_bins, max_gap_x, line_length
 
 
+def _fit_paired_centerline(
+    center_points: np.ndarray,
+    widths: np.ndarray,
+    cfg: RowFollowerConfig,
+) -> tuple[bool, tuple[float, float] | None, np.ndarray, float, float]:
+    """Fit a corridor center from bins that contain both plant boundaries."""
+    required_bins = max(3, int(cfg.min_line_bins))
+    if len(center_points) < required_bins or len(widths) != len(center_points):
+        return False, None, np.empty((0, 2), dtype=np.float64), 0.0, 0.0
+
+    width_mask = (widths >= float(cfg.min_row_width)) & (widths <= float(cfg.max_row_width))
+    paired_points = center_points[width_mask]
+    paired_widths = widths[width_mask]
+    if len(paired_points) < required_bins:
+        return False, None, paired_points, 0.0, 0.0
+
+    line = _fit_line(paired_points)
+    if line is None:
+        return False, None, paired_points, 0.0, float(np.median(paired_widths))
+
+    # A flowerpot row is a sequence of arcs rather than a continuous wall.
+    # Reject isolated midpoint outliers, then validate the corridor axis.
+    residuals = np.abs(paired_points[:, 1] - (line[0] * paired_points[:, 0] + line[1]))
+    inlier_limit = max(0.05, min(0.08, float(cfg.bin_size) * 0.35))
+    inlier_mask = residuals <= inlier_limit
+    if int(np.count_nonzero(inlier_mask)) < required_bins:
+        return False, None, paired_points, float(np.median(residuals)), float(np.median(paired_widths))
+    paired_points = paired_points[inlier_mask]
+    paired_widths = paired_widths[inlier_mask]
+    line = _fit_line(paired_points)
+    if line is None or len(paired_points) < required_bins:
+        return False, None, paired_points, 0.0, 0.0
+
+    residual_median, _consecutive, max_gap_x, line_length = _line_stats(
+        paired_points,
+        line,
+        float(cfg.bin_size),
+    )
+    if residual_median > 0.05:
+        return False, None, paired_points, residual_median, float(np.median(paired_widths))
+    if max_gap_x > max(float(cfg.boundary_max_gap_x), float(cfg.bin_size) * 2.25):
+        return False, None, paired_points, residual_median, float(np.median(paired_widths))
+    if line_length < max(0.40, float(cfg.bin_size) * 2.0):
+        return False, None, paired_points, residual_median, float(np.median(paired_widths))
+    return True, line, paired_points, residual_median, float(np.median(paired_widths))
+
+
 def _soft_side_ok(
     points: np.ndarray,
     reject_reason: str,
@@ -354,6 +404,7 @@ def estimate_row_from_points(
     row_width_ref = float(cfg.row_width)
     candidate_centers: list[list[float]] = []
     paired_center_samples: list[list[float]] = []
+    paired_width_samples: list[float] = []
     left_samples: list[list[float]] = []
     right_samples: list[list[float]] = []
     reject_reasons: list[str] = []
@@ -389,6 +440,7 @@ def estimate_row_from_points(
             center_y = 0.5 * (left_inner_y + right_inner_y)
             candidate_centers.append([x_mid, center_y, row_width_ref, 2.0])
             paired_center_samples.append([x_mid, center_y])
+            paired_width_samples.append(float(left_inner_y - right_inner_y))
         elif left_inner_y is not None:
             center_y = float(left_inner_y - 0.5 * row_width_ref)
             candidate_centers.append([x_mid, center_y, row_width_ref, 1.0])
@@ -414,6 +466,25 @@ def estimate_row_from_points(
     )
     parallel_angle_diff_deg = 0.0
     width_error_m = 0.0
+    paired_center_points = (
+        np.asarray(paired_center_samples, dtype=np.float64)
+        if paired_center_samples
+        else np.empty((0, 2), dtype=np.float64)
+    )
+    paired_widths = (
+        np.asarray(paired_width_samples, dtype=np.float64)
+        if paired_width_samples
+        else np.empty((0,), dtype=np.float64)
+    )
+    (
+        paired_center_valid,
+        paired_center_line,
+        paired_center_inliers,
+        paired_residual_median,
+        paired_width_median,
+    ) = _fit_paired_centerline(paired_center_points, paired_widths, cfg)
+    if paired_widths.size:
+        width_error_m = float(np.max(np.abs(paired_widths - row_width_ref)))
 
     if left_valid and right_valid and left_line is not None and right_line is not None:
         parallel_angle_diff_deg = abs(math.degrees(math.atan(left_line[0])) - math.degrees(math.atan(right_line[0])))
@@ -445,7 +516,7 @@ def estimate_row_from_points(
 
     # If strict dual-side validation rejects both sides, but one side is still geometrically
     # usable, degrade to a single-side solution instead of forcing a full stop.
-    if not left_valid and not right_valid:
+    if not paired_center_valid and not left_valid and not right_valid:
         left_soft_ok = _soft_side_ok(left_points, left_reject_reason, left_residual_median, left_consecutive_bins)
         right_soft_ok = _soft_side_ok(right_points, right_reject_reason, right_residual_median, right_consecutive_bins)
         if left_soft_ok or right_soft_ok:
@@ -498,12 +569,17 @@ def estimate_row_from_points(
                 left_consecutive_bins=left_consecutive_bins,
                 right_consecutive_bins=right_consecutive_bins,
                 boundary_source="reject",
+                paired_bins=int(len(paired_center_inliers)),
+                paired_residual_median=paired_residual_median,
+                paired_width_median=paired_width_median,
             ),
             debug,
         )
 
     mode = "reject"
-    if left_valid and right_valid:
+    if paired_center_valid:
+        mode = "both_sides"
+    elif left_valid and right_valid:
         mode = "both_sides"
     elif left_valid:
         mode = "left_only"
@@ -511,7 +587,7 @@ def estimate_row_from_points(
         mode = "right_only"
     effective_mode = mode
 
-    row_width = row_width_ref
+    row_width = paired_width_median if paired_center_valid else row_width_ref
     virtual_left_points = np.empty((0, 2), dtype=np.float64)
     virtual_right_points = np.empty((0, 2), dtype=np.float64)
     virtual_center_points = np.empty((0, 2), dtype=np.float64)
@@ -523,20 +599,20 @@ def estimate_row_from_points(
         virtual_left_points = right_points.copy()
         virtual_left_points[:, 1] += row_width
         virtual_center_points = np.column_stack((right_points[:, 0], right_points[:, 1] + 0.5 * row_width))
-    paired_center_points = (
-        np.asarray(paired_center_samples, dtype=np.float64)
-        if paired_center_samples
-        else np.empty((0, 2), dtype=np.float64)
-    )
-    if effective_mode == "both_sides" and len(paired_center_points) >= 2:
+    if paired_center_valid:
+        center_fit_points = paired_center_inliers
+    elif effective_mode == "both_sides" and len(paired_center_points) >= 2:
         center_fit_points = paired_center_points
     elif effective_mode in {"left_only", "right_only"} and len(virtual_center_points) >= 2:
         center_fit_points = virtual_center_points
     else:
         center_fit_points = np.empty((0, 2), dtype=np.float64)
     candidates = np.asarray(candidate_centers, dtype=np.float64) if candidate_centers else np.empty((0, 4), dtype=np.float64)
-    center_line = _fit_line(center_fit_points)
-    if effective_mode == "left_only" and left_line is not None:
+    center_line = paired_center_line if paired_center_valid else _fit_line(center_fit_points)
+    if paired_center_valid and center_line is not None:
+        left_line = (center_line[0], center_line[1] + 0.5 * row_width)
+        right_line = (center_line[0], center_line[1] - 0.5 * row_width)
+    elif effective_mode == "left_only" and left_line is not None:
         center_line = (left_line[0], left_line[1] - 0.5 * row_width)
         right_line = (left_line[0], left_line[1] - row_width)
     elif effective_mode == "right_only" and right_line is not None:
@@ -663,7 +739,10 @@ def estimate_row_from_points(
                 right_residual_median=right_residual_median if np.isfinite(right_residual_median) else 0.0,
                 left_consecutive_bins=left_consecutive_bins,
                 right_consecutive_bins=right_consecutive_bins,
-                boundary_source=effective_mode,
+                boundary_source="paired_midpoints" if paired_center_valid else effective_mode,
+                paired_bins=int(len(paired_center_inliers)),
+                paired_residual_median=paired_residual_median,
+                paired_width_median=paired_width_median,
             ),
             debug,
         )
@@ -699,7 +778,10 @@ def estimate_row_from_points(
         right_residual_median=right_residual_median if np.isfinite(right_residual_median) else 0.0,
         left_consecutive_bins=left_consecutive_bins,
         right_consecutive_bins=right_consecutive_bins,
-        boundary_source=effective_mode,
+        boundary_source="paired_midpoints" if paired_center_valid else effective_mode,
+        paired_bins=int(len(paired_center_inliers)),
+        paired_residual_median=paired_residual_median,
+        paired_width_median=paired_width_median,
     )
     debug = RowDebugData(
         raw_points=raw_points,
