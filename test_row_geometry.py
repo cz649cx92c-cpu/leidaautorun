@@ -75,6 +75,34 @@ class PairedMidpointCenterlineTests(unittest.TestCase):
 
         self.assertNotEqual(estimate.boundary_source, "paired_midpoints")
 
+    @staticmethod
+    def _single_boundary_points(y: float) -> np.ndarray:
+        points: list[tuple[float, float]] = []
+        for idx in range(6):
+            x = 0.22 + 0.20 * idx
+            points.extend(((x - 0.025, y), (x + 0.025, y)))
+        return np.repeat(np.asarray(points, dtype=np.float64), 2, axis=0)
+
+    def test_left_boundary_uses_fixed_sixty_centimeter_channel(self) -> None:
+        estimate, _debug = estimate_row_from_points(
+            self._single_boundary_points(0.36), self.cfg, 0.60
+        )
+
+        self.assertTrue(estimate.found)
+        self.assertEqual(estimate.mode, "left_only")
+        self.assertAlmostEqual(estimate.center_line[1], 0.06, delta=0.01)
+        self.assertAlmostEqual(estimate.right_line[1], -0.24, delta=0.01)
+
+    def test_right_boundary_uses_fixed_sixty_centimeter_channel(self) -> None:
+        estimate, _debug = estimate_row_from_points(
+            self._single_boundary_points(-0.34), self.cfg, 0.60
+        )
+
+        self.assertTrue(estimate.found)
+        self.assertEqual(estimate.mode, "right_only")
+        self.assertAlmostEqual(estimate.center_line[1], -0.04, delta=0.01)
+        self.assertAlmostEqual(estimate.left_line[1], 0.26, delta=0.01)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -659,12 +659,28 @@ def create_tracker_with_retry(map_frame: str, base_frame: str, node_name: str, t
     raise RuntimeError(f'{stage_name} could not initialize the ROS TF tracker before timeout.')
 
 
-def ensure_can_ready(channel: str, bitrate: int) -> None:
-    state_path = Path('/sys/class/net') / channel / 'operstate'
-    if not state_path.exists():
-        raise RuntimeError(f'CAN channel not found: {channel}')
+def _can_interface_is_up(interface_path: Path) -> bool:
+    state_path = interface_path / 'operstate'
     state = state_path.read_text(encoding='utf-8').strip().lower()
     if state in {'up', 'unknown'}:
+        return True
+
+    # SocketCAN can remain operstate=down while it is administratively UP and
+    # receiving frames. Match the web UI and honor Linux's IFF_UP flag.
+    flags_path = interface_path / 'flags'
+    try:
+        flags = int(flags_path.read_text(encoding='utf-8').strip(), 0)
+    except (OSError, ValueError):
+        return False
+    return bool(flags & 0x1)
+
+
+def ensure_can_ready(channel: str, bitrate: int) -> None:
+    interface_path = Path('/sys/class/net') / channel
+    state_path = interface_path / 'operstate'
+    if not state_path.exists():
+        raise RuntimeError(f'CAN channel not found: {channel}')
+    if _can_interface_is_up(interface_path):
         return
 
     def _run_ip(cmd: list[str], *, allow_failure: bool = False) -> subprocess.CompletedProcess[str]:

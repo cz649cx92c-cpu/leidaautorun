@@ -692,6 +692,22 @@ class DirectLocalLidarController:
         follower_args.k_lat = float(args.lidar_k_lat)
         follower_args.k_heading = float(args.lidar_k_heading)
         follower_args.center_y_target = _config_float(config, "center_y_target", float(args.lidar_center_y_target))
+        follower_args.forward_center_left_offset_m = max(
+            0.0,
+            _config_float(
+                config,
+                "forward_center_left_offset_m",
+                float(args.lidar_forward_center_left_offset_m),
+            ),
+        )
+        follower_args.reverse_center_left_offset_m = max(
+            0.0,
+            _config_float(
+                config,
+                "reverse_center_left_offset_m",
+                float(args.lidar_reverse_center_left_offset_m),
+            ),
+        )
         follower_args.heading_conflict_error_y = float(args.lidar_heading_conflict_error_y)
         follower_args.heading_conflict_scale = float(args.lidar_heading_conflict_scale)
         follower_args.row_width = float(args.lidar_row_width)
@@ -764,6 +780,19 @@ class DirectLocalLidarController:
         follower_args.reverse_min_wz_deg = float(args.lidar_reverse_min_wz_deg)
         follower_args.reverse_min_wz_error_y = float(args.lidar_reverse_min_wz_error_y)
         follower_args.reverse_wz_enable_heading_deg = float(args.lidar_reverse_wz_enable_heading_deg)
+        follower_args.reverse_heading_conflict_error_y = float(
+            args.lidar_reverse_heading_conflict_error_y
+        )
+        follower_args.reverse_heading_max_ratio = float(args.lidar_reverse_heading_max_ratio)
+        follower_args.reverse_sign_flip_guard_error_y = float(
+            args.lidar_reverse_sign_flip_guard_error_y
+        )
+        follower_args.reverse_sign_flip_guard_last_wz_deg = float(
+            args.lidar_reverse_sign_flip_guard_last_wz_deg
+        )
+        follower_args.max_wz_delta_deg_per_cycle = float(
+            args.lidar_max_wz_delta_deg_per_cycle
+        )
         # Keep the reverse steering convention identical to the text
         # reference follower.  A positive/negative override here would make
         # the rear-lidar correction turn the wrong way.
@@ -925,6 +954,13 @@ class DirectLocalLidarController:
                     "filtered_center_y_m": round(float(estimate.center_y), 4),
                     "center_y_m": round(float(estimate.center_y), 4),
                     "center_error_m": round(center_error_m, 4),
+                    "center_y_target": _safe_float(self.last_debug.get("center_y_target"), 0.0),
+                    "forward_center_left_offset_m": _safe_float(
+                        self.last_debug.get("forward_center_left_offset_m"), 0.0
+                    ),
+                    "reverse_center_left_offset_m": _safe_float(
+                        self.last_debug.get("reverse_center_left_offset_m"), 0.0
+                    ),
                     "heading_deg": round(math.degrees(float(estimate.heading_rad)), 3),
                     "row_width_m": round(row_width_m, 4),
                     "left_boundary_dist_m": round(left_boundary_dist_m, 4),
@@ -966,6 +1002,10 @@ class DirectLocalLidarController:
                     ),
                     "paired_width_median": _safe_float(
                         self.last_debug.get("paired_width_median"), 0.0
+                    ),
+                    "control_phase": str(self.last_debug.get("control_phase", "") or ""),
+                    "control_using_last_good_line": bool(
+                        self.last_debug.get("control_using_last_good_line", False)
                     ),
                 }
                 payload.update(self._lidar_debug_fields())
@@ -3103,6 +3143,10 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     f"reverse_yaw_guard={reverse_yaw_guard_engaged} "
                     f"lidar_active={local_payload.get('active_lidar', '-')} "
                     f"lidar_fallback={bool(local_payload.get('lidar_fallback_active', False))} "
+                    f"lidar_fallback_allowed={bool(local_payload.get('cross_lidar_fallback_allowed', False))} "
+                    f"lidar_fallback_valid_frames={int(_safe_float(local_payload.get('fallback_valid_frames'), 0.0))} "
+                    f"lidar_both_lost={bool(local_payload.get('both_lidars_lost', False))} "
+                    f"lidar_control_phase={local_payload.get('control_phase', '-')} "
                     f"lidar_line_mode={local_payload.get('line_mode', '')} "
                     f"lidar_boundary_source={local_payload.get('boundary_source', '-')} "
                     f"lidar_paired_bins={int(_safe_float(local_payload.get('paired_bins'), 0.0))} "
@@ -3305,6 +3349,8 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-k-lat", type=float, default=1.2)
     parser.add_argument("--lidar-k-heading", type=float, default=0.45)
     parser.add_argument("--lidar-center-y-target", type=float, default=0.0)
+    parser.add_argument("--lidar-forward-center-left-offset-m", type=float, default=0.04)
+    parser.add_argument("--lidar-reverse-center-left-offset-m", type=float, default=0.05)
     parser.add_argument("--lidar-heading-conflict-error-y", type=float, default=0.012)
     parser.add_argument("--lidar-heading-conflict-scale", type=float, default=0.0)
     parser.add_argument("--lidar-row-width", type=float, default=0.60)
@@ -3355,12 +3401,17 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-forward-lost-hold-wz-scale", type=float, default=0.5)
     parser.add_argument("--lidar-forward-lost-hold-max-wz-deg", type=float, default=0.6)
     parser.add_argument("--lidar-reverse-speed", type=float, default=0.15)
-    parser.add_argument("--lidar-reverse-k-lat", type=float, default=14.0)
-    parser.add_argument("--lidar-reverse-k-heading", type=float, default=0.10)
-    parser.add_argument("--lidar-reverse-max-wz-deg", type=float, default=2.5)
-    parser.add_argument("--lidar-reverse-min-wz-deg", type=float, default=2.0)
+    parser.add_argument("--lidar-reverse-k-lat", type=float, default=24.0)
+    parser.add_argument("--lidar-reverse-k-heading", type=float, default=0.50)
+    parser.add_argument("--lidar-reverse-max-wz-deg", type=float, default=5.0)
+    parser.add_argument("--lidar-reverse-min-wz-deg", type=float, default=1.8)
     parser.add_argument("--lidar-reverse-min-wz-error-y", type=float, default=0.025)
-    parser.add_argument("--lidar-reverse-wz-enable-heading-deg", type=float, default=1.0)
+    parser.add_argument("--lidar-reverse-wz-enable-heading-deg", type=float, default=0.5)
+    parser.add_argument("--lidar-reverse-heading-conflict-error-y", type=float, default=0.01)
+    parser.add_argument("--lidar-reverse-heading-max-ratio", type=float, default=0.35)
+    parser.add_argument("--lidar-reverse-sign-flip-guard-error-y", type=float, default=0.02)
+    parser.add_argument("--lidar-reverse-sign-flip-guard-last-wz-deg", type=float, default=1.5)
+    parser.add_argument("--lidar-max-wz-delta-deg-per-cycle", type=float, default=1.0)
     parser.add_argument("--lidar-reverse-steer-sign", type=float, default=-1.0)
     parser.add_argument("--lidar-reverse-wz-filter-alpha", type=float, default=0.30)
     parser.add_argument("--lidar-reverse-exit-global-distance", type=float, default=1.50)
