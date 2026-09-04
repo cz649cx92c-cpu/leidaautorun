@@ -36,13 +36,53 @@ from sensor_msgs.msg import LaserScan  # noqa: E402
 from std_msgs.msg import String  # noqa: E402
 
 
-def enforce_local_min_wz(wz_rad: float, *, reverse: bool) -> tuple[float, bool]:
-    if reverse:
+FORWARD_LOCAL_MIN_WZ_DEG = 1.25
+
+
+def enforce_local_min_wz(
+    wz_rad: float,
+    *,
+    reverse: bool,
+    tracking_valid: bool = True,
+) -> tuple[float, bool]:
+    if reverse or not tracking_valid:
         return float(wz_rad), False
     wz_deg = math.degrees(float(wz_rad))
     if 1e-9 < abs(wz_deg) < 1.0:
-        return math.radians(math.copysign(2.5, wz_deg)), True
+        return math.radians(math.copysign(FORWARD_LOCAL_MIN_WZ_DEG, wz_deg)), True
     return float(wz_rad), False
+
+
+def limit_center_line_change(
+    previous: tuple[float, float],
+    current: tuple[float, float],
+    *,
+    reference_x: float,
+    max_center_delta_m: float,
+    max_heading_delta_deg: float,
+) -> tuple[tuple[float, float], bool]:
+    previous_heading_deg = math.degrees(math.atan(float(previous[0])))
+    current_heading_deg = math.degrees(math.atan(float(current[0])))
+    heading_delta_deg = current_heading_deg - previous_heading_deg
+    limited_heading_deg = previous_heading_deg + max(
+        -abs(float(max_heading_delta_deg)),
+        min(abs(float(max_heading_delta_deg)), heading_delta_deg),
+    )
+
+    previous_y = float(previous[0]) * float(reference_x) + float(previous[1])
+    current_y = float(current[0]) * float(reference_x) + float(current[1])
+    center_delta_m = current_y - previous_y
+    limited_y = previous_y + max(
+        -abs(float(max_center_delta_m)),
+        min(abs(float(max_center_delta_m)), center_delta_m),
+    )
+    limited_slope = math.tan(math.radians(limited_heading_deg))
+    limited_intercept = limited_y - limited_slope * float(reference_x)
+    limited = (
+        abs(limited_heading_deg - current_heading_deg) > 1e-9
+        or abs(limited_y - current_y) > 1e-9
+    )
+    return (limited_slope, limited_intercept), limited
 
 
 @dataclass
@@ -486,6 +526,7 @@ class PlantRowFollower(Node):
             safety_margin=float(args.safety_margin),
             center_jump_reject=float(args.center_jump_reject),
             one_side_center_jump_reject=float(args.one_side_center_jump_reject),
+            segmented_pot_boundary_recovery=True,
         )
         self.front_row_cfg = base_row_cfg
         self.rear_row_cfg = replace(
@@ -497,6 +538,7 @@ class PlantRowFollower(Node):
             scan_view_center_deg=0.0,
             scan_view_angle_deg=180.0,
             reflect_x_axis=True,
+            segmented_pot_boundary_recovery=False,
         )
         self.row_cfg = self.front_row_cfg
         initial_gear = self._normalized_gear()
@@ -874,24 +916,38 @@ class PlantRowFollower(Node):
         estimate.heading_jump_deg = heading_jump
 
         jump_reject_enabled = same_mode and self.last_good_center_line is not None
-        if jump_reject_enabled and center_jump > 0.06:
-            estimate.center_jump_rejected = True
-            estimate.warning = "center_jump_rejected"
-            estimate.center_line = self.last_good_center_line
-            estimate.left_line = self.last_good_left_line
-            estimate.right_line = self.last_good_right_line
-            estimate.center_y = float(self.last_good_center_y)
-            estimate.raw_center_y = float(self.last_good_center_y)
-            estimate.heading_rad = math.radians(float(self.last_good_heading_deg))
-        elif jump_reject_enabled and heading_jump > 8.0:
-            estimate.heading_jump_rejected = True
-            estimate.warning = "heading_jump_rejected"
-            estimate.center_line = self.last_good_center_line
-            estimate.left_line = self.last_good_left_line
-            estimate.right_line = self.last_good_right_line
-            estimate.center_y = float(self.last_good_center_y)
-            estimate.raw_center_y = float(self.last_good_center_y)
-            estimate.heading_rad = math.radians(float(self.last_good_heading_deg))
+        front_segmented_tracking = (
+            not bool(self.args.reverse)
+            and self.active_lidar == "front"
+            and bool(self.row_cfg.segmented_pot_boundary_recovery)
+        )
+        if jump_reject_enabled and (center_jump > 0.06 or heading_jump > 8.0):
+            estimate.center_jump_rejected = center_jump > 0.06
+            estimate.heading_jump_rejected = heading_jump > 8.0
+            if front_segmented_tracking and estimate.center_line is not None:
+                estimate.center_line, _limited = limit_center_line_change(
+                    self.last_good_center_line,
+                    estimate.center_line,
+                    reference_x=reference_x,
+                    max_center_delta_m=0.06,
+                    max_heading_delta_deg=8.0,
+                )
+                estimate.center_y = float(
+                    estimate.center_line[0] * reference_x + estimate.center_line[1]
+                )
+                estimate.raw_center_y = float(estimate.center_y)
+                estimate.heading_rad = float(math.atan(estimate.center_line[0]))
+                warning = "front_segmented_line_change_limited"
+            else:
+                warning = (
+                    "center_jump_rejected" if center_jump > 0.06 else "heading_jump_rejected"
+                )
+                estimate.center_line = self.last_good_center_line
+                estimate.left_line = self.last_good_left_line
+                estimate.right_line = self.last_good_right_line
+                estimate.center_y = float(self.last_good_center_y)
+                estimate.raw_center_y = float(self.last_good_center_y)
+                estimate.heading_rad = math.radians(float(self.last_good_heading_deg))
 
         filtered_center_limit = float(self.args.center_y_reject_abs)
         if valid_mode in {"left_only", "right_only"}:
@@ -976,6 +1032,9 @@ class PlantRowFollower(Node):
             ),
             "paired_width_median": float(
                 getattr(estimate, "paired_width_median", 0.0) or 0.0
+            ),
+            "segmented_boundary_recovered": bool(
+                getattr(estimate, "segmented_boundary_recovered", False)
             ),
         }
         payload.update(self._lidar_debug_fields())
@@ -1279,7 +1338,7 @@ class PlantRowFollower(Node):
             last_good_cmd_wz_deg=math.degrees(float(self.last_good_cmd.wz)),
             hold_vx=float(hold_cmd.vx),
             hold_wz_deg=hold_wz_deg,
-            control_using_last_good_line=True,
+            control_using_last_good_line=abs(hold_wz_deg) > 1e-9,
         )
         self._send_drive(hold_cmd.gear, float(hold_cmd.vx), float(hold_cmd.wz))
         return True
@@ -1299,10 +1358,15 @@ class PlantRowFollower(Node):
         gear = self._normalized_gear() if gear in {"6", "8"} else gear
         wz_before_min_boost_deg = math.degrees(float(wz))
         local_min_wz_boosted = False
+        forward_tracking_valid = (
+            bool(self.last_debug.get("found", False))
+            and str(self.last_debug.get("control_phase", "")) == "forward_tracking"
+        )
         if gear == "4t4d" and not bool(getattr(self, "_direct_command_active", False)):
             wz, local_min_wz_boosted = enforce_local_min_wz(
                 wz,
                 reverse=bool(self.args.reverse),
+                tracking_valid=forward_tracking_valid,
             )
         steering_angle = self.last_steering_angle
         steering_speed = 0.0
@@ -1390,7 +1454,7 @@ class PlantRowFollower(Node):
                     "send_body_wz_deg": cmd_wz_deg_s,
                     "wz_before_min_boost_deg": wz_before_min_boost_deg,
                     "local_min_wz_boosted": local_min_wz_boosted,
-                    "local_min_wz_deg": 2.5,
+                    "local_min_wz_deg": FORWARD_LOCAL_MIN_WZ_DEG,
                     "final_wz_rad": float(wz),
                     "final_wz_deg": cmd_wz_deg_s,
                     "send_steering_angle": steering_angle if steering_cmd is not None else runtime.get("send_steering_angle", None),
@@ -1492,7 +1556,10 @@ class PlantRowFollower(Node):
                     if bool(self.args.reverse)
                     else float(self.args.forward_lost_hold_max_wz_deg)
                 ),
-                wz_scale=1.0 if bool(self.args.reverse) else float(self.args.forward_lost_hold_wz_scale),
+                # With no fresh forward line there is no evidence for either
+                # steering direction. Keep moving, but do not preserve or
+                # amplify a stale turn while the scan recovers.
+                wz_scale=1.0 if bool(self.args.reverse) else 0.0,
                 max_age_s=None,
             ):
                 return
@@ -1614,6 +1681,9 @@ class PlantRowFollower(Node):
                         ),
                         "paired_width_median": round(
                             float(self.last_debug.get("paired_width_median", 0.0)), 4
+                        ),
+                        "segmented_boundary_recovered": bool(
+                            self.last_debug.get("segmented_boundary_recovered", False)
                         ),
                         "control_using_last_good_line": bool(self.last_debug.get("control_using_last_good_line", False)),
                         "final_vx": round(float(self.last_debug.get("final_vx", 0.0)), 4),

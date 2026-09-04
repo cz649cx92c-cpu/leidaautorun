@@ -9,11 +9,13 @@ from plant_lidar_centerline_follower import (
     BodyCommand,
     CommandSender,
     ControlState,
+    FORWARD_LOCAL_MIN_WZ_DEG,
     IOCommand,
     PlantRowFollower,
     RowEstimate,
     SteeringCommand,
     enforce_local_min_wz,
+    limit_center_line_change,
 )
 
 
@@ -149,17 +151,27 @@ class CommandSenderRemoteReleaseTests(unittest.TestCase):
 
 
 class LocalMinimumTurnTests(unittest.TestCase):
-    def test_small_right_turn_is_boosted_to_negative_two_point_five_degrees(self) -> None:
+    def test_small_right_turn_is_boosted_to_negative_minimum(self) -> None:
         wz, boosted = enforce_local_min_wz(math.radians(-0.8), reverse=False)
 
         self.assertTrue(boosted)
-        self.assertAlmostEqual(math.degrees(wz), -2.5)
+        self.assertAlmostEqual(math.degrees(wz), -FORWARD_LOCAL_MIN_WZ_DEG)
 
-    def test_small_left_turn_is_boosted_to_positive_two_point_five_degrees(self) -> None:
+    def test_small_left_turn_is_boosted_to_positive_minimum(self) -> None:
         wz, boosted = enforce_local_min_wz(math.radians(0.4), reverse=False)
 
         self.assertTrue(boosted)
-        self.assertAlmostEqual(math.degrees(wz), 2.5)
+        self.assertAlmostEqual(math.degrees(wz), FORWARD_LOCAL_MIN_WZ_DEG)
+
+    def test_lost_forward_line_does_not_boost_stale_turn(self) -> None:
+        wz, boosted = enforce_local_min_wz(
+            math.radians(0.4),
+            reverse=False,
+            tracking_valid=False,
+        )
+
+        self.assertFalse(boosted)
+        self.assertAlmostEqual(math.degrees(wz), 0.4)
 
     def test_zero_and_one_degree_commands_are_unchanged(self) -> None:
         zero_wz, zero_boosted = enforce_local_min_wz(0.0, reverse=False)
@@ -178,6 +190,66 @@ class LocalMinimumTurnTests(unittest.TestCase):
         self.assertFalse(right_boosted)
         self.assertAlmostEqual(math.degrees(left_wz), 0.5)
         self.assertAlmostEqual(math.degrees(right_wz), -0.5)
+
+
+class ForwardCenterLineChangeTests(unittest.TestCase):
+    def test_large_fresh_heading_change_is_limited_without_freezing_old_sign(self) -> None:
+        reference_x = 0.6
+        previous_heading_deg = 3.0
+        current_heading_deg = -12.0
+        previous_slope = math.tan(math.radians(previous_heading_deg))
+        current_slope = math.tan(math.radians(current_heading_deg))
+        previous = (previous_slope, 0.03 - previous_slope * reference_x)
+        current = (current_slope, -0.05 - current_slope * reference_x)
+
+        limited_line, limited = limit_center_line_change(
+            previous,
+            current,
+            reference_x=reference_x,
+            max_center_delta_m=0.06,
+            max_heading_delta_deg=8.0,
+        )
+
+        self.assertTrue(limited)
+        self.assertAlmostEqual(math.degrees(math.atan(limited_line[0])), -5.0)
+        limited_y = limited_line[0] * reference_x + limited_line[1]
+        self.assertAlmostEqual(limited_y, -0.03)
+
+
+class ForwardLostLineTests(unittest.TestCase):
+    def test_lost_line_keeps_forward_speed_but_clears_stale_turn(self) -> None:
+        node = PlantRowFollower.__new__(PlantRowFollower)
+        node.args = SimpleNamespace(gear="4t4d")
+        node.last_good_time = time.monotonic()
+        node.last_good_cmd = BodyCommand(
+            gear="4t4d",
+            vx=0.15,
+            vy=0.0,
+            wz=math.radians(0.8),
+        )
+        node.last_error_y = 0.03
+        node.last_good_heading_deg = 3.0
+        node.last_debug = {}
+        node._set_debug_snapshot = lambda **values: node.last_debug.update(values)
+        sent: list[BodyCommand] = []
+        node._send_drive = lambda gear, vx, wz: sent.append(
+            BodyCommand(gear=gear, vx=vx, vy=0.0, wz=wz)
+        )
+
+        held = node._hold_last_good_command(
+            estimate=RowEstimate(found=False, mode="reject"),
+            control_phase="lost_hold_forward",
+            stop_reason="no_valid_boundary",
+            warning="lost_hold",
+            wz_limit_deg=0.6,
+            wz_scale=0.0,
+            max_age_s=None,
+        )
+
+        self.assertTrue(held)
+        self.assertEqual(len(sent), 1)
+        self.assertAlmostEqual(sent[0].vx, 0.15)
+        self.assertAlmostEqual(math.degrees(sent[0].wz), 0.0)
 
 
 class ReverseSingleBoundaryControlTests(unittest.TestCase):

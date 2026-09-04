@@ -103,6 +103,50 @@ class PairedMidpointCenterlineTests(unittest.TestCase):
         self.assertAlmostEqual(estimate.center_line[1], -0.04, delta=0.01)
         self.assertAlmostEqual(estimate.left_line[1], 0.26, delta=0.01)
 
+    @staticmethod
+    def _segmented_pot_side_points(side: str) -> np.ndarray:
+        xs = [0.22 + 0.20 * idx for idx in range(6)]
+        magnitudes = [0.30, 0.40, 0.31, 0.41, 0.30, 0.40]
+        sign = 1.0 if side == "left" else -1.0
+        points: list[tuple[float, float]] = []
+        for x, magnitude in zip(xs, magnitudes):
+            points.extend(((x - 0.025, sign * magnitude), (x + 0.025, sign * magnitude)))
+        return np.repeat(np.asarray(points, dtype=np.float64), 2, axis=0)
+
+    def test_front_segmented_left_pot_arcs_recover_fixed_width_centerline(self) -> None:
+        self.cfg.segmented_pot_boundary_recovery = True
+
+        estimate, _debug = estimate_row_from_points(
+            self._segmented_pot_side_points("left"), self.cfg, 0.60
+        )
+
+        self.assertTrue(estimate.found)
+        self.assertEqual(estimate.mode, "left_only")
+        self.assertEqual(estimate.boundary_source, "segmented_pot_left")
+        self.assertTrue(estimate.segmented_boundary_recovered)
+        self.assertAlmostEqual(estimate.center_line[1], 0.0, delta=0.03)
+
+    def test_front_segmented_right_pot_arcs_recover_fixed_width_centerline(self) -> None:
+        self.cfg.segmented_pot_boundary_recovery = True
+
+        estimate, _debug = estimate_row_from_points(
+            self._segmented_pot_side_points("right"), self.cfg, 0.60
+        )
+
+        self.assertTrue(estimate.found)
+        self.assertEqual(estimate.mode, "right_only")
+        self.assertEqual(estimate.boundary_source, "segmented_pot_right")
+        self.assertTrue(estimate.segmented_boundary_recovered)
+        self.assertAlmostEqual(estimate.center_line[1], 0.0, delta=0.03)
+
+    def test_segmented_pot_recovery_is_disabled_by_default_for_reverse_rules(self) -> None:
+        estimate, _debug = estimate_row_from_points(
+            self._segmented_pot_side_points("left"), self.cfg, 0.60
+        )
+
+        self.assertFalse(estimate.found)
+        self.assertFalse(estimate.segmented_boundary_recovered)
+
 
 if __name__ == "__main__":
     unittest.main()

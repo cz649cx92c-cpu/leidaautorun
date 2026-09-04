@@ -44,6 +44,7 @@ class RowFollowerConfig:
     scan_view_center_deg: float = 0.0
     scan_view_angle_deg: float = 360.0
     reflect_x_axis: bool = False
+    segmented_pot_boundary_recovery: bool = False
 
 
 @dataclass
@@ -86,6 +87,7 @@ class RowEstimate:
     paired_bins: int = 0
     paired_residual_median: float = 0.0
     paired_width_median: float = 0.0
+    segmented_boundary_recovered: bool = False
 
 
 @dataclass
@@ -293,6 +295,67 @@ def _validate_side(points: np.ndarray, line: tuple[float, float] | None, bin_siz
     return True, "", residual_median, consecutive_bins, max_gap_x, line_length
 
 
+def _fit_segmented_pot_boundary(
+    points: np.ndarray,
+    cfg: RowFollowerConfig,
+    *,
+    side: str,
+) -> tuple[tuple[float, float] | None, float, int, float, float]:
+    """Recover a straight row axis from discontinuous circular pot returns."""
+    if points is None or len(points) < 3:
+        return None, float("inf"), 0, float("inf"), 0.0
+
+    pts = points[np.argsort(points[:, 0])]
+    line_length = float(pts[-1, 0] - pts[0, 0])
+    if line_length < max(0.35, float(cfg.bin_size) * 1.5):
+        return None, float("inf"), 0, float("inf"), line_length
+
+    min_pair_dx = max(0.30, float(cfg.bin_size) * 1.5)
+    slopes: list[float] = []
+    for left_index in range(len(pts) - 1):
+        for right_index in range(left_index + 1, len(pts)):
+            dx = float(pts[right_index, 0] - pts[left_index, 0])
+            if dx >= min_pair_dx:
+                slopes.append(float((pts[right_index, 1] - pts[left_index, 1]) / dx))
+    if not slopes:
+        return None, float("inf"), 0, float("inf"), line_length
+
+    slope = float(np.median(np.asarray(slopes, dtype=np.float64)))
+    if abs(math.degrees(math.atan(slope))) > 25.0:
+        return None, float("inf"), 0, float("inf"), line_length
+
+    intercept_samples = pts[:, 1] - slope * pts[:, 0]
+    # Use the corridor-facing envelope so the periodic bulge of each round
+    # pot does not move the inferred 60 cm channel inward.
+    percentile = 30.0 if side == "left" else 70.0
+    intercept = float(np.percentile(intercept_samples, percentile))
+    line = (slope, intercept)
+    residuals = np.abs(pts[:, 1] - (slope * pts[:, 0] + intercept))
+    inlier_limit = max(0.06, min(0.09, float(cfg.bin_size) * 0.45))
+    inlier_mask = residuals <= inlier_limit
+    inlier_count = int(np.count_nonzero(inlier_mask))
+    if inlier_count < 3:
+        return None, float(np.median(residuals)), inlier_count, float("inf"), line_length
+
+    inliers = pts[inlier_mask]
+    xs = np.sort(inliers[:, 0])
+    gaps = np.diff(xs)
+    max_gap_x = float(np.max(gaps)) if gaps.size else float("inf")
+    if max_gap_x > max(float(cfg.boundary_max_gap_x), float(cfg.bin_size) * 2.5):
+        return None, float(np.median(residuals[inlier_mask])), inlier_count, max_gap_x, line_length
+
+    safe_inner = _safe_inner_limit(cfg)
+    sample_xs = (float(cfg.forward_min), float(cfg.forward_max))
+    sample_ys = [slope * x + intercept for x in sample_xs]
+    side_tolerance = 0.03
+    if side == "left" and min(sample_ys) < safe_inner - side_tolerance:
+        return None, float(np.median(residuals[inlier_mask])), inlier_count, max_gap_x, line_length
+    if side == "right" and max(sample_ys) > -safe_inner + side_tolerance:
+        return None, float(np.median(residuals[inlier_mask])), inlier_count, max_gap_x, line_length
+
+    return line, float(np.median(residuals[inlier_mask])), inlier_count, max_gap_x, line_length
+
+
 def _fit_paired_centerline(
     center_points: np.ndarray,
     widths: np.ndarray,
@@ -486,6 +549,28 @@ def estimate_row_from_points(
     if paired_widths.size:
         width_error_m = float(np.max(np.abs(paired_widths - row_width_ref)))
 
+    segmented_left_recovered = False
+    segmented_right_recovered = False
+    if bool(cfg.segmented_pot_boundary_recovery):
+        if not left_valid:
+            recovered = _fit_segmented_pot_boundary(left_points, cfg, side="left")
+            if recovered[0] is not None:
+                left_line = recovered[0]
+                left_residual_median = recovered[1]
+                left_consecutive_bins = recovered[2]
+                left_valid = True
+                left_reject_reason = ""
+                segmented_left_recovered = True
+        if not right_valid:
+            recovered = _fit_segmented_pot_boundary(right_points, cfg, side="right")
+            if recovered[0] is not None:
+                right_line = recovered[0]
+                right_residual_median = recovered[1]
+                right_consecutive_bins = recovered[2]
+                right_valid = True
+                right_reject_reason = ""
+                segmented_right_recovered = True
+
     if left_valid and right_valid and left_line is not None and right_line is not None:
         parallel_angle_diff_deg = abs(math.degrees(math.atan(left_line[0])) - math.degrees(math.atan(right_line[0])))
         if parallel_angle_diff_deg > 10.0:
@@ -586,6 +671,19 @@ def estimate_row_from_points(
     elif right_valid:
         mode = "right_only"
     effective_mode = mode
+    segmented_left_used = segmented_left_recovered and left_valid
+    segmented_right_used = segmented_right_recovered and right_valid
+    segmented_boundary_recovered = segmented_left_used or segmented_right_used
+    if paired_center_valid:
+        boundary_source = "paired_midpoints"
+    elif segmented_left_used and segmented_right_used:
+        boundary_source = "segmented_pot_both_sides"
+    elif segmented_left_used:
+        boundary_source = "segmented_pot_left"
+    elif segmented_right_used:
+        boundary_source = "segmented_pot_right"
+    else:
+        boundary_source = effective_mode
 
     row_width = paired_width_median if paired_center_valid else row_width_ref
     virtual_left_points = np.empty((0, 2), dtype=np.float64)
@@ -739,10 +837,11 @@ def estimate_row_from_points(
                 right_residual_median=right_residual_median if np.isfinite(right_residual_median) else 0.0,
                 left_consecutive_bins=left_consecutive_bins,
                 right_consecutive_bins=right_consecutive_bins,
-                boundary_source="paired_midpoints" if paired_center_valid else effective_mode,
+                boundary_source=boundary_source,
                 paired_bins=int(len(paired_center_inliers)),
                 paired_residual_median=paired_residual_median,
                 paired_width_median=paired_width_median,
+                segmented_boundary_recovered=segmented_boundary_recovered,
             ),
             debug,
         )
@@ -778,10 +877,11 @@ def estimate_row_from_points(
         right_residual_median=right_residual_median if np.isfinite(right_residual_median) else 0.0,
         left_consecutive_bins=left_consecutive_bins,
         right_consecutive_bins=right_consecutive_bins,
-        boundary_source="paired_midpoints" if paired_center_valid else effective_mode,
+        boundary_source=boundary_source,
         paired_bins=int(len(paired_center_inliers)),
         paired_residual_median=paired_residual_median,
         paired_width_median=paired_width_median,
+        segmented_boundary_recovered=segmented_boundary_recovered,
     )
     debug = RowDebugData(
         raw_points=raw_points,
