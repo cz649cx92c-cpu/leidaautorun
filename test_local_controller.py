@@ -350,5 +350,17 @@ class ReverseSingleBoundaryControlTests(unittest.TestCase):
         self.assertAlmostEqual(self.node.last_debug["track_error_y"], 0.0)
 
 
+class PotStopFreezeTests(unittest.TestCase):
+    def test_active_photo_stop_does_not_process_new_scan(self) -> None:
+        node = PlantRowFollower.__new__(PlantRowFollower)
+        node.pot_stop_active = True
+        node.pot_stop_until = 12.0
+        node.pot_last_scan_seq = 7
+
+        node._update_pot_counting(object(), scan_seq=8, now=10.0)
+
+        self.assertEqual(node.pot_last_scan_seq, 7)
+
+
 if __name__ == "__main__":
     unittest.main()

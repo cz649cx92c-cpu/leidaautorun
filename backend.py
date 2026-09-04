@@ -773,6 +773,13 @@ class DirectLocalLidarController:
         follower_args.forward_lost_stop_sec = float(args.lidar_forward_lost_stop_sec)
         follower_args.forward_lost_hold_wz_scale = float(args.lidar_forward_lost_hold_wz_scale)
         follower_args.forward_lost_hold_max_wz_deg = float(args.lidar_forward_lost_hold_max_wz_deg)
+        follower_args.pot_stop_every = max(1, int(args.lidar_pot_stop_every))
+        follower_args.pot_stop_hold_sec = max(0.0, float(args.lidar_pot_stop_hold_sec))
+        follower_args.pot_count_line_x = float(args.lidar_pot_count_line_x)
+        follower_args.pot_min_station_spacing_m = max(
+            0.10,
+            float(args.lidar_pot_min_station_spacing_m),
+        )
         follower_args.reverse_speed = float(args.lidar_reverse_speed)
         follower_args.reverse_k_lat = float(args.lidar_reverse_k_lat)
         follower_args.reverse_k_heading = float(args.lidar_reverse_k_heading)
@@ -942,6 +949,8 @@ class DirectLocalLidarController:
                     state = "TRACK" if estimate.found else "SEARCH"
                     if bool(self.waiting_for_new_scan):
                         state = "HOLD"
+                    elif bool(self.pot_stop_active):
+                        state = "HOLD"
                 payload = {
                     "state": state,
                     "found": bool(estimate.found),
@@ -1009,6 +1018,7 @@ class DirectLocalLidarController:
                     ),
                 }
                 payload.update(self._lidar_debug_fields())
+                payload.update(self._pot_debug_fields())
                 with controller._status_lock:
                     controller._status = LineStatus(
                         state=state,
@@ -1061,6 +1071,8 @@ class DirectLocalLidarController:
         target_center_offset_px: float = 0.0,
         vehicle_direction_angle_deg: float = 0.0,
         allow_cross_lidar_fallback: bool = False,
+        count_pots: bool = False,
+        pot_progress_m: float | None = None,
     ) -> None:
         del gear, target_center_offset_px, vehicle_direction_angle_deg
         was_enabled = bool(self._node.drive_enable)
@@ -1078,11 +1090,16 @@ class DirectLocalLidarController:
             self._node.drive_enable = False
             self._node.args.reverse = bool(reverse)
             self._node.prepare_lidar_switch(bool(reverse))
+        self._node.args.reverse = bool(reverse)
         self._node.drive_enable = bool(enable)
         self._node.set_cross_lidar_fallback_allowed(
             bool(enable) and bool(allow_cross_lidar_fallback)
         )
-        self._node.args.reverse = bool(reverse)
+        pot_counting_enabled = bool(enable) and bool(count_pots) and not bool(reverse)
+        self._node.set_pot_counting_context(
+            pot_counting_enabled,
+            pot_progress_m if pot_counting_enabled else None,
+        )
         self._node.args.low_beam = bool(low_beam)
         if reverse:
             self._node.args.reverse_speed = abs(float(cruise_vx))
@@ -1093,6 +1110,8 @@ class DirectLocalLidarController:
 
     def set_global_owner(self, active: bool) -> None:
         active = bool(active)
+        if active:
+            self._node.set_pot_counting_context(False, None)
         with self._owner_lock:
             if active == self._global_owner:
                 return
@@ -3040,6 +3059,22 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                         # switching, so a brief rear dropout does not flap roles.
                         or reversing_here
                     ),
+                    count_pots=(
+                        bool(args.lidar_pot_stop_enabled)
+                        and not reversing_here
+                        and current_segment is not None
+                        and not row_entry_assist.lidar_pending
+                        and not row_entry_assist.lidar_tracking
+                    ),
+                    pot_progress_m=(
+                        float(along)
+                        if bool(args.lidar_pot_stop_enabled)
+                        and not reversing_here
+                        and current_segment is not None
+                        and not row_entry_assist.lidar_pending
+                        and not row_entry_assist.lidar_tracking
+                        else None
+                    ),
                 )
                 local_status = local_controller.status_snapshot()
                 local_cmd = local_controller.cmd_snapshot()
@@ -3147,6 +3182,15 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     f"lidar_fallback_valid_frames={int(_safe_float(local_payload.get('fallback_valid_frames'), 0.0))} "
                     f"lidar_both_lost={bool(local_payload.get('both_lidars_lost', False))} "
                     f"lidar_control_phase={local_payload.get('control_phase', '-')} "
+                    f"pot_counting={bool(local_payload.get('pot_counting_enabled', False))} "
+                    f"pot_progress={_safe_float(local_payload.get('pot_forward_progress_m'), 0.0):.2f} "
+                    f"pot_visible={int(_safe_float(local_payload.get('pot_visible_station_count'), 0.0))} "
+                    f"pot_group={int(_safe_float(local_payload.get('pot_count_in_group'), 0.0))}/"
+                    f"{int(_safe_float(local_payload.get('pot_stop_every'), 3.0))} "
+                    f"pot_total={int(_safe_float(local_payload.get('pot_total_count'), 0.0))} "
+                    f"pot_stop={bool(local_payload.get('pot_stop_active', False))} "
+                    f"pot_stop_seq={int(_safe_float(local_payload.get('pot_stop_sequence'), 0.0))} "
+                    f"pot_event={local_payload.get('pot_last_event', '-')} "
                     f"lidar_line_mode={local_payload.get('line_mode', '')} "
                     f"lidar_boundary_source={local_payload.get('boundary_source', '-')} "
                     f"lidar_paired_bins={int(_safe_float(local_payload.get('paired_bins'), 0.0))} "
@@ -3249,6 +3293,22 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                             "left_clearance_m": _safe_float(local_payload.get("left_clearance_m"), 0.0),
                             "right_clearance_m": _safe_float(local_payload.get("right_clearance_m"), 0.0),
                             "reject_reason": str(local_payload.get("reject_reason") or ""),
+                            "pot_counting_enabled": bool(
+                                local_payload.get("pot_counting_enabled", False)
+                            ),
+                            "pot_visible_station_count": int(
+                                _safe_float(local_payload.get("pot_visible_station_count"), 0.0)
+                            ),
+                            "pot_count_in_group": int(
+                                _safe_float(local_payload.get("pot_count_in_group"), 0.0)
+                            ),
+                            "pot_total_count": int(
+                                _safe_float(local_payload.get("pot_total_count"), 0.0)
+                            ),
+                            "pot_stop_active": bool(local_payload.get("pot_stop_active", False)),
+                            "pot_stop_sequence": int(
+                                _safe_float(local_payload.get("pot_stop_sequence"), 0.0)
+                            ),
                         },
                     },
                 )
@@ -3400,6 +3460,11 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-forward-lost-stop-sec", type=float, default=0.50)
     parser.add_argument("--lidar-forward-lost-hold-wz-scale", type=float, default=0.5)
     parser.add_argument("--lidar-forward-lost-hold-max-wz-deg", type=float, default=0.6)
+    parser.add_argument("--lidar-pot-stop-enabled", action="store_true")
+    parser.add_argument("--lidar-pot-stop-every", type=int, default=3)
+    parser.add_argument("--lidar-pot-stop-hold-sec", type=float, default=2.0)
+    parser.add_argument("--lidar-pot-count-line-x", type=float, default=0.45)
+    parser.add_argument("--lidar-pot-min-station-spacing-m", type=float, default=0.24)
     parser.add_argument("--lidar-reverse-speed", type=float, default=0.15)
     parser.add_argument("--lidar-reverse-k-lat", type=float, default=24.0)
     parser.add_argument("--lidar-reverse-k-heading", type=float, default=0.50)

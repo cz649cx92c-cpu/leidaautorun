@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from backend import build_parser
 from core_backend import _can_interface_is_up
 
 
@@ -24,6 +25,22 @@ class CanInterfaceReadinessTests(unittest.TestCase):
         interface = self._interface(operstate="down\n", flags="0x40080\n")
 
         self.assertFalse(_can_interface_is_up(interface))
+
+
+class PotStopFlagTests(unittest.TestCase):
+    @staticmethod
+    def _parse(*extra: str):
+        return build_parser().parse_args(
+            ["autorun", "--db", "map.bin", "--mission", "mission.json", *extra]
+        )
+
+    def test_pot_stop_is_disabled_by_default(self) -> None:
+        self.assertFalse(self._parse().lidar_pot_stop_enabled)
+
+    def test_pot_stop_can_be_enabled_explicitly(self) -> None:
+        self.assertTrue(
+            self._parse("--lidar-pot-stop-enabled").lidar_pot_stop_enabled
+        )
 
 
 if __name__ == "__main__":

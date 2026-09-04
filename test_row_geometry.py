@@ -3,7 +3,12 @@ import unittest
 
 import numpy as np
 
-from row_geometry import RowFollowerConfig, estimate_row_from_points
+from row_geometry import (
+    PotPassCounter,
+    RowFollowerConfig,
+    detect_pot_station_xs,
+    estimate_row_from_points,
+)
 
 
 class PairedMidpointCenterlineTests(unittest.TestCase):
@@ -146,6 +151,99 @@ class PairedMidpointCenterlineTests(unittest.TestCase):
 
         self.assertFalse(estimate.found)
         self.assertFalse(estimate.segmented_boundary_recovered)
+
+
+class PotCountingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cfg = RowFollowerConfig(
+            forward_min=0.15,
+            forward_max=1.60,
+            lateral_limit=0.75,
+            vehicle_half_width=0.20,
+            safety_margin=0.04,
+        )
+
+    @staticmethod
+    def _arc_points(station_xs: list[float], *, include_right: bool = True) -> np.ndarray:
+        points: list[tuple[float, float]] = []
+        # This follows LaserScan angular order: left is far-to-near and right
+        # is near-to-far for objects in front of the vehicle.
+        for x in reversed(station_xs):
+            points.extend(((x + 0.04, 0.32), (x, 0.28), (x - 0.04, 0.32)))
+        if include_right:
+            for x in station_xs:
+                points.extend(((x - 0.04, -0.32), (x, -0.28), (x + 0.04, -0.32)))
+        return np.asarray(points, dtype=np.float64)
+
+    def test_paired_pot_arcs_are_merged_into_longitudinal_stations(self) -> None:
+        stations = detect_pot_station_xs(
+            self._arc_points([0.35, 0.65, 0.95, 1.25]), self.cfg
+        )
+
+        self.assertEqual(len(stations), 4)
+        np.testing.assert_allclose(stations, [0.35, 0.65, 0.95, 1.25], atol=0.02)
+
+    def test_one_visible_side_still_produces_one_station_per_pot(self) -> None:
+        stations = detect_pot_station_xs(
+            self._arc_points([0.40, 0.75, 1.10], include_right=False), self.cfg
+        )
+
+        self.assertEqual(len(stations), 3)
+        np.testing.assert_allclose(stations, [0.40, 0.75, 1.10], atol=0.02)
+
+    def test_station_is_counted_once_when_it_crosses_vehicle_count_line(self) -> None:
+        counter = PotPassCounter(count_line_x=0.45)
+
+        self.assertEqual(counter.update([0.72], vehicle_progress_m=0.00), 0)
+        self.assertEqual(counter.update([0.58], vehicle_progress_m=0.14), 0)
+        self.assertEqual(counter.update([0.48], vehicle_progress_m=0.24), 0)
+        self.assertEqual(counter.update([0.43], vehicle_progress_m=0.29), 1)
+        self.assertEqual(counter.update([0.40], vehicle_progress_m=0.32), 0)
+        self.assertEqual(counter.total_count, 1)
+
+    def test_new_far_station_does_not_attach_to_already_passed_station(self) -> None:
+        counter = PotPassCounter(count_line_x=0.45)
+        for progress_m, station_x in ((0.00, 0.70), (0.18, 0.52), (0.27, 0.43)):
+            counter.update([station_x], vehicle_progress_m=progress_m)
+
+        self.assertEqual(counter.total_count, 1)
+        self.assertEqual(counter.update([0.62], vehicle_progress_m=0.43), 0)
+        self.assertEqual(counter.update([0.50], vehicle_progress_m=0.55), 0)
+        self.assertEqual(counter.update([0.42], vehicle_progress_m=0.63), 1)
+        self.assertEqual(counter.total_count, 2)
+
+    def test_stationary_point_cloud_jitter_cannot_create_a_count(self) -> None:
+        counter = PotPassCounter(count_line_x=0.45)
+
+        for station_x in (0.72, 0.55, 0.43, 0.56, 0.41, 0.53, 0.42):
+            counter.update([station_x], vehicle_progress_m=1.00)
+
+        self.assertEqual(counter.total_count, 0)
+
+    def test_shifted_duplicate_track_is_suppressed_by_station_spacing(self) -> None:
+        counter = PotPassCounter(count_line_x=0.45, min_station_spacing_m=0.24)
+        for progress_m, station_x in ((0.00, 0.72), (0.15, 0.57), (0.29, 0.43)):
+            counter.update([station_x], vehicle_progress_m=progress_m)
+        self.assertEqual(counter.total_count, 1)
+
+        # The same arc is reconstructed 19 cm farther down the row, outside
+        # association tolerance but still inside physical pot spacing.
+        for progress_m, station_x in ((0.35, 0.56), (0.45, 0.46), (0.50, 0.41)):
+            counter.update([station_x], vehicle_progress_m=progress_m)
+
+        self.assertEqual(counter.total_count, 1)
+
+    def test_reset_clears_row_count_before_row_change(self) -> None:
+        counter = PotPassCounter(count_line_x=0.45)
+        for progress_m, station_x in ((0.00, 0.70), (0.18, 0.52), (0.27, 0.43)):
+            counter.update([station_x], vehicle_progress_m=progress_m)
+        self.assertEqual(counter.total_count, 1)
+
+        counter.reset()
+
+        self.assertEqual(counter.total_count, 0)
+        self.assertEqual(counter.tracks, [])
+        self.assertEqual(counter.counted_station_positions, [])
 
 
 if __name__ == "__main__":

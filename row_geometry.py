@@ -108,6 +108,139 @@ class RowDebugData:
     candidate_right_line: tuple[float, float] | None = None
 
 
+@dataclass
+class _PotStationTrack:
+    station_position_m: float
+    latest_relative_x: float
+    first_progress_m: float
+    seen_frames: int = 1
+    missed_frames: int = 0
+    armed: bool = False
+    counted: bool = False
+
+
+class PotPassCounter:
+    """Count unique pot stations as they cross a line ahead of the vehicle."""
+
+    def __init__(
+        self,
+        *,
+        count_line_x: float = 0.45,
+        arm_margin_m: float = 0.05,
+        match_distance_m: float = 0.16,
+        min_station_spacing_m: float = 0.24,
+        min_progress_before_count_m: float = 0.04,
+        max_missed_frames: int = 20,
+    ) -> None:
+        self.count_line_x = float(count_line_x)
+        self.arm_margin_m = max(0.01, float(arm_margin_m))
+        self.match_distance_m = max(0.05, float(match_distance_m))
+        self.min_station_spacing_m = max(0.10, float(min_station_spacing_m))
+        self.min_progress_before_count_m = max(0.02, float(min_progress_before_count_m))
+        self.max_missed_frames = max(1, int(max_missed_frames))
+        self.tracks: list[_PotStationTrack] = []
+        self.counted_station_positions: list[float] = []
+        self.total_count = 0
+
+    def reset(self) -> None:
+        self.tracks.clear()
+        self.counted_station_positions.clear()
+        self.total_count = 0
+
+    def update(self, station_xs: list[float], *, vehicle_progress_m: float) -> int:
+        progress_m = float(vehicle_progress_m)
+        if not np.isfinite(progress_m):
+            return 0
+        detections = sorted(
+            (progress_m + float(x), float(x))
+            for x in station_xs
+            if np.isfinite(x)
+        )
+        unmatched_tracks = set(range(len(self.tracks)))
+        matches: list[tuple[int, float, float]] = []
+        new_detections: list[tuple[float, float]] = []
+
+        for station_position_m, relative_x in detections:
+            candidates = [
+                (
+                    abs(self.tracks[index].station_position_m - station_position_m),
+                    index,
+                )
+                for index in unmatched_tracks
+                if abs(self.tracks[index].station_position_m - station_position_m)
+                <= self.match_distance_m
+            ]
+            if not candidates:
+                new_detections.append((station_position_m, relative_x))
+                continue
+            _distance, track_index = min(candidates)
+            unmatched_tracks.remove(track_index)
+            matches.append((track_index, station_position_m, relative_x))
+
+        arm_x = self.count_line_x + self.arm_margin_m
+        observed_track_indexes: list[int] = []
+        for track_index, station_position_m, relative_x in matches:
+            track = self.tracks[track_index]
+            track.station_position_m = (
+                0.75 * float(track.station_position_m) + 0.25 * station_position_m
+            )
+            track.latest_relative_x = relative_x
+            track.seen_frames += 1
+            track.missed_frames = 0
+            if relative_x >= arm_x:
+                track.armed = True
+            observed_track_indexes.append(track_index)
+
+        for track_index in unmatched_tracks:
+            self.tracks[track_index].missed_frames += 1
+
+        for station_position_m, relative_x in new_detections:
+            self.tracks.append(
+                _PotStationTrack(
+                    station_position_m=station_position_m,
+                    latest_relative_x=relative_x,
+                    first_progress_m=progress_m,
+                    armed=relative_x >= arm_x,
+                )
+            )
+            observed_track_indexes.append(len(self.tracks) - 1)
+
+        newly_counted = 0
+        for track_index in observed_track_indexes:
+            track = self.tracks[track_index]
+            progressed_enough = (
+                progress_m - float(track.first_progress_m)
+                >= self.min_progress_before_count_m
+            )
+            if (
+                not track.armed
+                or track.counted
+                or track.seen_frames < 3
+                or track.latest_relative_x > self.count_line_x
+                or not progressed_enough
+            ):
+                continue
+            track.counted = True
+            duplicate_station = any(
+                abs(track.station_position_m - counted_position)
+                < self.min_station_spacing_m
+                for counted_position in self.counted_station_positions
+            )
+            if duplicate_station:
+                continue
+            self.counted_station_positions.append(float(track.station_position_m))
+            self.total_count += 1
+            newly_counted += 1
+
+        self.tracks = [
+            track
+            for track in self.tracks
+            if track.missed_frames <= self.max_missed_frames
+            and track.station_position_m >= progress_m + self.count_line_x - 0.30
+        ]
+        return newly_counted
+
+
 def _empty_debug(raw_points: np.ndarray, web_points: np.ndarray, points: np.ndarray) -> RowDebugData:
     return RowDebugData(
         raw_points=raw_points,
@@ -218,6 +351,105 @@ def filter_points_for_row(raw_points: np.ndarray, cfg: RowFollowerConfig) -> np.
     if not np.any(mask):
         return np.empty((0, 2), dtype=np.float64)
     return raw_points[mask]
+
+
+def _pot_arc_cluster_centers(
+    points: np.ndarray,
+    *,
+    side: str,
+    join_distance_m: float,
+    min_points: int,
+) -> list[float]:
+    if points.size == 0:
+        return []
+    if side == "left":
+        side_points = points[points[:, 1] > 0.0]
+    else:
+        side_points = points[points[:, 1] < 0.0]
+    if len(side_points) < min_points:
+        return []
+
+    clusters: list[list[np.ndarray]] = []
+    current: list[np.ndarray] = []
+    previous: np.ndarray | None = None
+    for point in side_points:
+        if previous is None or float(np.linalg.norm(point - previous)) <= join_distance_m:
+            current.append(point)
+        else:
+            if current:
+                clusters.append(current)
+            current = [point]
+        previous = point
+    if current:
+        clusters.append(current)
+
+    centers: list[float] = []
+    for cluster in clusters:
+        if len(cluster) < min_points:
+            continue
+        array = np.asarray(cluster, dtype=np.float64)
+        x_span = float(np.ptp(array[:, 0]))
+        y_span = float(np.ptp(array[:, 1]))
+        # A pot return is a compact arc. Long connected structures are not
+        # allowed to become a sequence of synthetic pot counts.
+        if x_span > 0.36 or y_span > 0.30:
+            continue
+        centers.append(float(np.median(array[:, 0])))
+    return centers
+
+
+def detect_pot_station_xs(raw_points: np.ndarray, cfg: RowFollowerConfig) -> list[float]:
+    """Return longitudinal centers of visible pot stations in the row."""
+    body_filtered = _exclude_robot_frame(
+        raw_points,
+        reflect_x_axis=bool(cfg.reflect_x_axis),
+    )
+    points = filter_points_for_row(body_filtered, cfg)
+    if points.size == 0:
+        return []
+
+    safe_inner = _safe_inner_limit(cfg)
+    boundary_mask = np.abs(points[:, 1]) >= max(0.18, safe_inner - 0.04)
+    boundary_points = points[boundary_mask]
+    if len(boundary_points) < 3:
+        return []
+
+    left_centers = _pot_arc_cluster_centers(
+        boundary_points,
+        side="left",
+        join_distance_m=0.13,
+        min_points=3,
+    )
+    right_centers = _pot_arc_cluster_centers(
+        boundary_points,
+        side="right",
+        join_distance_m=0.13,
+        min_points=3,
+    )
+
+    stations: list[float] = []
+    unmatched_right = set(range(len(right_centers)))
+    for left_x in sorted(left_centers):
+        candidates = [
+            (abs(left_x - right_centers[index]), index)
+            for index in unmatched_right
+            if abs(left_x - right_centers[index]) <= 0.18
+        ]
+        if candidates:
+            _distance, right_index = min(candidates)
+            unmatched_right.remove(right_index)
+            stations.append(0.5 * (left_x + right_centers[right_index]))
+        else:
+            stations.append(left_x)
+    stations.extend(right_centers[index] for index in unmatched_right)
+
+    merged: list[float] = []
+    for station_x in sorted(stations):
+        if merged and station_x - merged[-1] < 0.14:
+            merged[-1] = 0.5 * (merged[-1] + station_x)
+        else:
+            merged.append(float(station_x))
+    return merged
 
 
 def _safe_inner_limit(cfg: RowFollowerConfig) -> float:

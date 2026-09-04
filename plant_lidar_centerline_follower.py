@@ -22,12 +22,15 @@ if str(CONTROL_ROOT) not in sys.path:
 from fw_mini_controller import BodyCommand, FWMiniController, IOCommand, SteeringCommand, auto_park  # noqa: E402
 from fw_mini_status_reader import build_snapshot, decode_msg, open_can_bus  # noqa: E402
 from row_geometry import (  # noqa: E402
+    PotPassCounter,
     ROBOT_FRAME_BACK,
     ROBOT_FRAME_FRONT,
     RowEstimate,
     RowFollowerConfig,
     blend_line,
+    detect_pot_station_xs,
     estimate_row,
+    raw_scan_to_points,
 )
 
 import rclpy  # noqa: E402
@@ -541,6 +544,19 @@ class PlantRowFollower(Node):
             segmented_pot_boundary_recovery=False,
         )
         self.row_cfg = self.front_row_cfg
+        self.pot_counting_enabled = False
+        self.pot_forward_progress_m: float | None = None
+        self.pot_counter = PotPassCounter(
+            count_line_x=float(args.pot_count_line_x),
+            min_station_spacing_m=float(args.pot_min_station_spacing_m),
+        )
+        self.pot_count_in_group = 0
+        self.pot_stop_active = False
+        self.pot_stop_until = 0.0
+        self.pot_stop_sequence = 0
+        self.pot_last_scan_seq = -1
+        self.pot_visible_station_count = 0
+        self.pot_last_event = "disabled"
         initial_gear = self._normalized_gear()
         self.sender = CommandSender(
             args.interface,
@@ -594,6 +610,120 @@ class PlantRowFollower(Node):
         self.last_following_wz_deg = 0.0
         self.wz_not_following_count = 0
         self.last_debug = {}
+        self._reset_pot_counting_state("motion_history_cleared")
+
+    def _reset_pot_counting_state(self, reason: str) -> None:
+        self.pot_counter.reset()
+        self.pot_forward_progress_m = None
+        self.pot_count_in_group = 0
+        self.pot_stop_active = False
+        self.pot_stop_until = 0.0
+        self.pot_stop_sequence = 0
+        self.pot_last_scan_seq = -1
+        self.pot_visible_station_count = 0
+        self.pot_last_event = str(reason)
+
+    def set_pot_counting_context(
+        self,
+        enabled: bool,
+        forward_progress_m: float | None,
+    ) -> None:
+        with self.mode_lock:
+            self.set_pot_counting_enabled(enabled)
+            self.pot_forward_progress_m = (
+                float(forward_progress_m)
+                if enabled
+                and forward_progress_m is not None
+                and math.isfinite(float(forward_progress_m))
+                else None
+            )
+
+    def set_pot_counting_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled) and not bool(self.args.reverse)
+        if enabled == self.pot_counting_enabled:
+            return
+        self.pot_counting_enabled = enabled
+        self._reset_pot_counting_state("enabled" if enabled else "disabled")
+        if enabled:
+            self.get_logger().info(
+                "forward pot counting enabled "
+                f"every={max(1, int(self.args.pot_stop_every))} "
+                f"count_line_x={float(self.args.pot_count_line_x):.2f}m "
+                f"hold={max(0.0, float(self.args.pot_stop_hold_sec)):.2f}s"
+            )
+        else:
+            self.get_logger().info("forward pot counting disabled and row count cleared")
+
+    def _pot_debug_fields(self, now: float | None = None) -> dict[str, Any]:
+        current = time.monotonic() if now is None else float(now)
+        return {
+            "pot_counting_enabled": bool(self.pot_counting_enabled),
+            "pot_forward_progress_m": self.pot_forward_progress_m,
+            "pot_visible_station_count": int(self.pot_visible_station_count),
+            "pot_count_in_group": int(self.pot_count_in_group),
+            "pot_total_count": int(self.pot_counter.total_count),
+            "pot_stop_every": max(1, int(self.args.pot_stop_every)),
+            "pot_stop_active": bool(self.pot_stop_active),
+            "pot_stop_remaining_sec": max(0.0, float(self.pot_stop_until) - current)
+            if self.pot_stop_active
+            else 0.0,
+            "pot_stop_sequence": int(self.pot_stop_sequence),
+            "pot_last_event": self.pot_last_event,
+        }
+
+    def _update_pot_counting(self, scan: LaserScan | None, scan_seq: int, now: float) -> None:
+        if self.pot_stop_active:
+            if now < self.pot_stop_until:
+                # Freeze detection and association while stationary. Point-cloud
+                # shape changes at a standstill must never create new pot counts
+                # or extend the current photo stop.
+                return
+            self.pot_stop_active = False
+            self.pot_stop_until = 0.0
+            self.pot_last_event = "stop_finished"
+            self.get_logger().info(
+                f"pot photo stop finished sequence={self.pot_stop_sequence}; resuming row tracking"
+            )
+
+        if (
+            not self.pot_counting_enabled
+            or bool(self.args.reverse)
+            or self.primary_lidar != "front"
+            or self.active_lidar != "front"
+            or self.pot_forward_progress_m is None
+            or scan is None
+            or int(scan_seq) == self.pot_last_scan_seq
+        ):
+            return
+
+        self.pot_last_scan_seq = int(scan_seq)
+        raw_points = raw_scan_to_points(scan, self.front_row_cfg)
+        station_xs = detect_pot_station_xs(raw_points, self.front_row_cfg)
+        self.pot_visible_station_count = len(station_xs)
+        newly_counted = self.pot_counter.update(
+            station_xs,
+            vehicle_progress_m=float(self.pot_forward_progress_m),
+        )
+        for _ in range(newly_counted):
+            self.pot_count_in_group += 1
+            self.pot_last_event = "pot_counted"
+            self.get_logger().info(
+                "pot station counted "
+                f"group={self.pot_count_in_group}/{max(1, int(self.args.pot_stop_every))} "
+                f"row_total={self.pot_counter.total_count}"
+            )
+            if self.pot_count_in_group < max(1, int(self.args.pot_stop_every)):
+                continue
+            self.pot_count_in_group = 0
+            self.pot_stop_active = True
+            self.pot_stop_until = now + max(0.0, float(self.args.pot_stop_hold_sec))
+            self.pot_stop_sequence += 1
+            self.pot_last_event = "stop_started"
+            self.get_logger().info(
+                "pot photo stop started "
+                f"sequence={self.pot_stop_sequence} row_total={self.pot_counter.total_count} "
+                f"hold={max(0.0, float(self.args.pot_stop_hold_sec)):.2f}s"
+            )
 
     def prepare_lidar_switch(self, reverse: bool) -> None:
         target = "rear" if reverse else "front"
@@ -1038,6 +1168,7 @@ class PlantRowFollower(Node):
             ),
         }
         payload.update(self._lidar_debug_fields())
+        payload.update(self._pot_debug_fields())
         payload.update(extra)
         self.last_debug = payload
 
@@ -1493,7 +1624,7 @@ class PlantRowFollower(Node):
 
     def _on_control_locked(self) -> None:
         now = time.monotonic()
-        primary_scan, primary_age, _primary_seq = self._scan_snapshot(self.primary_lidar, now)
+        primary_scan, primary_age, primary_seq = self._scan_snapshot(self.primary_lidar, now)
         waiting_for_new_scan = self.waiting_for_new_scan
         waiting_reason = self.waiting_for_new_scan_reason
         if bool(self.drive_enable) and waiting_for_new_scan:
@@ -1530,6 +1661,8 @@ class PlantRowFollower(Node):
 
         estimate = self._select_dual_lidar_estimate(now, primary_estimate)
         self.last_estimate = estimate
+        self._update_pot_counting(primary_scan, primary_seq, now)
+        cmd: BodyCommand | None = None
         if estimate.found:
             self.last_found_time = now
             self.last_good_time = now
@@ -1542,6 +1675,33 @@ class PlantRowFollower(Node):
             self.last_good_right_line = getattr(estimate, "right_line", None)
             self.last_good_mode = str(getattr(estimate, "effective_mode", estimate.mode) or "")
             self.last_good_heading_deg = math.degrees(float(getattr(estimate, "heading_rad", 0.0) or 0.0))
+
+        if self.pot_stop_active:
+            if not estimate.found:
+                self._set_debug_snapshot(
+                    estimate=estimate,
+                    found=False,
+                    control_phase="pot_stop_hold",
+                    stop_reason="three_pot_photo_stop",
+                    warning=estimate.reject_reason or estimate.mode,
+                    final_vx=0.0,
+                    final_wz=0.0,
+                )
+            else:
+                self.last_debug.update(
+                    {
+                        "control_phase": "pot_stop_hold",
+                        "stop_reason": "three_pot_photo_stop",
+                        "final_vx": 0.0,
+                        "final_wz_rad": 0.0,
+                        "final_wz_deg": 0.0,
+                    }
+                )
+                self.last_debug.update(self._pot_debug_fields(now))
+            self._send_stop(force_brake=True)
+            return
+
+        if cmd is not None:
             self.last_cmd_vx = float(cmd.vx)
             self.last_cmd_wz = float(cmd.wz)
             self._send_drive(cmd.gear, float(cmd.vx), float(cmd.wz))
@@ -1604,6 +1764,7 @@ class PlantRowFollower(Node):
             "reverse_steer_sign": round(float(self.last_debug.get("reverse_steer_sign", 0.0)), 4),
             "line_mode": self.last_debug.get("line_mode", ""),
         }
+        payload.update(self._pot_debug_fields())
         text = json.dumps(payload, ensure_ascii=True)
         self.status_pub.publish(String(data=text))
         print(text, flush=True)
@@ -1712,7 +1873,8 @@ class PlantRowFollower(Node):
                         "raw_center_warning": self.last_debug.get("raw_center_warning", ""),
                         "reject_reason": self.last_debug.get("reject_reason", ""),
                         "stop_reason": self.last_debug.get("stop_reason", ""),
-                },
+                        **self._pot_debug_fields(),
+                    },
                 ensure_ascii=True,
                 indent=2,
             )
@@ -1810,6 +1972,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forward-lost-stop-sec", type=float, default=0.50)
     parser.add_argument("--forward-lost-hold-wz-scale", type=float, default=0.5)
     parser.add_argument("--forward-lost-hold-max-wz-deg", type=float, default=0.6)
+    parser.add_argument("--pot-stop-every", type=int, default=3)
+    parser.add_argument("--pot-stop-hold-sec", type=float, default=2.0)
+    parser.add_argument("--pot-count-line-x", type=float, default=0.45)
+    parser.add_argument("--pot-min-station-spacing-m", type=float, default=0.24)
     parser.add_argument("--reverse-speed", type=float, default=0.15)
     parser.add_argument("--reverse-k-lat", type=float, default=24.0)
     parser.add_argument("--reverse-k-heading", type=float, default=0.50)

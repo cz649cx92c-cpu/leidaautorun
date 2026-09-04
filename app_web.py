@@ -129,6 +129,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "line_kp_offset": "7.0",
     "line_kp_heading": "0.08",
     "line_max_wz": "1.6",
+    "pot_stop_enabled": False,
     "mapping_recorddata": False,
 }
 
@@ -2493,6 +2494,85 @@ HTML_PAGE = """<!doctype html>
       padding: 8px 10px;
       margin-top: 0;
     }
+    #tab-tasks .drive-head-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 12px;
+      margin-left: auto;
+    }
+    #tab-tasks .pot-stop-control {
+      display: inline-grid;
+      grid-template-columns: auto 38px 26px;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      color: var(--ui-muted);
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #tab-tasks .pot-stop-control.enabled { color: var(--ui-text); }
+    #tab-tasks .pot-stop-control.locked { cursor: not-allowed; opacity: 0.64; }
+    #tab-tasks .pot-stop-switch {
+      position: relative;
+      width: 38px;
+      height: 22px;
+      display: inline-block;
+    }
+    #tab-tasks .pot-stop-switch input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      min-height: 0;
+      margin: 0;
+      padding: 0;
+      opacity: 0;
+    }
+    #tab-tasks .pot-stop-track {
+      position: absolute;
+      inset: 0;
+      border: 1px solid var(--ui-line);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--ui-muted) 18%, var(--ui-strong-surface));
+      transition: background 160ms ease, border-color 160ms ease;
+    }
+    #tab-tasks .pot-stop-track::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--ui-muted);
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+      transition: transform 160ms ease, background 160ms ease;
+    }
+    #tab-tasks .pot-stop-switch input:checked + .pot-stop-track {
+      border-color: color-mix(in srgb, var(--ui-accent) 65%, transparent);
+      background: color-mix(in srgb, var(--ui-accent) 74%, var(--ui-strong-surface));
+    }
+    #tab-tasks .pot-stop-switch input:checked + .pot-stop-track::after {
+      transform: translateX(16px);
+      background: #ffffff;
+    }
+    #tab-tasks .pot-stop-switch input:focus-visible + .pot-stop-track {
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-accent) 20%, transparent);
+    }
+    #tab-tasks .pot-stop-state {
+      min-width: 26px;
+      color: var(--ui-muted);
+      text-align: left;
+    }
+    #tab-tasks .pot-stop-control.enabled .pot-stop-state { color: var(--ui-accent); }
+    @media (max-width: 620px) {
+      #tab-tasks .drive-head-actions {
+        width: 100%;
+        justify-content: space-between;
+      }
+    }
     #tab-tasks .deferred-intro,
     #tab-tasks .locked-stage {
       padding: 10px 14px;
@@ -2784,7 +2864,17 @@ HTML_PAGE = """<!doctype html>
                       <h2>Replay mission</h2>
                       <p>Global mission tracking with local row guidance.</p>
                     </div>
-                    <div class="status-badge" id="driveStageBadge">Standby</div>
+                    <div class="drive-head-actions">
+                      <label class="pot-stop-control" id="potStopControl" for="potStopEnabled" title="Enable a stop after every three detected pot stations">
+                        <span>3-Pot Stop</span>
+                        <span class="pot-stop-switch">
+                          <input type="checkbox" id="potStopEnabled" aria-label="Stop every three pots" onchange="onPotStopToggleChanged()">
+                          <span class="pot-stop-track" aria-hidden="true"></span>
+                        </span>
+                        <span class="pot-stop-state" id="potStopState">OFF</span>
+                      </label>
+                      <div class="status-badge" id="driveStageBadge">Standby</div>
+                    </div>
                   </div>
                   <div class="field-inline">
                     <div class="field">
@@ -2952,7 +3042,7 @@ HTML_PAGE = """<!doctype html>
     let consoleAutoFollow = true;
     const defaultTheme = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
     const editableFieldIds = [
-      'mapName', 'missionName', 'lineCruiseVx',
+      'mapName', 'missionName', 'lineCruiseVx', 'potStopEnabled',
       'mappingRecorddata', 'sensorHeight', 'bodyXOffset',
       'bodyYOffset', 'rollGain', 'pitchGain'
     ];
@@ -3538,6 +3628,22 @@ HTML_PAGE = """<!doctype html>
       el.addEventListener(evt, () => dirtyFields.add(id));
     }
 
+    function updatePotStopControl(enabled, locked=false) {
+      const control = document.getElementById('potStopControl');
+      const input = document.getElementById('potStopEnabled');
+      const state = document.getElementById('potStopState');
+      if (!control || !input || !state) return;
+      control.classList.toggle('enabled', !!enabled);
+      control.classList.toggle('locked', !!locked);
+      input.disabled = !!locked;
+      state.textContent = enabled ? 'ON' : 'OFF';
+    }
+
+    function onPotStopToggleChanged() {
+      const input = document.getElementById('potStopEnabled');
+      updatePotStopControl(!!input?.checked, !!input?.disabled);
+    }
+
     function updateWorkflowState(data) {
       const ready = isLocalizationReady(data.localization_status);
       const activeLocalizationMapId = data.active_localization_map_id || '';
@@ -3702,6 +3808,7 @@ HTML_PAGE = """<!doctype html>
       updateFieldIfClean('mapName', data.mapping_name || '');
       updateFieldIfClean('missionName', data.mission_name || '');
       updateFieldIfClean('mappingRecorddata', !!data.settings.mapping_recorddata, true);
+      updateFieldIfClean('potStopEnabled', !!data.settings.pot_stop_enabled, true);
       updateFieldIfClean('lineCruiseVx', data.settings.line_cruise_vx || '');
       updateFieldIfClean('sensorHeight', data.settings.sensor_height_m || '');
       updateFieldIfClean('bodyXOffset', data.settings.body_x_offset_m || '');
@@ -3718,6 +3825,10 @@ HTML_PAGE = """<!doctype html>
       updateWorkflowState(data);
 
       const taskStatus = String(data.task_status || '');
+      updatePotStopControl(
+        !!document.getElementById('potStopEnabled')?.checked,
+        taskStatus === 'Hybrid Drive'
+      );
       setActionButton('mappingActionBtn', taskStatus === 'Mapping', 'Start Mapping', 'Stop Mapping');
       setActionButton('localizationActionBtn', isLocalizationActive(localizationText), 'Start Localization', 'Stop Localization');
       setActionButton('recordingActionBtn', taskStatus === 'Path Recording', 'Start Recording', 'Stop Recording');
@@ -3754,6 +3865,7 @@ HTML_PAGE = """<!doctype html>
         roll_gain: document.getElementById('rollGain').value,
         pitch_gain: document.getElementById('pitchGain').value,
         mapping_recorddata: document.getElementById('mappingRecorddata').checked,
+        pot_stop_enabled: document.getElementById('potStopEnabled').checked,
       });
       for (const id of editableFieldIds) dirtyFields.delete(id);
       await refreshState();
@@ -5735,6 +5847,8 @@ class WebController:
             "--lidar-x-offset-m", DEFAULT_LIDAR_X_OFFSET_M,
             "--lidar-y-offset-m", DEFAULT_LIDAR_Y_OFFSET_M,
         ]
+        if self.settings.get("pot_stop_enabled") is True:
+            args.append("--lidar-pot-stop-enabled")
         return args
 
     def _uvc_preview_args(self) -> list[str]:
