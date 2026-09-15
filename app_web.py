@@ -87,7 +87,7 @@ OTA_REMOTE = "leidaautorun"
 OTA_REPOSITORY = "cz649cx92c-cpu/leidaautorun"
 OTA_RELEASES_URL = f"https://api.github.com/repos/{OTA_REPOSITORY}/releases"
 OTA_BRANCH_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
-APP_VERSION = "v1.3.0"
+APP_VERSION = "v1.5.0"
 OTA_DOWNLOAD_DIR = PROJECT_ROOT / "runtime" / "ota"
 GAMEPAD_SPEED_LIMITS: dict[str, tuple[float, float]] = {
     "low": (0.15, 25.0),
