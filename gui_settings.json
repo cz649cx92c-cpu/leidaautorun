@@ -13,5 +13,7 @@
   "line_kp_offset": "7.0",
   "line_kp_heading": "0.08",
   "line_max_wz": "1.6",
-  "mapping_recorddata": false
+  "pot_stop_enabled": false,
+  "mapping_recorddata": false,
+  "forward_center_left_offset_m": "0.0"
 }

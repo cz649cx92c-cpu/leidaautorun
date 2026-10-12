@@ -5,7 +5,7 @@
     "scan_topic": "/front/scan",
     "frame_id": "front_laser",
     "sensor_yaw_deg": 180.0,
-    "lidar_yaw_correction_deg": -3.0,
+    "lidar_yaw_correction_deg": 13.0,
     "lidar_x_offset_m": 0.0,
     "lidar_y_offset_m": 0.035,
     "extrinsics_confirmed": true
