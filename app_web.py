@@ -63,6 +63,7 @@ from dual_lidar_config import (
     lidar_driver_start_lock,
     load_dual_lidar_config,
 )
+from status_freshness import FeedbackFreshness
 
 
 HOST = "0.0.0.0"
@@ -2664,6 +2665,7 @@ HTML_PAGE = """<!doctype html>
             </div>
 
             <div class="panel status-panel" aria-label="Vehicle instruments">
+              <div class="status-note" id="vehicleFeedbackFreshness">Waiting for vehicle feedback</div>
               <div id="vehicleStatus" class="instrument-cluster">
                 <section class="instrument-section speed-instrument" aria-label="Speed">
                   <div class="speed-gauge">
@@ -3433,6 +3435,16 @@ HTML_PAGE = """<!doctype html>
     function updateVehicleStatus(status) {
       const root = document.getElementById('vehicleStatus');
       if (!root) return;
+      const freshness = document.getElementById('vehicleFeedbackFreshness');
+      if (freshness) {
+        const age = Number(status.feedback_age_ms);
+        freshness.textContent = status.feedback_fresh
+          ? `Vehicle feedback live · ${Number.isFinite(age) ? (age / 1000).toFixed(1) : '0.0'} s ago`
+          : Number.isFinite(age)
+            ? `Vehicle feedback stale · ${Math.round(age / 1000)} s ago`
+            : 'Waiting for vehicle feedback';
+        freshness.classList.toggle('warn', !status.feedback_fresh);
+      }
       const vxRaw = Number(status.motion?.vx_mps ?? status.motion?.vx);
       const vyRaw = Number(status.motion?.vy_mps ?? status.motion?.vy);
       const speedValue = Number.isFinite(vxRaw) && Number.isFinite(vyRaw)
@@ -3648,7 +3660,10 @@ HTML_PAGE = """<!doctype html>
       const ready = isLocalizationReady(data.localization_status);
       const activeLocalizationMapId = data.active_localization_map_id || '';
       const canState = String(data.can_status || 'Unknown').toUpperCase();
-      const canReady = ['UP', 'UNKNOWN'].includes(canState);
+      // Only an explicit UP state is safe for controls.  UNKNOWN is common for
+      // SocketCAN interfaces, but it can also hide a bus-off or no-carrier
+      // condition and must not enable drive controls.
+      const canReady = canState === 'UP';
       const selectedMap = (data.maps || []).find(
         item => item.id === (activeLocalizationMapId || data.selected_replay_map_id || data.selected_record_map_id)
       );
@@ -4832,6 +4847,9 @@ class WebController:
         self.camera_status = "Stopped"
         self.lidar_status = "Starting..."
         self.can_status = "Unknown"
+        self._can_status_checked_at = 0.0
+        self._can_recovery_next_at = 0.0
+        self._can_recovery_running = False
         self.preview_source = "Waiting for preview stream"
         self.localization_status = "Not started"
         self.task_status = "Idle"
@@ -4841,6 +4859,7 @@ class WebController:
         self.latest_camera_frame_at = 0.0
         self.latest_lidar_scan: dict[str, Any] = {}
         self.vehicle_status: dict[str, Any] = {}
+        self._vehicle_feedback_freshness = FeedbackFreshness(timeout_s=2.0)
         self.charge_feedback: dict[str, Any] = {}
         self.gamepad_control: dict[str, Any] = {
             "enabled": False,
@@ -4938,6 +4957,8 @@ class WebController:
                 raise RuntimeError("Web gamepad control is already active in another browser.")
             if self.task_status == "Hybrid Drive":
                 raise RuntimeError("Stop Hybrid Drive before enabling the web gamepad.")
+            if self._can_recovery_running or self.can_status != "UP" or not self.vehicle_status.get("feedback_fresh", False):
+                raise RuntimeError("CAN feedback is not ready; wait for the CAN link and live feedback.")
             self.gamepad_control.update(
                 {
                     "enabled": True,
@@ -5058,6 +5079,9 @@ class WebController:
                 if physical_remote:
                     source, label = "remote_controller", "Remote control"
                     blocked_reason = "Physical remote controller has priority"
+                elif self._can_recovery_running or self.can_status != "UP" or not self.vehicle_status.get("feedback_fresh", False):
+                    source, label = "can_unavailable", "CAN unavailable"
+                    blocked_reason = "CAN link or vehicle feedback is not ready"
                 elif automatic_drive:
                     source, label = "automatic", "Automatic"
                     blocked_reason = "Hybrid Drive is running"
@@ -5074,7 +5098,17 @@ class WebController:
 
                 gear = str(state.get("gear") or "4t4d")
                 deadman = bool(state.get("deadman", False))
-                can_publish = enabled and connected and fresh and not physical_remote and not estop and not automatic_drive
+                can_publish = (
+                    enabled
+                    and connected
+                    and fresh
+                    and self.can_status == "UP"
+                    and not self._can_recovery_running
+                    and bool(self.vehicle_status.get("feedback_fresh", False))
+                    and not physical_remote
+                    and not estop
+                    and not automatic_drive
+                )
                 command_active = can_publish and deadman and gear in {"4t4d", "crab"}
                 speed_mode = str(state.get("speed_mode") or "low")
                 linear_limit, yaw_limit_deg = GAMEPAD_SPEED_LIMITS.get(speed_mode, GAMEPAD_SPEED_LIMITS["low"])
@@ -5160,11 +5194,28 @@ class WebController:
             return "Unavailable"
         text = result.stdout
         flags_match = re.search(r"<([^>]*)>", text)
-        if flags_match and "UP" in {flag.strip().upper() for flag in flags_match.group(1).split(",")}:
+        flags = {
+            flag.strip().upper()
+            for flag in (flags_match.group(1).split(",") if flags_match else [])
+            if flag.strip()
+        }
+        # `UP` is an administrative flag.  It is still present while a CAN
+        # controller is BUS-OFF, and may be present with no physical carrier.
+        # Report the fault state before considering the flag.
+        if re.search(r"\bBUS[-_ ]OFF\b", text, re.IGNORECASE):
+            return "BUS-OFF"
+        state_match = re.search(r"\bstate\s+([A-Za-z0-9_-]+)", text, re.IGNORECASE)
+        state = state_match.group(1).upper() if state_match else ""
+        if state in {"BUS-OFF", "BUSOFF"}:
+            return "BUS-OFF"
+        if "NO-CARRIER" in flags:
+            return "NO-CARRIER"
+        if state in {"DOWN", "DORMANT", "LOWERLAYERDOWN", "NOTPRESENT"}:
+            return state
+        if "UP" in flags:
             return "UP"
-        match = re.search(r"state\s+([A-Z]+)", text)
-        if match:
-            return match.group(1)
+        if state:
+            return state
         return "UNKNOWN"
 
     def _auto_connect_can(self) -> None:
@@ -5183,6 +5234,129 @@ class WebController:
         except Exception as exc:
             self.can_status = self._query_can_state(channel)
             self._log(f"Automatic CAN connection failed: {exc}")
+
+    @staticmethod
+    def _can_control_pids() -> list[int]:
+        """Return exact yhs CAN node PIDs (ps comm names may be truncated)."""
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "pid=,args="],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=True,
+            )
+        except Exception:
+            return []
+        pids: list[int] = []
+        for line in result.stdout.splitlines():
+            match = re.match(r"\s*(\d+)\s+(.*)", line)
+            if not match:
+                continue
+            try:
+                pid = int(match.group(1))
+            except ValueError:
+                continue
+            if pid == os.getpid():
+                continue
+            args = match.group(2)
+            if re.search(r"(?:^|\s)(?:\S*/)?yhs_can_control_node(?:\s|$)", args):
+                pids.append(pid)
+        return pids
+
+    def _recover_can_fault(self, channel: str) -> None:
+        """Stop motion, reset SocketCAN, and recreate the ROS CAN bridge.
+
+        This runs in a daemon thread so a BUS-OFF recovery never holds the
+        status lock or blocks the web API.  A stopped task is deliberately not
+        resumed automatically after the bus comes back.
+        """
+        channel = str(channel or "can0").strip() or "can0"
+        bitrate = str(self.settings.get("can_bitrate") or "500000").strip() or "500000"
+        try:
+            bridge = get_bridge()
+            before_snapshot = bridge.snapshot()
+            before_seq = int(before_snapshot.get("_seq", 0)) if isinstance(before_snapshot, dict) else 0
+            with self.lock:
+                self.pending_action = None
+                worker = self.task_worker
+                if worker is not None:
+                    self.task_status = "Stopping after CAN fault"
+                    self._log("CAN fault recovery is stopping the active task; it will not auto-resume.")
+                    worker.stop()
+                if bool(self.gamepad_control.get("enabled", False)) or self._gamepad_output_active:
+                    self.release_gamepad_control(reason="CAN fault recovery")
+
+            # Give the task process a chance to close its SocketCAN reader.
+            deadline = time.monotonic() + 8.0
+            while worker is not None and worker.process is not None and worker.process.poll() is None:
+                worker.stop()
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.25)
+
+            # The node name is longer than Linux's 15-character comm field;
+            # pkill -x therefore misses it.  Match the full command line and
+            # terminate every stale instance before recreating one.
+            node_pids = self._can_control_pids()
+            for pid in node_pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    self._log(f"CAN recovery could not stop control node PID {pid}.")
+            wait_deadline = time.monotonic() + 3.0
+            while time.monotonic() < wait_deadline and self._can_control_pids():
+                time.sleep(0.1)
+            remaining_pids = self._can_control_pids()
+            for pid in remaining_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    self._log(f"CAN recovery could not force-stop control node PID {pid}.")
+            if self._can_control_pids():
+                self._log("CAN recovery aborted: stale CAN control node is still running.")
+                return
+
+            result = subprocess.run(
+                ["sudo", "-n", "/usr/local/bin/bringup_can0.sh", channel, bitrate],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=8.0,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "CAN bring-up failed").strip()
+                self._log(f"CAN recovery failed: {detail[-240:]}")
+                return
+            # The CAN node owns a socket created before BUS-OFF. Recreate it so
+            # the recovered interface is actually used for RX and TX.
+            time.sleep(0.5)
+            ensure_node = getattr(bridge, "_ensure_can_control_running", None)
+            if callable(ensure_node):
+                ensure_node()
+            feedback_deadline = time.monotonic() + 5.0
+            feedback_recovered = False
+            while time.monotonic() < feedback_deadline:
+                snapshot = bridge.snapshot()
+                if isinstance(snapshot, dict) and int(snapshot.get("_seq", 0)) > before_seq:
+                    feedback_recovered = True
+                    break
+                time.sleep(0.1)
+            recovered_state = self._query_can_state(channel)
+            with self.lock:
+                self.can_status = recovered_state
+            feedback_note = "feedback resumed" if feedback_recovered else "waiting for fresh feedback"
+            self._log(f"CAN recovered on {channel}; control node restarted (state={recovered_state}, {feedback_note}).")
+        except Exception as exc:
+            self._log(f"CAN recovery exception: {exc}")
+        finally:
+            with self.lock:
+                self._can_recovery_running = False
 
     def connect_can(self, channel: str, bitrate: str | int) -> None:
         with self.lock:
@@ -6067,6 +6241,8 @@ class WebController:
                 raise RuntimeError("No map selected.")
             if mission_path is None:
                 raise RuntimeError("No mission selected.")
+            if self._can_recovery_running or self.can_status != "UP" or not self.vehicle_status.get("feedback_fresh", False):
+                raise RuntimeError("CAN feedback is not ready; wait for the CAN link and live feedback.")
             self.selected_replay_map_id = map_id
             self.selected_mission_id = mission_id
             try:
@@ -6244,7 +6420,39 @@ class WebController:
         while not self.closing:
             with self.lock:
                 now = time.monotonic()
+                # Refresh the link state while the page is open so BUS-OFF and
+                # NO-CARRIER faults appear promptly instead of leaving a stale
+                # UP value from startup.
+                if now >= self._can_status_checked_at:
+                    channel = str(self.settings.get("can_channel") or "can0")
+                    self.can_status = self._query_can_state(channel)
+                    self._can_status_checked_at = now + 1.0
+                    if (
+                        self.can_status in {"BUS-OFF", "NO-CARRIER", "DOWN", "LOWERLAYERDOWN"}
+                        and now >= self._can_recovery_next_at
+                        and not self._can_recovery_running
+                    ):
+                        self._can_recovery_next_at = now + 10.0
+                        self._can_recovery_running = True
+                        self._log(f"CAN fault detected: {self.can_status}; starting automatic recovery.")
+                        threading.Thread(
+                            target=self._recover_can_fault,
+                            args=(channel,),
+                            name="can-recovery",
+                            daemon=True,
+                        ).start()
                 snapshot = bridge.snapshot()
+                if isinstance(snapshot, dict):
+                    feedback_fresh, feedback_age_ms = self._vehicle_feedback_freshness.observe(
+                        snapshot.get("_seq"), now
+                    )
+                    snapshot["feedback_fresh"] = feedback_fresh
+                    snapshot["feedback_age_ms"] = feedback_age_ms
+                    if self._can_recovery_running:
+                        self.can_status = "RECOVERING"
+                    elif self.can_status == "UP" and not feedback_fresh:
+                        self.can_status = "UP_NO_FEEDBACK"
+                    snapshot["can_status"] = self.can_status
                 charge_received_at = float(
                     self.charge_feedback.get("received_monotonic", 0.0) or 0.0
                 )

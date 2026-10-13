@@ -675,12 +675,28 @@ def _can_interface_is_up(interface_path: Path) -> bool:
     return bool(flags & 0x1)
 
 
+def _can_interface_faulted(channel: str) -> bool:
+    """Detect controller faults that still leave IFF_UP asserted."""
+    try:
+        result = subprocess.run(
+            ['ip', '-details', 'link', 'show', channel],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    text = result.stdout.upper()
+    return 'BUS-OFF' in text or 'NO-CARRIER' in text
+
+
 def ensure_can_ready(channel: str, bitrate: int) -> None:
     interface_path = Path('/sys/class/net') / channel
     state_path = interface_path / 'operstate'
     if not state_path.exists():
         raise RuntimeError(f'CAN channel not found: {channel}')
-    if _can_interface_is_up(interface_path):
+    if _can_interface_is_up(interface_path) and not _can_interface_faulted(channel):
         return
 
     def _run_ip(cmd: list[str], *, allow_failure: bool = False) -> subprocess.CompletedProcess[str]:

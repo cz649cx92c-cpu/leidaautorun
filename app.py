@@ -348,23 +348,45 @@ class StatusMonitor:
         except Exception:
             self.sink.put(("log", f"{now_text()} can0 was not found on this system."))
             return False
+        # operstate is often `unknown` for SocketCAN and remains so while the
+        # controller is BUS-OFF. Inspect the detailed link flags before treating
+        # an interface as healthy.
+        try:
+            detail = subprocess.run(
+                ["ip", "-details", "link", "show", "can0"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            ).stdout.upper()
+            if "BUS-OFF" in detail or "NO-CARRIER" in detail:
+                fault = "BUS-OFF" if "BUS-OFF" in detail else "NO-CARRIER"
+                self.sink.put(("log", f"{now_text()} can0 reports {fault}; reinitializing CAN."))
+                state = "fault"
+        except Exception:
+            pass
         if state in {"up", "unknown"}:
             self.sink.put(("log", f"{now_text()} can0 is already up."))
             return True
         self.sink.put(("log", f"{now_text()} can0 is {state}. Bringing it up at 500000 bitrate..."))
-        cmds = [
-            ["sudo", "ip", "link", "set", "can0", "down"],
-            ["sudo", "ip", "link", "set", "can0", "type", "can", "bitrate", "500000"],
-            ["sudo", "ip", "link", "set", "can0", "up"],
-        ]
-        for cmd in cmds:
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
-            if result.returncode != 0:
-                output = (result.stdout or "").strip()
-                self.sink.put(("log", f"{now_text()} Failed to run: {' '.join(cmd)}"))
-                if output:
-                    self.sink.put(("log", f"{now_text()} {output}"))
-                return False
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "/usr/local/bin/bringup_can0.sh", "can0", "500000"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                timeout=8.0,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.sink.put(("log", f"{now_text()} Failed to reinitialize can0: {exc}"))
+            return False
+        if result.returncode != 0:
+            output = (result.stdout or "").strip()
+            self.sink.put(("log", f"{now_text()} Failed to reinitialize can0."))
+            if output:
+                self.sink.put(("log", f"{now_text()} {output}"))
+            return False
         self.sink.put(("log", f"{now_text()} can0 is now up."))
         return True
 

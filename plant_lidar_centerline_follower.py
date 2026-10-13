@@ -1321,7 +1321,8 @@ class PlantRowFollower(Node):
                 heading_error = float(math.atan(line_fit[0]))
                 heading_error_deg = math.degrees(heading_error)
             if one_side_mode:
-                max_wz_deg = min(max_wz_deg, 0.8)
+                # Forward one-side tracking only; reverse uses its own limits above.
+                max_wz_deg = min(max_wz_deg, 1.2)
                 max_wz_rad = math.radians(max_wz_deg)
                 k_lat_eff *= 0.5
                 k_heading_eff *= 0.3

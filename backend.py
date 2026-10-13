@@ -1325,6 +1325,27 @@ def _row_entry_lidar_reliable(
     return True, "ok"
 
 
+def _row_entry_lidar_visible(status: LineStatus) -> tuple[bool, str]:
+    """Return whether the forward lidar currently sees a usable row centerline.
+
+    Forward row entry only needs a few valid centerline observations before the
+    local controller takes over. Exact heading and clearance validation is
+    intentionally left to the local controller after handoff; applying those
+    limits here made a single noisy scan reset the entry gate indefinitely.
+    """
+    if not status.fresh:
+        return False, "stale_status"
+    if not status.found:
+        return False, "centerline_not_found"
+    payload = status.payload if isinstance(status.payload, dict) else {}
+    if str(payload.get("active_lidar") or "") != "front":
+        return False, "front_lidar_required"
+    mode = str(payload.get("mode") or "")
+    if mode not in {"both_sides", "left_only", "right_only"}:
+        return False, "usable_boundary_required"
+    return True, "ok"
+
+
 def _forward_row_segments(points: list[Any], motions: list[dict[str, Any]]) -> list[ForwardRowSegment]:
     segments: list[ForwardRowSegment] = []
     idx = 0
@@ -1471,6 +1492,8 @@ class RowEntryAssistState:
     settle_until: float = 0.0
     stable_frames: int = 0
     detected_frames: int = 0
+    missed_frames: int = 0
+    alignment_ready: bool = True
     last_status_at: float = 0.0
     last_log_at: float = 0.0
     lidar_start_along_m: float = 0.0
@@ -2136,6 +2159,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     row_entry_assist.active = not reversing_here and not lidar_entry_staged
                     row_entry_assist.handed_off = reversing_here or lidar_entry_staged
                     row_entry_assist.fresh_start_reset_done = False
+                    row_entry_assist.alignment_ready = True
                     if not reversing_here and row_entry_assist.force_global_only and not lidar_entry_staged:
                         row_entry_assist.active = True
                         row_entry_assist.handed_off = False
@@ -2167,36 +2191,51 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                         row_entry_assist.start_along_m = along
                         row_entry_assist.start_along_valid = True
                     row_entry_progress_m = max(0.0, along - row_entry_assist.start_along_m)
-                    # Do not hand control to a lidar controller that is still
-                    # SEARCHing.  Continue following the recorded row at low
-                    # speed until the centerline is stable enough to take over.
-                    entry_reliable, entry_reason = _row_entry_lidar_reliable(
-                        entry_lidar_status,
-                        min_clearance_m=float(args.lidar_row_entry_min_clearance),
-                        max_heading_deg=float(args.lidar_row_entry_max_heading_deg),
+                    # For forward entry, four valid front-lidar centerline
+                    # observations are enough. Do not require the first four
+                    # observations to have identical heading/clearance values:
+                    # the local controller will correct those after handoff.
+                    # A couple of missing scans are tolerated so one noisy
+                    # frame cannot deadlock the vehicle at the row mouth.
+                    entry_visible, entry_reason = _row_entry_lidar_visible(
+                        entry_lidar_status
                     )
                     if entry_lidar_status.updated_at > row_entry_assist.last_status_at:
                         row_entry_assist.last_status_at = entry_lidar_status.updated_at
-                        entry_mode = str(
-                            (entry_lidar_status.payload or {}).get("mode", "")
-                            if isinstance(entry_lidar_status.payload, dict)
-                            else ""
-                        )
-                        entry_detected = bool(
-                            entry_lidar_status.fresh
-                            and entry_lidar_status.found
-                            and str((entry_lidar_status.payload or {}).get("active_lidar") or "")
-                            == "front"
-                            and entry_mode in {"both_sides", "left_only", "right_only"}
-                        )
+                        entry_detected = entry_visible
                         if entry_detected:
                             row_entry_assist.detected_frames += 1
+                            row_entry_assist.missed_frames = 0
+                            row_entry_assist.stable_frames += 1
+                            entry_payload = (
+                                entry_lidar_status.payload
+                                if isinstance(entry_lidar_status.payload, dict)
+                                else {}
+                            )
+                            entry_center_error_m = _safe_float(
+                                entry_payload.get("center_error_m"), 0.0
+                            )
+                            entry_heading_deg = abs(
+                                _safe_float(entry_payload.get("heading_deg"), 0.0)
+                            )
+                            row_entry_assist.alignment_ready = bool(
+                                abs(entry_center_error_m)
+                                <= max(
+                                    0.02,
+                                    float(args.lidar_row_entry_max_center_error_m),
+                                )
+                                and entry_heading_deg
+                                <= max(
+                                    2.0,
+                                    float(args.lidar_row_entry_max_alignment_heading_deg),
+                                )
+                            )
                         else:
                             row_entry_assist.detected_frames = 0
-                        if entry_reliable:
-                            row_entry_assist.stable_frames += 1
-                        else:
-                            row_entry_assist.stable_frames = 0
+                            row_entry_assist.missed_frames += 1
+                            if row_entry_assist.missed_frames >= 3:
+                                row_entry_assist.stable_frames = 0
+                                row_entry_assist.alignment_ready = False
                     required_entry_frames = max(1, int(args.lidar_row_entry_stable_frames))
                     row_entry_max_distance_m = max(
                         max(0.40, float(args.lidar_row_entry_distance)),
@@ -2208,15 +2247,22 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     )
                     if (
                         row_entry_progress_m >= max(0.40, float(args.lidar_row_entry_distance))
-                        and row_entry_assist.stable_frames < required_entry_frames
+                        and (
+                            row_entry_assist.stable_frames < required_entry_frames
+                            or not row_entry_assist.alignment_ready
+                        )
                         and time.monotonic() - row_entry_assist.last_log_at >= 1.0
                     ):
-                        entry_action = "stopped" if row_entry_safety_stop else "continuing"
+                        if row_entry_assist.stable_frames >= required_entry_frames:
+                            entry_action = "correcting"
+                        else:
+                            entry_action = "stopped" if row_entry_safety_stop else "continuing"
                         wait_message = (
-                            f"Global row entry {entry_action} until front lidar centerline is stable: "
+                            f"Global row entry {entry_action} until front lidar centerline is aligned: "
                             f"progress={row_entry_progress_m:.2f}m "
                             f"max_distance={row_entry_max_distance_m:.2f}m "
                             f"frames={row_entry_assist.stable_frames}/{required_entry_frames} "
+                            f"alignment_ready={row_entry_assist.alignment_ready} "
                             f"reason={entry_reason}."
                         )
                         core.log(wait_message)
@@ -2233,6 +2279,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     and row_entry_progress_m >= max(0.40, float(args.lidar_row_entry_distance))
                     and row_entry_assist.stable_frames
                     >= max(1, int(args.lidar_row_entry_stable_frames))
+                    and row_entry_assist.alignment_ready
                 )
                 if row_entry_handoff_ready:
                     row_entry_assist.active = False
@@ -2246,7 +2293,8 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     entry_message = (
                         "Global low-speed row entry finished; handing control to lidar guidance "
                         f"after {row_entry_progress_m:.2f}m with "
-                        f"{row_entry_assist.stable_frames} continuous stable front-lidar frames."
+                        f"{row_entry_assist.stable_frames} front-lidar centerline detections "
+                        "and alignment ready."
                     )
                     core.log(entry_message)
                     _append_hybrid_log(hybrid_run_log, entry_message)
@@ -2480,6 +2528,8 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                 row_entry_assist.settle_until = 0.0
                 row_entry_assist.stable_frames = 0
                 row_entry_assist.detected_frames = 0
+                row_entry_assist.missed_frames = 0
+                row_entry_assist.alignment_ready = True
                 row_entry_assist.last_status_at = 0.0
                 row_entry_assist.last_log_at = 0.0
                 row_entry_assist.lidar_start_along_m = 0.0
@@ -2540,6 +2590,8 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                         else:
                             row_entry_assist.stable_frames = 0
                             row_entry_assist.detected_frames = 0
+                            row_entry_assist.missed_frames = 0
+                            row_entry_assist.alignment_ready = True
 
                     required_frames = max(1, int(args.lidar_row_entry_stable_frames))
                     if row_entry_assist.stable_frames < required_frames:
@@ -2621,6 +2673,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                         row_entry_assist.lidar_start_along_valid = False
                         row_entry_assist.stable_frames = 0
                         row_entry_assist.detected_frames = 0
+                        row_entry_assist.missed_frames = 0
                         finish_msg = (
                             "Lidar constrained row entry finished. "
                             f"progress={entry_progress_m:.2f}m; restoring normal lidar cruise."
@@ -2904,6 +2957,8 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                             row_entry_assist.settle_until = 0.0
                             row_entry_assist.stable_frames = 0
                             row_entry_assist.detected_frames = 0
+                            row_entry_assist.missed_frames = 0
+                            row_entry_assist.alignment_ready = True
                             row_entry_assist.last_status_at = 0.0
                             row_entry_assist.last_log_at = 0.0
                             row_entry_assist.lidar_start_along_m = 0.0
@@ -2939,12 +2994,10 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                             12.0,
                         )
                         if row_entry_global_window:
-                            cmd_vx = min(cmd_vx, abs(float(args.lidar_row_entry_speed)))
-                            cmd_wz = core._clamp(
-                                cmd_wz,
-                                -abs(float(args.lidar_row_entry_max_wz_deg)),
-                                abs(float(args.lidar_row_entry_max_wz_deg)),
-                            )
+                            # Keep the final adaptive stage in charge of the
+                            # entry speed cap; large-error correction may use
+                            # the configured 0.10 m/s correction speed.
+                            cmd_vx = min(cmd_vx, abs(float(args.line_cruise_vx)))
                             # The recorded path brings the vehicle through open
                             # space to the row mouth.  As soon as lidar sees one
                             # or both plant boundaries, use that live centerline
@@ -2975,19 +3028,63 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                                     * heading_scale
                                     * lidar_heading_deg
                                 )
-                                entry_max_wz_deg = abs(float(args.lidar_row_entry_max_wz_deg))
-                                cmd_wz = core._clamp(
-                                    lidar_wz_deg,
-                                    -entry_max_wz_deg,
-                                    entry_max_wz_deg,
-                                )
-                                if abs(center_error_m) > 0.08:
-                                    cmd_vx = min(cmd_vx, 0.05)
+                                cmd_wz = lidar_wz_deg
                                 row_entry_lidar_guidance = True
                                 row_entry_lidar_mode = entry_mode
                                 row_entry_lidar_center_error_m = center_error_m
                                 row_entry_lidar_heading_deg = lidar_heading_deg
                                 row_entry_lidar_wz_deg = cmd_wz
+                            # The recorded path can be well aligned while the
+                            # vehicle heading is still wrong at the row mouth.
+                            # Use a stronger, speed-limited correction only for
+                            # forward row entry; normal forward and all reverse
+                            # control keep their existing limits.
+                            if not row_entry_safety_stop:
+                                center_abs = (
+                                    abs(row_entry_lidar_center_error_m)
+                                    if row_entry_lidar_guidance
+                                    else 0.0
+                                )
+                                heading_abs = max(
+                                    abs(float(heading_err_deg)),
+                                    abs(row_entry_lidar_heading_deg)
+                                    if row_entry_lidar_guidance
+                                    else 0.0,
+                                )
+                                nominal_max_wz = abs(float(args.lidar_row_entry_max_wz_deg))
+                                if (
+                                    center_abs
+                                    > max(0.02, float(args.lidar_row_entry_max_center_error_m))
+                                    or heading_abs >= 4.0
+                                ):
+                                    entry_max_wz_deg = min(
+                                        3.0,
+                                        max(
+                                            nominal_max_wz,
+                                            abs(float(args.lidar_row_entry_correction_max_wz_deg)),
+                                        ),
+                                    )
+                                    entry_speed_cap = min(
+                                        abs(float(args.line_cruise_vx)),
+                                        abs(float(args.lidar_row_entry_correction_speed)),
+                                    )
+                                elif center_abs > 0.04 or heading_abs >= 2.0:
+                                    entry_max_wz_deg = min(3.0, max(nominal_max_wz, 3.0))
+                                    entry_speed_cap = min(
+                                        abs(float(args.line_cruise_vx)),
+                                        abs(float(args.lidar_row_entry_correction_speed)),
+                                    )
+                                else:
+                                    entry_max_wz_deg = nominal_max_wz
+                                    entry_speed_cap = abs(float(args.lidar_row_entry_speed))
+                                cmd_vx = min(cmd_vx, entry_speed_cap)
+                                cmd_wz = core._clamp(
+                                    cmd_wz,
+                                    -entry_max_wz_deg,
+                                    entry_max_wz_deg,
+                                )
+                                if row_entry_lidar_guidance:
+                                    row_entry_lidar_wz_deg = cmd_wz
                             if row_entry_safety_stop:
                                 cmd_vx = 0.0
                                 cmd_wz = 0.0
@@ -3163,6 +3260,7 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                     f"post_row_change_lock={post_row_change_locked} "
                     f"force_global_entry_only={force_global_entry_only} "
                     f"entry_handoff={row_entry_handoff_ready} "
+                    f"entry_alignment_ready={row_entry_assist.alignment_ready} "
                     f"entry_safety_stop={row_entry_safety_stop} "
                     f"entry_lidar_guidance={row_entry_lidar_guidance} "
                     f"entry_lidar_mode={row_entry_lidar_mode or '-'} "
@@ -3400,6 +3498,10 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-row-entry-distance", type=float, default=1.0)
     parser.add_argument("--lidar-row-entry-max-distance", type=float, default=1.5)
     parser.add_argument("--lidar-row-entry-max-wz-deg", type=float, default=1.0)
+    parser.add_argument("--lidar-row-entry-correction-max-wz-deg", type=float, default=3.0)
+    parser.add_argument("--lidar-row-entry-correction-speed", type=float, default=0.10)
+    parser.add_argument("--lidar-row-entry-max-center-error-m", type=float, default=0.07)
+    parser.add_argument("--lidar-row-entry-max-alignment-heading-deg", type=float, default=10.0)
     parser.add_argument("--lidar-row-entry-max-heading-deg", type=float, default=10.0)
     parser.add_argument("--lidar-row-entry-min-clearance", type=float, default=0.04)
     parser.add_argument("--lidar-scan-topic", default="/scan")
