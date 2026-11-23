@@ -2447,6 +2447,27 @@ HTML_PAGE = """<!doctype html>
     }
     .ota-progress-fill { width: 0%; height: 100%; background: var(--ui-accent); transition: width 180ms ease; }
     .ota-progress-value { color: var(--ui-muted); font-size: 12px; }
+    .ota-install-status {
+      display: grid;
+      gap: 6px;
+      padding: 12px 14px;
+      border: 1px solid var(--ui-line);
+      border-radius: 12px;
+      background: var(--ui-accent-soft);
+      color: var(--ui-text);
+      font-size: 13px;
+    }
+    .ota-install-status[hidden], .ota-install-status progress[hidden] { display: none; }
+    .ota-install-status strong { font-size: 14px; }
+    .ota-install-status p { margin: 0; color: var(--ui-muted); overflow-wrap: anywhere; }
+    .ota-install-status progress {
+      display: block;
+      width: 100%;
+      height: 8px;
+      accent-color: var(--ui-accent);
+    }
+    .ota-install-status[data-state="success"] { background: color-mix(in srgb, var(--good) 14%, transparent); }
+    .ota-install-status[data-state="error"] { background: color-mix(in srgb, var(--warn) 12%, transparent); }
     .ota-actions { margin-left: auto; }
     @media (max-width: 780px) {
       #tab-settings.overlay-panel { width: calc(100% - 20px); }
@@ -2467,6 +2488,7 @@ HTML_PAGE = """<!doctype html>
     }
     @media (prefers-reduced-motion: reduce) {
       #tab-settings.overlay-panel.active, .lidar-tuning-preview { animation: none; }
+      .ota-install-status progress { display: none; }
     }
     body.workflow-overlay-open {
       overflow: hidden;
@@ -3026,13 +3048,18 @@ HTML_PAGE = """<!doctype html>
                 </div>
                 <div class="ota-release-title" id="otaReleaseTitle">Ready to check for updates</div>
               </div>
+              <div class="ota-install-status" id="otaInstallStatus" role="status" aria-atomic="true" hidden>
+                <strong id="otaInstallTitle"></strong>
+                <p id="otaInstallDetail"></p>
+                <progress id="otaInstallProgress" aria-label="Installation in progress"></progress>
+              </div>
               <div class="ota-controls">
                 <div class="ota-progress-row" aria-label="Download progress">
                   <div class="ota-progress-track"><div class="ota-progress-fill" id="otaProgressFill"></div></div>
                   <div class="ota-progress-value" id="otaProgressValue">Not downloaded</div>
                 </div>
                 <div class="ota-actions">
-                  <button type="button" class="secondary" onclick="checkAppUpdate()">Check Update</button>
+                  <button type="button" class="secondary" id="otaCheckBtn" onclick="checkAppUpdate()">Check Update</button>
                   <button type="button" class="secondary" id="otaDownloadBtn" onclick="downloadAppUpdate()" disabled>Download Update</button>
                   <button type="button" id="otaInstallBtn" onclick="installAppUpdate()" disabled>Install Update</button>
                 </div>
@@ -3118,8 +3145,8 @@ HTML_PAGE = """<!doctype html>
       const current = document.body.getAttribute('data-theme') || defaultTheme;
       setTheme(current === 'dark' ? 'light' : 'dark');
     }
-    async function api(path, method='GET', body=null) {
-      const options = { method, headers: {} };
+    async function api(path, method='GET', body=null, signal) {
+      const options = { method, headers: {}, signal };
       if (body !== null) {
         options.headers['Content-Type'] = 'application/json';
         options.body = JSON.stringify(body);
@@ -3885,9 +3912,10 @@ HTML_PAGE = """<!doctype html>
     }
 
     async function refreshState() {
+      if (otaInstallBusy) return;
       try {
         const data = await api('/api/state');
-        applyState(data);
+        if (!otaInstallBusy) applyState(data);
       } catch (err) {
         console.error(err);
       }
@@ -4113,18 +4141,23 @@ HTML_PAGE = """<!doctype html>
     }
 
     let otaCandidate = '';
+    let otaSnapshot = {};
+    let otaInstallBusy = false;
+    const otaPendingVersionKey = 'autorunlida_pending_update';
+
     function updateOtaPanel(data) {
+      otaSnapshot = data;
       const current = document.getElementById('otaCurrentVersion');
       const available = document.getElementById('otaAvailableVersion');
       const title = document.getElementById('otaReleaseTitle');
-      const status = document.getElementById('otaStatus');
+      const checkButton = document.getElementById('otaCheckBtn');
       const install = document.getElementById('otaInstallBtn');
       const downloadButton = document.getElementById('otaDownloadBtn');
       const progress = document.getElementById('otaProgressFill');
       const progressValue = document.getElementById('otaProgressValue');
       if (current) current.textContent = data.current_version || '--';
       if (available) available.textContent = data.available_version || '--';
-      if (status) status.textContent = data.message || 'Check for an application update.';
+      if (title) title.textContent = data.message || 'Ready to check for updates';
       otaCandidate = data.available_version || '';
       const download = data.download || {};
       const downloadState = String(download.state || 'idle');
@@ -4134,16 +4167,14 @@ HTML_PAGE = """<!doctype html>
       const percent = total > 0 ? Math.min(100, Math.round(received * 100 / total)) : 0;
       const formatBytes = value => value >= 1024 * 1024 ? (value / (1024 * 1024)).toFixed(1) + ' MB' : (value / 1024).toFixed(0) + ' KB';
       const formatSpeed = value => value > 0 ? formatBytes(value) + '/s' : '--';
-      if (downloadButton) downloadButton.disabled = !otaCandidate || downloadState === 'downloading' || downloadState === 'downloaded';
-      if (install) install.disabled = !otaCandidate || downloadState !== 'downloaded';
-      const checked = data.checked === true;
-      const ready = !!otaCandidate && !!data.can_install;
-      const releaseAvailable = !!otaCandidate;
-      if (title) title.textContent = ready
-        ? 'A new release is ready to install'
-        : releaseAvailable ? 'A release is available'
-          : checked ? 'Application is up to date'
-            : 'No update check has been run';
+      if (checkButton) checkButton.disabled = otaInstallBusy;
+      if (downloadButton) {
+        downloadButton.disabled = otaInstallBusy || !otaCandidate || downloadState === 'downloading' || downloadState === 'downloaded';
+      }
+      if (install) {
+        install.disabled = otaInstallBusy || !otaCandidate || !data.can_install || downloadState !== 'downloaded';
+        install.textContent = otaInstallBusy ? 'Installing…' : 'Install Update';
+      }
       if (progress) progress.style.width = downloadState === 'downloaded' ? '100%' : downloadState === 'downloading' ? percent + '%' : '0%';
       if (progressValue) progressValue.textContent = downloadState === 'downloading'
         ? percent + '%  ' + formatSpeed(speed)
@@ -4152,6 +4183,7 @@ HTML_PAGE = """<!doctype html>
             : 'Not downloaded';
     }
     async function checkAppUpdate() {
+      if (otaInstallBusy) return;
       try {
         const data = await api('/api/ota/check', 'POST', {});
         updateOtaPanel(data);
@@ -4165,19 +4197,66 @@ HTML_PAGE = """<!doctype html>
         showToast('Update check failed: ' + (err?.message || err), 'error');
       }
     }
-    async function installAppUpdate() {
-      if (!otaCandidate) return;
-      if (!window.confirm('Install ' + otaCandidate + '? The web service will restart.')) return;
+    function showOtaInstallStatus(state, title, detail) {
+      const panel = document.getElementById('otaInstallStatus');
+      panel.dataset.state = state;
+      document.getElementById('otaInstallTitle').textContent = title;
+      document.getElementById('otaInstallDetail').textContent = detail;
+      document.getElementById('otaInstallProgress').hidden = state !== 'waiting';
+      panel.hidden = false;
+    }
+
+    async function trackOtaInstall(version, submit) {
+      if (otaInstallBusy) return;
+      otaInstallBusy = true;
+      updateOtaPanel(otaSnapshot);
       try {
-        const data = await api('/api/ota/install', 'POST', { version: otaCandidate });
-        updateOtaPanel(data);
-        showToast('Update installed. Restarting web service.', 'success');
+        if (submit) {
+          sessionStorage.setItem(otaPendingVersionKey, version);
+          showOtaInstallStatus('waiting', 'Installing ' + version, 'Fetching the release and switching to the new version.');
+          try {
+            await api('/api/ota/install', 'POST', { version }, AbortSignal.timeout(150000));
+          } catch (err) {
+            // The restart can disconnect the POST after the update was accepted.
+            if (err.name !== 'TypeError' && err.name !== 'TimeoutError') throw err;
+          }
+        }
+
+        showOtaInstallStatus('waiting', 'Verifying ' + version, 'Waiting for the web service to respond with the new version.');
+        const deadline = Date.now() + (submit ? 45000 : 150000);
+        while (Date.now() < deadline) {
+          await new Promise(resolve => window.setTimeout(resolve, 1500));
+          try {
+            const status = await api('/api/ota/status', 'GET', null, AbortSignal.timeout(2500));
+            if (status.current_version === version && status.download?.state !== 'installed') {
+              updateOtaPanel(status);
+              showOtaInstallStatus('success', 'Installed ' + version, 'The web service is back online.');
+              return;
+            }
+          } catch {
+            // The service may be offline while restarting.
+          }
+        }
+        showOtaInstallStatus('error', 'Installation status unavailable', 'Refresh the page to check the current version before retrying.');
       } catch (err) {
-        showToast('Update failed: ' + (err?.message || err), 'error');
+        let detail = err.message;
+        try { detail = JSON.parse(detail).error || detail; } catch {}
+        showOtaInstallStatus('error', 'Could not install ' + version, detail);
+      } finally {
+        sessionStorage.removeItem(otaPendingVersionKey);
+        otaInstallBusy = false;
+        updateOtaPanel(otaSnapshot);
       }
     }
+
+    async function installAppUpdate() {
+      const version = otaCandidate;
+      if (otaInstallBusy || !version || !otaSnapshot.can_install || otaSnapshot.download?.state !== 'downloaded') return;
+      if (!window.confirm('Install ' + version + '? The web service will restart.')) return;
+      await trackOtaInstall(version, true);
+    }
     async function downloadAppUpdate() {
-      if (!otaCandidate) return;
+      if (otaInstallBusy || !otaCandidate) return;
       try {
         const data = await api('/api/ota/download', 'POST', { version: otaCandidate });
         updateOtaPanel(data);
@@ -4701,6 +4780,11 @@ HTML_PAGE = """<!doctype html>
     }
     setTheme(localStorage.getItem('autorun_final_theme') || defaultTheme);
     renderPanelWheel();
+    const pendingOtaVersion = sessionStorage.getItem(otaPendingVersionKey);
+    if (pendingOtaVersion) {
+      selectTab('settings');
+      void trackOtaInstall(pendingOtaVersion, false);
+    }
     setInterval(refreshState, 1000);
     setInterval(refreshLidarPreview, 200);
     setInterval(refreshPreview, 250);
@@ -5687,7 +5771,7 @@ class WebController:
         received = 0
         started_at = time.monotonic()
         try:
-            request = Request(release_url, headers={"Accept": "application/octet-stream", "User-Agent": "autorunlida-ota"})
+            request = Request(release_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "autorunlida-ota"})
             with urlopen(request, timeout=30) as response, partial.open("wb") as output:
                 total = int(response.headers.get("Content-Length") or 0)
                 while True:
