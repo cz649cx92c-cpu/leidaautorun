@@ -10,9 +10,11 @@ import signal
 import socket
 import subprocess
 import shutil
+import tempfile
 import threading
 import time
 from collections import deque
+from dataclasses import replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -53,10 +55,16 @@ from app import (  # type: ignore
     now_text,
     project_ground_pose,
 )
+from backend import front_lidar_preview_config
 from control.official_fwmini_compat import get_bridge
-from row_geometry import RowFollowerConfig, estimate_row
+from row_geometry import (
+    ROBOT_FRAME_BACK, ROBOT_FRAME_FRONT, ROBOT_FRAME_LEFT, ROBOT_FRAME_RIGHT,
+    RowDebugData, RowEstimate, RowFollowerConfig, estimate_row,
+    estimate_row_from_points, raw_scan_to_points,
+)
 from yhs_can_interfaces.msg import ChassisInfoFb
 from dual_lidar_config import (
+    CONFIG_PATH as DUAL_LIDAR_CONFIG_PATH,
     LidarConfig,
     legacy_lidar_driver_running,
     lidar_driver_running,
@@ -76,7 +84,6 @@ DEFAULT_LIDAR_X_OFFSET_M = "0.035"
 DEFAULT_LIDAR_Y_OFFSET_M = "0.0"
 DUAL_LIDAR_CONFIG = load_dual_lidar_config()
 LIDAR_SCAN_TOPIC = DUAL_LIDAR_CONFIG.front.scan_topic
-LIDAR_CALIBRATION_PATH = PROJECT_ROOT / "config" / "lidar_calibration.json"
 LIDAR_DRIVER_ROOT = Path("/home/orangepi/ugv")
 LIDAR_DRIVER_BIN = LIDAR_DRIVER_ROOT / "install" / "lidar_pkg" / "lib" / "lidar_pkg" / "lidar_node"
 LIDAR_DRIVER_PARAMS = (
@@ -88,7 +95,7 @@ OTA_REMOTE = "leidaautorun"
 OTA_REPOSITORY = "cz649cx92c-cpu/leidaautorun"
 OTA_RELEASES_URL = f"https://api.github.com/repos/{OTA_REPOSITORY}/releases"
 OTA_BRANCH_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
-APP_VERSION = "v1.5.0"
+APP_VERSION = "v1.6.0"
 OTA_DOWNLOAD_DIR = PROJECT_ROOT / "runtime" / "ota"
 GAMEPAD_SPEED_LIMITS: dict[str, tuple[float, float]] = {
     "low": (0.15, 25.0),
@@ -97,22 +104,53 @@ GAMEPAD_SPEED_LIMITS: dict[str, tuple[float, float]] = {
 }
 
 
-def load_lidar_preview_calibration() -> dict[str, float]:
-    calibration = {
-        "lidar_yaw_correction_deg": float(DEFAULT_LIDAR_YAW_CORRECTION_DEG),
-        "lidar_x_offset_m": float(DEFAULT_LIDAR_X_OFFSET_M),
-        "lidar_y_offset_m": float(DEFAULT_LIDAR_Y_OFFSET_M),
+def editable_lidar_extrinsics(sensor: LidarConfig) -> dict[str, float]:
+    return {
+        "yaw_deg": sensor.lidar_yaw_correction_deg,
+        "lateral_cm": round(sensor.lidar_y_offset_m * 100.0, 8),
     }
-    try:
-        payload = json.loads(LIDAR_CALIBRATION_PATH.read_text(encoding="utf-8"))
-        if isinstance(payload, dict):
-            for key in tuple(calibration):
-                value = float(payload.get(key, calibration[key]))
-                if math.isfinite(value):
-                    calibration[key] = value
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        pass
-    return calibration
+
+
+def parse_lidar_extrinsics(payload: dict[str, Any]) -> tuple[float, float]:
+    values = []
+    for key, limit in (("yaw_deg", 180.0), ("lateral_cm", 100.0)):
+        raw = payload.get(key)
+        if type(raw) not in (int, float) or abs(raw) > limit or not math.isfinite(raw):
+            raise ValueError(f"{key} 应为 ±{limit:g} 以内的数值。")
+        values.append(float(raw))
+    return values[0], values[1]
+
+
+def estimate_lidar_extrinsics(
+    scans: list[RosLaserScan],
+    row_cfg: RowFollowerConfig,
+) -> tuple[float, float, int]:
+    # Allow an old extrinsic to shift returns toward the current chassis frame
+    # while looking for both sides. The driving estimator keeps its own limits.
+    cfg = replace(row_cfg, vehicle_half_width=0.08, safety_margin=0.0, forward_max=1.35)
+    estimates = []
+    reference_x = cfg.lidar_x_offset_m
+    reference_y = cfg.lidar_y_offset_m
+    for scan in scans:
+        row, _ = estimate_row(scan, cfg, cfg.row_width)
+        if not (row.found and row.left_valid and row.right_valid and row.effective_mode == "both_sides"
+                and row.center_line and cfg.min_row_width <= row.row_width <= cfg.max_row_width):
+            continue
+        slope, intercept = row.center_line
+        # Rear tracking reflects X only. Undo that reflection for body yaw.
+        heading = math.atan(-slope if cfg.reflect_x_axis else slope)
+        if not (abs(heading) <= math.radians(22.0) and abs(intercept) <= 0.20):
+            continue
+        # Rotate around the lidar mount, then translate the row to body Y=0.
+        lateral = math.cos(heading) * (reference_y - intercept) - math.sin(heading) * reference_x
+        estimates.append((cfg.lidar_yaw_correction_deg - math.degrees(heading), lateral))
+    if len(estimates) < 5:
+        raise ValueError("未稳定识别到两侧植物边界。请确认车辆停在直通道中线、车头摆正，或先手动粗调角度。")
+    lower, upper = np.percentile(estimates, (20, 80), axis=0)
+    if upper[0] - lower[0] > 3.0 or upper[1] - lower[1] > 0.035:
+        raise ValueError("多帧结果不稳定。请保持车辆静止并重新计算。")
+    yaw, lateral = np.median(estimates, axis=0)
+    return round((float(yaw) + 180.0) % 360.0 - 180.0, 2), round(float(lateral) * 100.0, 2), len(estimates)
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -810,19 +848,6 @@ HTML_PAGE = """<!doctype html>
       display: grid;
       gap: 16px;
     }
-    .tuning-layout {
-      grid-template-columns: minmax(0, 1fr);
-    }
-    .tuning-main-stack {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      gap: 16px;
-      align-content: start;
-      width: 100%;
-    }
-    .tuning-main-stack > .panel {
-      height: 100%;
-    }
     .tuning-notes {
       grid-column: 1 / -1;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -862,7 +887,6 @@ HTML_PAGE = """<!doctype html>
     @media (max-width: 1240px) {
       .shell, .dashboard-layout, .settings-layout { grid-template-columns: 1fr; }
       .hero-stats, .workflow-board { grid-template-columns: 1fr 1fr; }
-      .tuning-main-stack { grid-template-columns: 1fr; }
       .tuning-notes { grid-template-columns: 1fr; }
     }
     @media (max-width: 860px) {
@@ -1341,6 +1365,47 @@ HTML_PAGE = """<!doctype html>
     .lidar-key.right { background: #ea580c; }
     .lidar-key.center { background: #e11d48; }
     .lidar-example-note strong { color: var(--ui-text); }
+    .lidar-tuning-preview {
+      position: fixed;
+      z-index: 140;
+      right: max(12px, calc((100% - 1120px) / 2));
+      bottom: 16px;
+      width: min(500px, calc(50% - 24px));
+      max-height: calc(100dvh - 32px);
+      overflow: auto;
+      padding: 14px;
+      border: 1px solid var(--ui-line);
+      border-radius: 16px;
+      background: var(--ui-strong-surface);
+      box-shadow: 0 16px 52px var(--ui-overlay-shadow);
+      color: var(--ui-text);
+      animation: lidarPreviewEnter 160ms ease-out;
+    }
+    @keyframes lidarPreviewEnter {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: none; }
+    }
+    .lidar-tuning-preview header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .lidar-tuning-preview h2 { margin: 0; font-size: 16px; }
+    .lidar-tuning-preview canvas {
+      display: block;
+      width: 100%;
+      height: clamp(180px, 43vh, 390px);
+      border: 1px solid var(--ui-line-soft);
+      border-radius: 10px;
+    }
+    .lidar-tuning-preview canvas[hidden] { display: none; }
+    #lidarTunePreviewStatus { margin: 7px 0; color: var(--ui-muted); font-size: 12px; }
+    @media (max-width: 780px) {
+      .lidar-tuning-preview { bottom: 8px; width: calc(100% - 24px); max-height: 49dvh; padding: 10px; }
+      .lidar-tuning-preview canvas { height: clamp(140px, 30vh, 250px); }
+    }
     .properties {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -1654,9 +1719,6 @@ HTML_PAGE = """<!doctype html>
     .step-dependency { margin-top: auto; }
     .locked-stage { border-style: solid; border-radius: 16px; }
     .settings-layout { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
-    .tuning-main-stack { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
-    .settings-layout.tuning-layout { grid-template-columns: minmax(0, 1fr); }
-    .tuning-main-stack > .panel { padding: 18px; }
     .subpanel { padding:14px; background: var(--ui-strong-surface); }
     .note { box-shadow: none; }
     button { letter-spacing: .01em; }
@@ -1675,7 +1737,7 @@ HTML_PAGE = """<!doctype html>
     }
     @media (max-width: 820px) {
       .page.control-root { padding: 10px; }
-      .summary-strip, .workflow-board.primary-workflow, .workflow-board.secondary-workflow, .tuning-main-stack { grid-template-columns: 1fr; }
+      .summary-strip, .workflow-board.primary-workflow, .workflow-board.secondary-workflow { grid-template-columns: 1fr; }
       .summary-cell { border-right: 0; border-bottom: 1px solid var(--ui-line-soft); }
       .summary-cell:last-child { border-bottom: 0; }
       .ops-rail { grid-template-columns: 1fr; }
@@ -2259,108 +2321,82 @@ HTML_PAGE = """<!doctype html>
       color: color-mix(in srgb, var(--ui-warn) 90%, var(--ui-text));
       box-shadow: none;
     }
-    #tab-settings .projection-tuning-panel {
-      padding: 14px 16px;
-    }
-    #tab-settings .projection-tuning-panel .panel-head.tight {
-      margin-bottom: 8px;
-    }
-    #tab-settings .projection-tuning-panel .subpanel {
-      gap: 6px;
-    }
-    #tab-settings .projection-tuning-panel .field-inline {
-      gap: 6px;
-    }
-    #tab-settings .projection-tuning-panel .field {
-      gap: 4px;
-    }
-    #tab-settings .projection-tuning-panel label {
-      font-size: 10px;
-      line-height: 1.1;
-    }
-    #tab-settings .projection-tuning-panel input {
-      min-height: 32px;
-      padding: 5px 9px;
-      border-radius: 8px;
-      font-size: 12px;
-    }
-    #tab-settings .projection-tuning-panel .button-row {
-      gap: 6px;
-      margin-top: 2px;
-    }
-    #tab-settings .projection-tuning-panel .button-row button {
-      min-height: 32px;
-    }
-    #tab-settings .ota-panel {
-      grid-column: 1 / -1;
-      width: min(960px, 100%);
-      justify-self: center;
+    #tab-settings.overlay-panel {
+      width: min(1120px, calc(100% - 32px));
+      max-height: calc(100dvh - 92px);
       padding: 0;
       overflow: hidden;
-      border-radius: 14px;
-      background: color-mix(in srgb, var(--ui-panel) 96%, transparent);
+      background: var(--ui-strong-surface);
+      backdrop-filter: none;
     }
-    /* Keep the tuning controls readable without stretching sparse cards. */
-    #tab-settings .tuning-main-stack {
-      align-items: start;
-      gap: 14px;
+    #tab-settings.overlay-panel.active {
+      display: flex;
+      flex-direction: column;
     }
-    #tab-settings .tuning-main-stack > .panel {
-      height: auto;
-      align-self: start;
-      padding: 20px;
-    }
-    #tab-settings .tuning-main-stack > .panel .panel-head {
-      margin-bottom: 12px;
-    }
-    #tab-settings .tuning-main-stack > .panel .panel-head h2 {
-      font-size: 20px;
-    }
-    #tab-settings .tuning-main-stack > .panel .subpanel {
-      padding: 18px;
+    .tuning-sheet-head {
+      flex: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
       gap: 12px;
+      padding: 14px 24px;
+      border-bottom: 1px solid var(--ui-line);
     }
-    #tab-settings .tuning-controls-grid {
+    .tuning-sheet-head h2 { font-size: 21px; }
+    .tuning-sheet-body {
+      min-height: 0;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      padding: 22px 24px 20px;
+    }
+    .tuning-columns {
+      display: grid;
+      grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr);
+    }
+    .tuning-group { min-width: 0; }
+    .tuning-group + .tuning-group {
+      margin-left: 24px;
+      padding-left: 24px;
+      border-left: 1px solid var(--ui-line);
+    }
+    .tuning-group h3 { font-size: 16px; }
+    .tuning-group .panel-sub { font-size: 12px; }
+    .tuning-fields {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 12px;
+      margin-top: 14px;
     }
-    #tab-settings .tuning-main-stack > .panel .field-inline {
-      gap: 12px;
-    }
-    #tab-settings .tuning-main-stack > .panel .field {
-      gap: 6px;
-    }
-    #tab-settings .tuning-main-stack > .panel label {
-      font-size: 12px;
-      line-height: 1.2;
-    }
-    #tab-settings .tuning-main-stack > .panel input {
-      min-height: 42px;
-      padding: 8px 12px;
-      font-size: 15px;
-    }
-    #tab-settings .tuning-main-stack > .panel .button-row {
-      gap: 10px;
-      margin-top: 4px;
-    }
-    #tab-settings .tuning-main-stack > .panel .button-row button {
-      min-height: 42px;
+    .tuning-radar .tuning-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .tuning-radar .tuning-sensor { grid-column: 1 / -1; }
+    .tuning-fields .field { min-width: 0; gap: 5px; }
+    .tuning-fields label { font-size: 12px; line-height: 1.3; }
+    .tuning-fields input, .tuning-fields select {
+      min-height: 38px;
+      padding: 7px 10px;
       font-size: 14px;
+      background: var(--ui-panel);
     }
-    #tab-settings .ota-panel {
-      width: min(1100px, 100%);
-      padding: 0;
+    .tuning-actions, .ota-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
     }
-    #tab-settings .tuning-main-stack {
-      grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+    .tuning-actions { margin-top: 12px; }
+    .tuning-actions button, .tuning-sheet-head button, .ota-actions button,
+    .lidar-tuning-preview button {
+      width: auto;
+      min-width: 0;
+      min-height: 36px;
+      padding: 0 12px;
+      font-size: 12px;
+      box-shadow: none;
+      white-space: nowrap;
     }
-    #tab-settings .ota-panel {
-      grid-column: auto;
-      width: 100%;
-      justify-self: stretch;
-      align-self: start;
-    }
+    #lidarTuneSaved { margin-top: 10px; }
+    #lidarTuneStatus:empty { display: none; }
+    #lidarTuneStatus:not(:empty) { margin-top: 8px; }
+
     .toast-stack {
       top: 50%;
       right: auto;
@@ -2375,82 +2411,62 @@ HTML_PAGE = """<!doctype html>
       line-height: 1.5;
       border-radius: 14px;
     }
-    #tab-settings .ota-panel:hover { transform: none; }
-    .ota-update-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      align-items: center;
-      padding: 12px 16px;
-      border-bottom: 1px solid var(--ui-line-soft);
-    }
-    .ota-update-head h2 { font-size: 15px; }
-    .ota-update-head .panel-sub { margin-top: 3px; }
-    .ota-overview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); }
-    .ota-version-summary, .ota-release-summary { padding: 13px 16px; }
-    .ota-version-summary { border-right: 1px solid var(--ui-line-soft); }
-    .ota-label {
-      color: var(--ui-muted);
-      font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-    }
-    .ota-version-line {
+    .tuning-update {
+      margin-top: 22px;
+      padding-top: 17px;
+      border-top: 1px solid var(--ui-line);
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr);
       gap: 10px;
-      align-items: end;
-      max-width: none;
-      margin: 8px 0 0;
     }
-    .ota-version-value {
-      margin-top: 5px;
-      color: var(--ui-text);
-      font-size: 20px;
-      line-height: 1;
-      font-weight: 760;
+    .tuning-update h3 { font-size: 15px; }
+    .ota-overview, .ota-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 16px;
     }
+    .ota-version-line { display: flex; align-items: center; gap: 11px; }
+    .ota-label { color: var(--ui-muted); font-size: 11px; }
+    .ota-version-value { color: var(--ui-text); font-weight: 700; font-variant-numeric: tabular-nums; }
     .ota-version-value.available { color: var(--ui-accent); }
-    .ota-version-arrow {
-      color: var(--ui-muted);
-      font-size: 20px;
-      line-height: 1;
-      text-align: center;
-    }
-    .ota-release-summary { display: grid; align-content: center; gap: 8px; }
-    .ota-release-title { color: var(--ui-text); font-size: 13px; font-weight: 720; }
-    .ota-release-copy { color: var(--ui-muted); font-size: 12px; line-height: 1.45; }
+    .ota-version-arrow, .ota-release-title { color: var(--ui-muted); font-size: 12px; }
+    .ota-release-title { overflow-wrap: anywhere; }
     .ota-progress-row {
+      flex: 1 1 260px;
       display: grid;
-      grid-template-columns: auto minmax(0, 1fr) auto;
-      gap: 12px;
-      align-items: center;
-      padding: 10px 16px;
-      border-top: 1px solid var(--ui-line-soft);
-      border-bottom: 1px solid var(--ui-line-soft);
-      background: color-mix(in srgb, var(--ui-strong-surface) 64%, transparent);
-    }
-    .ota-progress-title { color: var(--ui-text); font-size: 12px; font-weight: 700; }
-    .ota-progress-track { height: 6px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--ui-muted) 17%, transparent); }
-    .ota-progress-fill { width: 0%; height: 100%; border-radius: inherit; background: var(--ui-accent); transition: width 180ms ease; }
-    .ota-progress-value { min-width: 112px; color: var(--ui-accent); font-size: 12px; font-weight: 750; text-align: right; }
-    .ota-actions {
-      display: flex;
-      justify-content: flex-end;
+      grid-template-columns: minmax(24px, 1fr) auto;
       gap: 10px;
-      padding: 12px 16px;
+      align-items: center;
+      min-width: 0;
     }
-    .ota-actions button { width: auto; min-width: 122px; min-height: 34px; padding: 0 13px; }
-    @media (max-width: 820px) {
-      #tab-settings .ota-panel { width: 100%; }
-      #tab-settings .tuning-controls-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .ota-overview { grid-template-columns: 1fr; }
-      .ota-version-summary { border-bottom: 1px solid var(--ui-line-soft); }
-      .ota-actions { display: grid; grid-template-columns: 1fr; }
-      .ota-actions button { width: 100%; }
+    .ota-progress-track {
+      height: 5px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--ui-muted) 17%, transparent);
     }
-    @media (max-width: 560px) {
-      #tab-settings .tuning-controls-grid { grid-template-columns: 1fr; }
+    .ota-progress-fill { width: 0%; height: 100%; background: var(--ui-accent); transition: width 180ms ease; }
+    .ota-progress-value { color: var(--ui-muted); font-size: 12px; }
+    .ota-actions { margin-left: auto; }
+    @media (max-width: 780px) {
+      #tab-settings.overlay-panel { width: calc(100% - 20px); }
+      .tuning-sheet-head { padding: 10px 15px; }
+      .tuning-sheet-body { padding: 15px; }
+      .tuning-columns { grid-template-columns: minmax(0, 1fr); }
+      .tuning-group + .tuning-group {
+        margin: 18px 0 0;
+        padding: 15px 0 0;
+        border-left: 0;
+        border-top: 1px solid var(--ui-line);
+      }
+      .ota-actions { margin-left: 0; }
+    }
+    @media (max-width: 460px) {
+      .tuning-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .tuning-actions button, .ota-actions button { padding: 0 9px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #tab-settings.overlay-panel.active, .lidar-tuning-preview { animation: none; }
     }
     body.workflow-overlay-open {
       overflow: hidden;
@@ -2758,31 +2774,32 @@ HTML_PAGE = """<!doctype html>
                 <div class="lidar-example-head">
                   <div>
                     <div class="lidar-example-title">
-                      <h2 id="lidarExampleTitle">Lidar Channel Geometry</h2>
-                      <span class="lidar-sample-badge" id="lidarDataBadge">Waiting for /scan</span>
+                      <h2 id="lidarExampleTitle">Front Lidar Channel Geometry</h2>
+                      <span class="lidar-sample-badge" id="lidarDataBadge">Waiting for front lidar</span>
                     </div>
                   </div>
                   <div class="lidar-geometry" aria-label="Lidar geometry parameters">
                     <span class="lidar-chip">Channel <strong id="lidarChannelState">--</strong></span>
                     <span class="lidar-chip">Row <strong id="lidarRowWidth">--</strong></span>
                     <span class="lidar-chip">Vehicle <strong>0.40 × 0.62 m</strong></span>
-                    <span class="lidar-chip">Lookahead <strong>0.60 m</strong></span>
+                    <span class="lidar-chip">ROS topic <strong id="lidarScanTopic">--</strong></span>
+                    <span class="lidar-chip">Lookahead <strong id="lidarLookahead">--</strong></span>
                     <span class="lidar-chip">Points <strong id="lidarPointCount">--</strong></span>
                     <span class="lidar-chip">Scan <strong id="lidarScanRate">-- Hz</strong></span>
                   </div>
                 </div>
                 <div class="lidar-canvas-wrap">
-                  <canvas id="lidarExampleCanvas" aria-label="Example lidar point cloud with row boundaries, centerline and scaled vehicle footprint"></canvas>
-                  <div class="lidar-axis-note">+X forward · lateral crop ±0.75 m</div>
+                  <canvas id="lidarExampleCanvas" aria-label="Front lidar scan, vehicle mask, and channel fit"></canvas>
+                  <div class="lidar-axis-note" id="lidarCropNote">+X forward</div>
                 </div>
                 <div class="lidar-example-foot">
                   <div class="lidar-legend">
-                    <span><i class="lidar-key"></i>Raw scan</span>
+                    <span><i class="lidar-key"></i>Scan after body mask</span>
                     <span><i class="lidar-key left"></i>Left fit</span>
                     <span><i class="lidar-key right"></i>Right fit</span>
                     <span><i class="lidar-key center"></i>Centerline</span>
                   </div>
-                  <span class="lidar-example-note" id="lidarDataNote">Detection window <strong>0.15–1.60 m</strong> · side clearance <strong>0.10 m / side</strong></span>
+                  <span class="lidar-example-note" id="lidarDataNote"></span>
                 </div>
               </section>
             </div>
@@ -2951,70 +2968,76 @@ HTML_PAGE = """<!doctype html>
           </div>
         </section>
 
-        <section id="tab-settings" class="tab-panel overlay-panel">
-          <button class="secondary overlay-close" onclick="selectTab('dashboard')">Close</button>
-          <div class="settings-layout tuning-layout">
-            <div class="tuning-main-stack">
-              <div class="panel tuning-controls-panel">
-                <div class="panel-head tight">
-                  <div>
-                    <h2>Tuning</h2>
+        <section id="tab-settings" class="tab-panel overlay-panel" aria-labelledby="tuningTitle">
+          <div class="tuning-sheet-head">
+            <h2 id="tuningTitle">Tuning</h2>
+            <button type="button" class="secondary" onclick="selectTab('dashboard')">Close</button>
+          </div>
+          <div class="tuning-sheet-body">
+            <div class="tuning-columns">
+              <section class="tuning-group tuning-radar" aria-labelledby="tuningRadarTitle">
+                <h3 id="tuningRadarTitle">局部跟踪雷达标定</h3>
+                <p class="panel-sub">将车停在通道中线，车头与通道平行。</p>
+                <div class="tuning-fields">
+                  <div class="field tuning-sensor">
+                    <label for="lidarTuneRole">雷达</label>
+                    <select id="lidarTuneRole" disabled><option value="front">前雷达</option><option value="rear">后雷达</option></select>
+                  </div>
+                  <div class="field">
+                    <label for="lidarTuneYaw">角度修正 (°)</label>
+                    <input id="lidarTuneYaw" type="number" min="-180" max="180" step="0.01" disabled>
+                  </div>
+                  <div class="field">
+                    <label for="lidarTuneLateral">横向偏移 (cm，向左为正)</label>
+                    <input id="lidarTuneLateral" type="number" min="-100" max="100" step="0.01" disabled>
                   </div>
                 </div>
-                <div class="subpanel">
-                  <div class="tuning-controls-grid">
-                    <div class="field"><label for="lineCruiseVx">Cruise vx</label><input id="lineCruiseVx"></div>
-                    <div class="field"><label for="sensorHeight">Sensor Height (m)</label><input id="sensorHeight"></div>
-                    <div class="field"><label for="bodyXOffset">Body X Offset (m)</label><input id="bodyXOffset"></div>
-                    <div class="field"><label for="bodyYOffset">Body Y Offset (m)</label><input id="bodyYOffset"></div>
-                    <div class="field"><label for="rollGain">Roll Gain</label><input id="rollGain"></div>
-                    <div class="field"><label for="pitchGain">Pitch Gain</label><input id="pitchGain"></div>
-                  </div>
-                  <div class="button-row">
-                    <button onclick="captureProjectionAnchor()">Capture Anchor</button>
-                    <button class="secondary" onclick="saveSettings()">Save Tuning</button>
-                  </div>
+                <p class="panel-sub" id="lidarTuneSaved"></p>
+                <div class="tuning-actions">
+                  <button id="lidarTuneMeasure" type="button" class="secondary" disabled>按中线计算</button>
+                  <button id="lidarTunePreviewOpen" type="button" class="secondary" aria-controls="lidarTunePreview" aria-expanded="false" disabled>预览点云</button>
+                  <button id="lidarTuneSave" type="button" disabled>保存外参</button>
                 </div>
+                <p class="panel-sub" id="lidarTuneStatus" role="status"></p>
+              </section>
+              <section class="tuning-group" aria-labelledby="tuningVehicleTitle">
+                <h3 id="tuningVehicleTitle">Vehicle &amp; projection</h3>
+                <div class="tuning-fields">
+                  <div class="field"><label for="lineCruiseVx">Cruise vx</label><input id="lineCruiseVx"></div>
+                  <div class="field"><label for="sensorHeight">Sensor Height (m)</label><input id="sensorHeight"></div>
+                  <div class="field"><label for="bodyXOffset">Body X Offset (m)</label><input id="bodyXOffset"></div>
+                  <div class="field"><label for="bodyYOffset">Body Y Offset (m)</label><input id="bodyYOffset"></div>
+                  <div class="field"><label for="rollGain">Roll Gain</label><input id="rollGain"></div>
+                  <div class="field"><label for="pitchGain">Pitch Gain</label><input id="pitchGain"></div>
+                </div>
+                <div class="tuning-actions">
+                  <button type="button" class="secondary" onclick="captureProjectionAnchor()">Capture Anchor</button>
+                  <button type="button" onclick="saveSettings()">Save Tuning</button>
+                </div>
+              </section>
+            </div>
+            <section class="tuning-update" aria-labelledby="tuningUpdateTitle">
+              <h3 id="tuningUpdateTitle">Application Update</h3>
+              <div class="ota-overview">
+                <div class="ota-version-line">
+                  <span class="ota-label">Current <strong class="ota-version-value" id="otaCurrentVersion">--</strong></span>
+                  <span class="ota-version-arrow" aria-hidden="true">&rarr;</span>
+                  <span class="ota-label">Available <strong class="ota-version-value available" id="otaAvailableVersion">--</strong></span>
+                </div>
+                <div class="ota-release-title" id="otaReleaseTitle">Ready to check for updates</div>
               </div>
-
-              <div class="panel ota-panel">
-                <div class="ota-update-head">
-                  <div>
-                    <h2>Application Update</h2>
-                  </div>
-                </div>
-                <div class="ota-overview">
-                  <div class="ota-version-summary">
-                    <div class="ota-label">Version</div>
-                    <div class="ota-version-line">
-                      <div>
-                        <div class="ota-label">Current</div>
-                        <div class="ota-version-value" id="otaCurrentVersion">--</div>
-                      </div>
-                      <div class="ota-version-arrow" aria-hidden="true">&rarr;</div>
-                      <div>
-                        <div class="ota-label">Available</div>
-                        <div class="ota-version-value available" id="otaAvailableVersion">--</div>
-                      </div>
-                    </div>
-                  </div>
-                  <div class="ota-release-summary">
-                    <div class="ota-release-title" id="otaReleaseTitle">Ready to check for updates</div>
-                  </div>
-                </div>
-                <div class="ota-progress-row">
-                  <div class="ota-progress-title">Download</div>
+              <div class="ota-controls">
+                <div class="ota-progress-row" aria-label="Download progress">
                   <div class="ota-progress-track"><div class="ota-progress-fill" id="otaProgressFill"></div></div>
                   <div class="ota-progress-value" id="otaProgressValue">Not downloaded</div>
                 </div>
                 <div class="ota-actions">
-                  <button class="secondary" onclick="checkAppUpdate()">Check Update</button>
-                  <button class="secondary" id="otaDownloadBtn" onclick="downloadAppUpdate()" disabled>Download Update</button>
-                  <button id="otaInstallBtn" onclick="installAppUpdate()" disabled>Install Update</button>
+                  <button type="button" class="secondary" onclick="checkAppUpdate()">Check Update</button>
+                  <button type="button" class="secondary" id="otaDownloadBtn" onclick="downloadAppUpdate()" disabled>Download Update</button>
+                  <button type="button" id="otaInstallBtn" onclick="installAppUpdate()" disabled>Install Update</button>
                 </div>
               </div>
-
-            </div>
+            </section>
           </div>
         </section>
 
@@ -3034,6 +3057,22 @@ HTML_PAGE = """<!doctype html>
       </main>
     </section>
   </div>
+<aside id="lidarTunePreview" class="lidar-tuning-preview" aria-labelledby="lidarTunePreviewTitle" hidden>
+  <header>
+    <h2 id="lidarTunePreviewTitle">雷达预览</h2>
+    <button id="lidarTunePreviewClose" class="secondary" type="button">关闭预览</button>
+  </header>
+  <p id="lidarTunePreviewStatus"></p>
+  <canvas id="lidarTunePreviewCanvas" aria-label="局部跟踪实时点云与通道中线" hidden></canvas>
+  <div class="lidar-example-foot">
+    <div class="lidar-legend">
+      <span><i class="lidar-key"></i>屏蔽后点云</span>
+      <span><i class="lidar-key left"></i>左边界</span>
+      <span><i class="lidar-key right"></i>右边界</span>
+      <span><i class="lidar-key center"></i>通道中线</span>
+    </div>
+  </div>
+</aside>
 <script>
     let stateCache = null;
     let lidarFrame = null;
@@ -3579,6 +3618,12 @@ HTML_PAGE = """<!doctype html>
         panelWheelIndex = wheelIndex;
         renderPanelWheel();
       }
+      if (nextTab === 'settings') {
+        document.querySelector('.tuning-sheet-body').scrollTop = 0;
+        loadLidarTuning();
+      } else {
+        setLidarTunePreviewOpen(false);
+      }
       document.body.classList.toggle('workflow-overlay-open', nextTab === 'tasks');
       document.getElementById('tab-dashboard')?.classList.add('active');
       for (const name of overlayTabs) {
@@ -3588,7 +3633,9 @@ HTML_PAGE = """<!doctype html>
     }
 
     document.addEventListener('keydown', event => {
-      if (event.key === 'Escape' && activeTab !== 'dashboard') selectTab('dashboard');
+      if (event.key !== 'Escape') return;
+      if (!lidarTunePreview.panel.hidden) setLidarTunePreviewOpen(false);
+      else if (activeTab !== 'dashboard') selectTab('dashboard');
     });
 
     async function onRecordMapChanged() {
@@ -3725,47 +3772,34 @@ HTML_PAGE = """<!doctype html>
         ? lidarFrame.geometry
         : {};
       const channelFound = live && geometry.found === true;
-      const controlAccepted = channelFound && geometry.control_accepted === true;
+      const fitValid = channelFound && geometry.fit_valid === true;
+      const sideMode = geometry.mode === 'left_only' || geometry.mode === 'right_only';
       const centerOffset = Number(geometry.center_y_m);
       setMetricValue(
         'metricCenterOffset',
-        channelFound && Number.isFinite(centerOffset) ? centerOffset.toFixed(3) : '--',
+        fitValid && Number.isFinite(centerOffset) ? centerOffset.toFixed(3) : '--',
         'm',
       );
-      setTextContent(
-        'metricGuidance',
-        controlAccepted ? 'Channel tracking' : live ? 'Lidar scanning' : 'Waiting /scan',
-      );
+      setTextContent('metricGuidance', fitValid ? 'Front lidar fit' : live ? 'Lidar scanning' : 'Waiting for front lidar');
+      setTextContent('lidarScanTopic', lidarFrame?.topic || '--');
+      setTextContent('lidarLookahead', live ? `${Number(lidarFrame.lookahead_x_m).toFixed(2)} m` : '--');
+      setTextContent('lidarCropNote', live ? `+X forward · lateral crop ±${Number(lidarFrame.crop_m[2]).toFixed(2)} m` : '+X forward');
       if (badge) {
-        badge.classList.toggle('live', controlAccepted);
-        badge.textContent = controlAccepted
-          ? `CHANNEL · ${Number(lidarFrame.scan_hz || 0).toFixed(1)} Hz`
-          : channelFound
-            ? `GEOMETRY ONLY · ${Number(lidarFrame.scan_hz || 0).toFixed(1)} Hz`
-          : live
-            ? `NO CHANNEL · ${Number(lidarFrame.scan_hz || 0).toFixed(1)} Hz`
-          : String(lidarFrame?.status || 'Waiting for /scan');
+        badge.classList.toggle('live', live);
+        badge.textContent = live ? 'Front scan live' : 'Waiting for front lidar';
       }
-      if (pointCount) pointCount.textContent = live ? String(lidarFrame.visible_count ?? lidarFrame.points?.length ?? 0) : '--';
-      if (scanRate) scanRate.textContent = live ? `${Number(lidarFrame.scan_hz || 0).toFixed(1)} Hz` : '-- Hz';
-      if (channelState) {
-        channelState.textContent = controlAccepted
-          ? 'TRACKABLE'
-          : channelFound
-            ? 'GEOMETRY ONLY'
-            : 'NOT DETECTED';
-      }
+      if (pointCount) pointCount.textContent = live ? String(lidarFrame.visible_count) : '--';
+      if (scanRate) scanRate.textContent = live ? `${Number(lidarFrame.scan_hz).toFixed(1)} Hz` : '-- Hz';
+      if (channelState) channelState.textContent = fitValid ? (sideMode ? 'ONE SIDE' : 'FITTED') : channelFound ? 'REJECTED' : 'NOT DETECTED';
       if (rowWidth) {
-        rowWidth.textContent = channelFound && Number.isFinite(Number(geometry.row_width_m))
-          ? `${Number(geometry.row_width_m).toFixed(2)} m`
+        rowWidth.textContent = fitValid && Number(geometry.row_width_m) > 0
+          ? `${Number(geometry.row_width_m).toFixed(2)} m${sideMode ? ' nominal' : ''}`
           : '--';
       }
       if (note) {
-        note.innerHTML = live
-          ? channelFound
-            ? `Two-side fit · left bins <strong>${Number(geometry.left_bins || 0)}</strong> · right bins <strong>${Number(geometry.right_bins || 0)}</strong> · measured width <strong>${Number(geometry.row_width_m || 0).toFixed(3)} m</strong>${controlAccepted ? '' : ' · guidance <strong>rejected</strong>'}`
-            : `Raw <strong>${Number(lidarFrame.raw_count || 0)}</strong> · valid <strong>${Number(lidarFrame.valid_count || 0)}</strong> · only raw points are shown`
-          : `Detection window <strong>0.15–1.60 m</strong> · side clearance <strong>0.10 m / side</strong>`;
+        note.textContent = live
+          ? `Raw ${lidarFrame.raw_count} · Valid ${lidarFrame.valid_count} · Fit input ${lidarFrame.fit_point_count} · ${Number(lidarFrame.yaw_correction_deg).toFixed(2)}° / ${(Number(lidarFrame.offset_y_m) * 100).toFixed(2)} cm`
+          : '';
       }
     }
 
@@ -3870,6 +3904,188 @@ HTML_PAGE = """<!doctype html>
         lidarRequestInFlight = false;
       }
     }
+
+    const lidarTuning = {
+      role: document.getElementById('lidarTuneRole'),
+      yaw: document.getElementById('lidarTuneYaw'),
+      lateral: document.getElementById('lidarTuneLateral'),
+      measure: document.getElementById('lidarTuneMeasure'),
+      save: document.getElementById('lidarTuneSave'),
+      saved: null,
+      busy: false,
+    };
+
+    const lidarTunePreview = {
+      button: document.getElementById('lidarTunePreviewOpen'),
+      panel: document.getElementById('lidarTunePreview'),
+      canvas: document.getElementById('lidarTunePreviewCanvas'),
+      requested: '',
+      inFlight: false,
+    };
+
+    function setLidarTunePreviewOpen(open) {
+      if (open && activeTab !== 'settings') return;
+      lidarTunePreview.panel.hidden = !open;
+      lidarTunePreview.button.setAttribute('aria-expanded', String(open));
+      if (open) {
+        refreshLidarTunePreview();
+      } else {
+        lidarTunePreview.requested = '';
+        lidarTunePreview.canvas.hidden = true;
+      }
+    }
+
+    async function refreshLidarTunePreview() {
+      const preview = lidarTunePreview;
+      if (preview.panel.hidden || document.hidden) return;
+      let values;
+      try {
+        values = readLidarTuning();
+      } catch (error) {
+        preview.requested = '';
+        preview.canvas.hidden = true;
+        setTextContent('lidarTunePreviewStatus', error.message);
+        return;
+      }
+      const key = JSON.stringify(values);
+      const selected = values.role === 'rear' ? '后雷达' : '前雷达';
+      const saved = lidarTuning.saved?.[values.role];
+      const hasEdits = saved && (saved.yaw_deg !== values.yaw_deg || saved.lateral_cm !== values.lateral_cm);
+      const params = `${values.yaw_deg}° · ${values.lateral_cm} cm${hasEdits ? ' · 未保存' : ''}`;
+      if (preview.requested !== key) {
+        preview.requested = key;
+        preview.canvas.hidden = true;
+        setTextContent('lidarTunePreviewTitle', `${selected}预览`);
+        setTextContent('lidarTunePreviewStatus', `${params} · 正在获取点云…`);
+      }
+      if (preview.inFlight) return;
+      preview.inFlight = true;
+      try {
+        const frame = await api('/api/lidar/calibration/preview', 'POST', values);
+        if (preview.panel.hidden || preview.requested !== key) return;
+        preview.canvas.hidden = !frame.live;
+        if (!frame.live) {
+          setTextContent('lidarTunePreviewStatus', `${params} · 等待有效点云`);
+          return;
+        }
+        const direction = values.role === 'rear' ? '↑ 车尾' : '↑ 车头';
+        const geometry = frame.geometry;
+        const side = geometry.mode === 'left_only' || geometry.mode === 'right_only';
+        const fit = geometry.fit_valid
+          ? `${side ? '单侧推定' : '中线已拟合'} · 偏移 ${(geometry.center_y_m * 100).toFixed(1)} cm · 航向 ${geometry.heading_deg.toFixed(1)}°`
+          : '未拟合出有效中线';
+        setTextContent('lidarTunePreviewStatus', `${params} · ${direction} · ${fit}`);
+        drawLidarFrame(preview.canvas, frame, performance.now(), true);
+      } catch (error) {
+        if (!preview.panel.hidden && preview.requested === key) {
+          preview.canvas.hidden = true;
+          setTextContent('lidarTunePreviewStatus', `${params} · 暂时无法获取雷达预览`);
+        }
+      } finally {
+        preview.inFlight = false;
+      }
+    }
+
+    lidarTunePreview.button.addEventListener('click', () => setLidarTunePreviewOpen(true));
+    document.getElementById('lidarTunePreviewClose').addEventListener('click', () => {
+      setLidarTunePreviewOpen(false);
+      lidarTunePreview.button.focus();
+    });
+    window.setInterval(refreshLidarTunePreview, 250);
+
+    function updateLidarTuningControls() {
+      const { role, yaw, lateral, measure, save, saved, busy } = lidarTuning;
+      role.disabled = yaw.disabled = lateral.disabled = measure.disabled = busy || !saved;
+      const current = saved?.[role.value];
+      lidarTunePreview.button.disabled = measure.disabled;
+      save.disabled = measure.disabled || (
+        yaw.valueAsNumber === current.yaw_deg && lateral.valueAsNumber === current.lateral_cm
+      );
+    }
+
+    function showSavedLidarTuning() {
+      const { role, yaw, lateral, saved } = lidarTuning;
+      const current = saved[role.value];
+      yaw.value = current.yaw_deg;
+      lateral.value = current.lateral_cm;
+      setTextContent('lidarTuneSaved', `已保存 ${current.yaw_deg}° · ${current.lateral_cm} cm`);
+    }
+
+    async function runLidarTuning(action) {
+      if (lidarTuning.busy) return;
+      lidarTuning.busy = true;
+      updateLidarTuningControls();
+      try {
+        await action();
+      } catch (error) {
+        let message = error.message;
+        try { message = JSON.parse(message).error || message; } catch (_) {}
+        setTextContent('lidarTuneStatus', message);
+      } finally {
+        lidarTuning.busy = false;
+        updateLidarTuningControls();
+      }
+    }
+
+    function loadLidarTuning() {
+      return runLidarTuning(async () => {
+        lidarTuning.saved = await api('/api/lidar/calibration');
+        showSavedLidarTuning();
+        setTextContent('lidarTuneStatus', '');
+      });
+    }
+
+    function readLidarTuning() {
+      const { role, yaw, lateral } = lidarTuning;
+      if (!Number.isFinite(yaw.valueAsNumber) || Math.abs(yaw.valueAsNumber) > 180 ||
+          !Number.isFinite(lateral.valueAsNumber) || Math.abs(lateral.valueAsNumber) > 100) {
+        throw new Error('请输入 ±180° 内的角度和 ±100 cm 内的横向偏移。');
+      }
+      return { role: role.value, yaw_deg: yaw.valueAsNumber, lateral_cm: lateral.valueAsNumber };
+    }
+
+    lidarTuning.role.addEventListener('change', () => {
+      showSavedLidarTuning();
+      setTextContent('lidarTuneStatus', '');
+      updateLidarTuningControls();
+      refreshLidarTunePreview();
+    });
+    lidarTuning.yaw.addEventListener('input', () => {
+      updateLidarTuningControls();
+      const angle = lidarTuning.yaw.valueAsNumber;
+      const savedAngle = lidarTuning.saved?.[lidarTuning.role.value]?.yaw_deg;
+      if (Number.isFinite(angle) && Math.abs(angle) <= 180 && angle !== savedAngle) {
+        setLidarTunePreviewOpen(true);
+      } else {
+        refreshLidarTunePreview();
+      }
+    });
+    lidarTuning.lateral.addEventListener('input', () => {
+      updateLidarTuningControls();
+      refreshLidarTunePreview();
+    });
+    lidarTuning.measure.addEventListener('click', () => runLidarTuning(async () => {
+      const values = readLidarTuning();
+      setTextContent('lidarTuneStatus', '正在采集静止扫描…');
+      const result = await api('/api/lidar/calibration/measure', 'POST', values);
+      lidarTuning.yaw.value = result.yaw_deg;
+      lidarTuning.lateral.value = result.lateral_cm;
+      setLidarTunePreviewOpen(true);
+      const current = lidarTuning.saved[values.role];
+      const yawDelta = ((result.yaw_deg - current.yaw_deg + 540) % 360) - 180;
+      const signed = value => (value > 0 ? '+' : '') + value.toFixed(2);
+      setTextContent('lidarTuneStatus', `${result.samples} 帧 · 相对已保存角度 ${signed(yawDelta)}°，横向 ${signed(result.lateral_cm - current.lateral_cm)} cm。请确认后保存。`);
+    }));
+    lidarTuning.save.addEventListener('click', () => runLidarTuning(async () => {
+      const values = readLidarTuning();
+      lidarTuning.saved = await api('/api/lidar/calibration', 'POST', {
+        ...values,
+        expected: lidarTuning.saved[values.role],
+      });
+      showSavedLidarTuning();
+      setTextContent('lidarTuneStatus', '已保存。下次启动局部跟踪时使用新外参。');
+      setLidarTunePreviewOpen(true);
+    }));
 
     async function saveSettings() {
       await api('/api/settings', 'POST', {
@@ -4165,10 +4381,15 @@ HTML_PAGE = """<!doctype html>
         return;
       }
       lidarLastDrawAt = timestamp;
+      drawLidarFrame(canvas, lidarFrame, timestamp);
+      window.requestAnimationFrame(drawLidarExample);
+    }
+
+    function drawLidarFrame(canvas, lidarFrame, timestamp, tuning=false) {
       const ctx = canvas.getContext('2d');
       const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
-      const cssWidth = Math.max(320, canvas.clientWidth || 900);
-      const cssHeight = Math.max(250, canvas.clientHeight || 320);
+      const cssWidth = canvas.clientWidth || 900;
+      const cssHeight = canvas.clientHeight || 320;
       const pixelWidth = Math.round(cssWidth * dpr);
       const pixelHeight = Math.round(cssHeight * dpr);
       if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
@@ -4192,19 +4413,13 @@ HTML_PAGE = """<!doctype html>
       ctx.fillStyle = bg;
       ctx.fillRect(0, 0, w, h);
 
-      // The live points use the lidar origin as (0, 0). The sensor is mounted
-      // at the front-center edge of the 0.62 m chassis, so the vehicle extends
-      // rearward from that origin in this preview. Keep this visualization-only;
-      // control geometry continues to use the calibrated ROS transform.
-      const vehicleLengthM = 0.62;
-      const vehicleHalfWidthM = 0.20;
-      const lidarMountX = 0.0;
-      const lidarMountY = 0.0;
-      const vehicleFrontX = lidarMountX;
-      const vehicleRearX = vehicleFrontX - vehicleLengthM;
-      const vehicleSelfMaskHalfWidthM = 0.30;
-      const vehicleSelfMaskFrontX = vehicleFrontX + 0.04;
-      const bounds = { xMin: -0.72, xMax: 1.78, yMin: -2.5, yMax: 2.5 };
+      const footprint = lidarFrame?.footprint_m || [0.22, 0.40, 0.20, 0.20];
+      const [vehicleFrontX, vehicleBackM, vehicleLeftM, vehicleRightM] = footprint;
+      const vehicleRearX = -vehicleBackM;
+      const lidarMountX = Number(lidarFrame?.offset_x_m || 0);
+      const lidarMountY = Number(lidarFrame?.offset_y_m || 0);
+      const lateralView = tuning ? 1.6 : 2.5;
+      const bounds = { xMin: -0.72, xMax: 1.78, yMin: -lateralView, yMax: lateralView };
       const pad = { left: 44, right: 24, top: 28, bottom: 28 };
       const plotW = w - pad.left - pad.right;
       const plotH = h - pad.top - pad.bottom;
@@ -4259,6 +4474,7 @@ HTML_PAGE = """<!doctype html>
         }
       }
       for (let y = -2.4; y <= 2.41; y += 0.2) {
+        if (y < bounds.yMin || y > bounds.yMax) continue;
         const major = Math.abs((y * 10) % 5) < 0.01;
         const p0 = project(bounds.xMin, y);
         const p1 = project(bounds.xMax, y);
@@ -4269,8 +4485,10 @@ HTML_PAGE = """<!doctype html>
         ctx.stroke();
       }
 
-      const cropTopLeft = project(1.60, -0.75);
-      const cropBottomRight = project(0.15, 0.75);
+      const [forwardMin, forwardMax, lateralLimit] = lidarFrame?.crop_m || [0.15, 1.60, 0.75];
+      const lookaheadX = Number(lidarFrame?.lookahead_x_m ?? 0.60);
+      const cropTopLeft = project(forwardMax, lateralLimit);
+      const cropBottomRight = project(forwardMin, -lateralLimit);
       const cropX = Math.min(cropTopLeft.x, cropBottomRight.x);
       const cropY = Math.min(cropTopLeft.y, cropBottomRight.y);
       const cropW = Math.abs(cropBottomRight.x - cropTopLeft.x);
@@ -4286,8 +4504,8 @@ HTML_PAGE = """<!doctype html>
       const geometry = hasLiveScan && lidarFrame.geometry && typeof lidarFrame.geometry === 'object'
         ? lidarFrame.geometry
         : {};
-      const channelFound = geometry.found === true;
-      const controlAccepted = geometry.control_accepted === true;
+      const fitValid = geometry.fit_valid === true;
+      const channelFound = geometry.found === true && (!tuning || fitValid);
       const lineFunction = (value) => {
         if (!Array.isArray(value) || value.length < 2) return null;
         const slope = Number(value[0]);
@@ -4300,7 +4518,7 @@ HTML_PAGE = """<!doctype html>
       const centerY = channelFound ? lineFunction(geometry.center_line) : null;
       const renderChannel = !!(channelFound && leftY && rightY && centerY);
       const xs = [];
-      for (let x = 0.10; x <= 1.64; x += 0.04) xs.push(x);
+      for (let i = 0; i <= 40; i += 1) xs.push(forwardMin + (forwardMax - forwardMin) * i / 40);
 
       if (renderChannel) {
         const corridor = [];
@@ -4308,7 +4526,7 @@ HTML_PAGE = """<!doctype html>
         [...xs].reverse().forEach(x => corridor.push([x, rightY(x)]));
         linePath(corridor);
         ctx.closePath();
-        ctx.fillStyle = controlAccepted
+        ctx.fillStyle = fitValid
           ? (themeDark ? 'rgba(34,197,94,.07)' : 'rgba(22,163,74,.055)')
           : (themeDark ? 'rgba(245,158,11,.08)' : 'rgba(217,119,6,.06)');
         ctx.fill();
@@ -4329,16 +4547,8 @@ HTML_PAGE = """<!doctype html>
           if (!Array.isArray(point) || point.length < 2) return;
           const x = Number(point[0]);
           const y = Number(point[1]);
-          if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-          // Suppress chassis, wheel, and suspension self-reflections only in the
-          // preview. Points outside the self-vehicle envelope remain visible.
-          const insideVehicleSelfMask = (
-            x >= vehicleRearX - 0.02
-            && x <= vehicleSelfMaskFrontX
-            && Math.abs(y - lidarMountY) <= vehicleSelfMaskHalfWidthM
-          );
-          if (insideVehicleSelfMask) return;
-          const inDetectionWindow = x >= 0.15 && x <= 1.60 && Math.abs(y) <= 0.75;
+          if (!Number.isFinite(x) || !Number.isFinite(y) || Math.abs(y) > lateralView) return;
+          const inDetectionWindow = x >= forwardMin && x <= forwardMax && Math.abs(y) <= lateralLimit;
           rawPoint(x, y, inDetectionWindow ? 1.85 : 1.25, inDetectionWindow ? .88 : .46);
         });
       } else {
@@ -4346,28 +4556,28 @@ HTML_PAGE = """<!doctype html>
         ctx.fillStyle = muted;
         ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText('Waiting for live /scan · simulated points are disabled', waitPoint.x, waitPoint.y);
+        ctx.fillText('Waiting for front lidar scan', waitPoint.x, waitPoint.y);
       }
 
-      const drawFit = (fn, stroke, width=2.2) => {
-        linePath([[0.15, fn(0.15)], [1.60, fn(1.60)]]);
+      const drawFit = (fn, stroke, width, dashed=false) => {
+        linePath([[forwardMin, fn(forwardMin)], [forwardMax, fn(forwardMax)]]);
         ctx.strokeStyle = stroke;
         ctx.lineWidth = width;
-        ctx.setLineDash(controlAccepted ? [] : [6, 4]);
+        ctx.setLineDash(fitValid && !dashed ? [] : [6, 4]);
         ctx.stroke();
         ctx.setLineDash([]);
       };
       if (renderChannel) {
-        drawFit(leftY, '#16a34a', 2.2);
-        drawFit(rightY, '#ea580c', 2.2);
-        drawFit(centerY, '#e11d48', 2.8);
+        drawFit(leftY, '#16a34a', 2.2, geometry.mode === 'right_only');
+        drawFit(rightY, '#ea580c', 2.2, geometry.mode === 'left_only');
+        drawFit(centerY, '#e11d48', 2.8, geometry.mode === 'left_only' || geometry.mode === 'right_only');
         linePath([[0, centerY(0)], [-0.43, centerY(-0.43)]]);
         ctx.strokeStyle = '#93c5fd';
         ctx.lineWidth = 1.6;
         ctx.setLineDash([6, 4]);
         ctx.stroke();
         ctx.setLineDash([]);
-      } else if (hasLiveScan) {
+      } else if (hasLiveScan && !tuning) {
         const statusPoint = project(0.82, 0);
         ctx.fillStyle = themeDark ? 'rgba(15,23,42,.78)' : 'rgba(255,255,255,.84)';
         roundedRect(statusPoint.x - 76, statusPoint.y - 13, 152, 26, 13);
@@ -4378,35 +4588,20 @@ HTML_PAGE = """<!doctype html>
         ctx.fillText('No valid channel detected', statusPoint.x, statusPoint.y);
       }
 
-      const sweepX = 0.15 + ((timestamp / 1800) % 1) * 1.45;
-      const sweep = project(sweepX, 0);
-      const sweepLeft = project(sweepX, -0.75);
-      const sweepRight = project(sweepX, 0.75);
-      const sweepGradient = ctx.createLinearGradient(sweepLeft.x, 0, sweepRight.x, 0);
-      sweepGradient.addColorStop(0, 'rgba(59,130,246,0)');
-      sweepGradient.addColorStop(.5, themeDark ? 'rgba(96,165,250,.38)' : 'rgba(37,99,235,.24)');
-      sweepGradient.addColorStop(1, 'rgba(59,130,246,0)');
-      ctx.strokeStyle = sweepGradient;
-      ctx.lineWidth = 1.3;
-      ctx.beginPath();
-      ctx.moveTo(sweepLeft.x, sweep.y);
-      ctx.lineTo(sweepRight.x, sweep.y);
-      ctx.stroke();
-
-      const vehicleFrontRight = project(vehicleFrontX, lidarMountY - vehicleHalfWidthM);
-      const vehicleRearLeft = project(vehicleRearX, lidarMountY + vehicleHalfWidthM);
+      const vehicleFrontRight = project(vehicleFrontX, -vehicleRightM);
+      const vehicleRearLeft = project(vehicleRearX, vehicleLeftM);
       const vehicleX = Math.min(vehicleFrontRight.x, vehicleRearLeft.x);
       const vehicleY = Math.min(vehicleFrontRight.y, vehicleRearLeft.y);
       const vehicleW = Math.abs(vehicleRearLeft.x - vehicleFrontRight.x);
       const vehicleH = Math.abs(vehicleRearLeft.y - vehicleFrontRight.y);
       roundedRect(vehicleX, vehicleY, vehicleW, vehicleH, 7);
-      ctx.fillStyle = themeDark ? '#17263b' : '#f8fafc';
+      ctx.fillStyle = tuning ? (themeDark ? '#3b2a20' : '#fff1e6') : (themeDark ? '#17263b' : '#f8fafc');
       ctx.fill();
       ctx.strokeStyle = themeDark ? '#dbeafe' : '#334155';
       ctx.lineWidth = 1.8;
       ctx.stroke();
-      const vehicleCenter = project((vehicleFrontX + vehicleRearX) / 2, lidarMountY);
-      const vehicleNose = project(vehicleFrontX - 0.04, lidarMountY);
+      const vehicleCenter = project((vehicleFrontX + vehicleRearX) / 2, 0);
+      const vehicleNose = project(vehicleFrontX - 0.04, 0);
       ctx.strokeStyle = '#0ea5e9';
       ctx.lineWidth = 2.2;
       ctx.beginPath();
@@ -4432,7 +4627,7 @@ HTML_PAGE = """<!doctype html>
       ctx.stroke();
 
       if (renderChannel) {
-        const lookahead = project(0.60, centerY(0.60));
+        const lookahead = project(lookaheadX, centerY(lookaheadX));
         const pulse = 4.2 + 1.2 * (0.5 + 0.5 * Math.sin(timestamp / 320));
         ctx.fillStyle = panel;
         ctx.strokeStyle = '#e11d48';
@@ -4444,14 +4639,15 @@ HTML_PAGE = """<!doctype html>
         ctx.fillStyle = text;
         ctx.font = '600 10px ui-sans-serif, system-ui, sans-serif';
         ctx.textAlign = 'left';
-        ctx.fillText('0.60 m lookahead', lookahead.x + 9, lookahead.y - 8);
+        ctx.fillText(lookaheadX.toFixed(2) + ' m lookahead', lookahead.x + 9, lookahead.y - 8);
       }
       ctx.fillStyle = muted;
       ctx.font = '9.5px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillText('vehicle 0.40 × 0.62 m', vehicleX + vehicleW + 8, vehicleY + vehicleH - 8);
+      ctx.textAlign = 'left';
+      ctx.fillText(tuning ? '车身屏蔽' : 'vehicle 0.40 × 0.62 m', vehicleX + vehicleW + 8, vehicleY + vehicleH - 8);
 
       if (renderChannel) {
-        const widthX = 1.42;
+        const widthX = forwardMin + 0.88 * (forwardMax - forwardMin);
         const leftWidthPoint = project(widthX, leftY(widthX));
         const rightWidthPoint = project(widthX, rightY(widthX));
         ctx.strokeStyle = themeDark ? 'rgba(226,232,240,.56)' : 'rgba(51,65,85,.46)';
@@ -4468,7 +4664,6 @@ HTML_PAGE = """<!doctype html>
           leftWidthPoint.y - 9,
         );
       }
-      window.requestAnimationFrame(drawLidarExample);
     }
 
     for (const id of editableFieldIds) markFieldDirty(id);
@@ -4520,52 +4715,73 @@ HTML_PAGE = """<!doctype html>
 """
 
 
+def lidar_preview_frame(
+    scan: RosLaserScan, cfg: RowFollowerConfig, estimate: RowEstimate, debug: RowDebugData,
+    lateral_view: float = 2.5,
+) -> dict[str, Any]:
+    view = debug.web_points
+    if view.size:
+        x, y = view.T
+        view = view[(x >= -0.72) & (x <= 1.78) & (np.abs(y) <= lateral_view)]
+    points = np.round(view, 4).tolist()
+    line_available = estimate.center_line is not None
+    rear = cfg.reflect_x_axis
+    return {
+        "frame_id": str(scan.header.frame_id or "laser"),
+        "points": points,
+        "raw_count": len(scan.ranges),
+        "valid_count": len(debug.raw_points),
+        "fit_point_count": len(debug.points),
+        "visible_count": len(points),
+        "sensor_yaw_deg": cfg.sensor_yaw_deg,
+        "footprint_m": (
+            ROBOT_FRAME_BACK if rear else ROBOT_FRAME_FRONT,
+            ROBOT_FRAME_FRONT if rear else ROBOT_FRAME_BACK,
+            ROBOT_FRAME_LEFT,
+            ROBOT_FRAME_RIGHT,
+        ),
+        "yaw_correction_deg": cfg.lidar_yaw_correction_deg,
+        "offset_x_m": -cfg.lidar_x_offset_m if rear else cfg.lidar_x_offset_m,
+        "offset_y_m": cfg.lidar_y_offset_m,
+        "crop_m": (cfg.forward_min, cfg.forward_max, cfg.lateral_limit),
+        "lookahead_x_m": cfg.lookahead_x,
+        "geometry": {
+            "found": line_available,
+            "fit_valid": bool(estimate.found and line_available),
+            "mode": str(estimate.effective_mode or estimate.mode),
+            "reject_reason": str(estimate.reject_reason or ""),
+            "row_width_m": round(float(estimate.row_width), 4) if estimate.row_width > 0.0 else None,
+            "center_y_m": round(float(estimate.center_y), 4) if line_available else None,
+            "heading_deg": round(math.degrees(estimate.heading_rad), 2) if line_available else None,
+            "left_bins": int(estimate.left_bins),
+            "right_bins": int(estimate.right_bins),
+            "left_line": estimate.left_line,
+            "right_line": estimate.right_line,
+            "center_line": estimate.center_line,
+        },
+    }
+
+
 class RosLaserScanMonitor:
     def __init__(
         self,
         sink: queue.Queue[tuple[str, Any]],
-        topic: str = LIDAR_SCAN_TOPIC,
     ) -> None:
         self.sink = sink
-        self.topic = topic
-        self.calibration = load_lidar_preview_calibration()
+        self.topic = LIDAR_SCAN_TOPIC
+        self.scan_ready = threading.Condition()
+        self.recent_scans: dict[str, deque[tuple[float, RosLaserScan]]] = {
+            role: deque(maxlen=16) for role in ("front", "rear")
+        }
         self.running = False
         self.subscription: Any = None
+        self.rear_subscription: Any = None
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.last_emit = 0.0
         self.scan_times: deque[float] = deque(maxlen=40)
         self.scan_hz = 0.0
         self.min_emit_interval = 0.12
-        self.last_good_row_width = 0.60
-        self.row_cfg = RowFollowerConfig(
-            row_width=0.60,
-            min_row_width=0.48,
-            max_row_width=0.78,
-            lookahead_x=0.60,
-            forward_min=0.15,
-            forward_max=1.60,
-            lateral_limit=0.75,
-            range_min=0.05,
-            range_max=6.0,
-            bin_size=0.20,
-            min_points=16,
-            min_bins=2,
-            min_line_bins=4,
-            min_side_points_per_bin=2,
-            center_deadband=0.03,
-            left_percentile=20.0,
-            right_percentile=80.0,
-            sensor_yaw_deg=180.0,
-            lidar_yaw_correction_deg=self.calibration["lidar_yaw_correction_deg"],
-            lidar_x_offset_m=self.calibration["lidar_x_offset_m"],
-            lidar_y_offset_m=self.calibration["lidar_y_offset_m"],
-            boundary_max_gap_x=0.45,
-            boundary_width_tolerance_m=0.0,
-            vehicle_half_width=0.20,
-            safety_margin=0.03,
-            center_jump_reject=0.25,
-            one_side_center_jump_reject=0.30,
-        )
+        self.row_cfg = front_lidar_preview_config(DUAL_LIDAR_CONFIG.front)
 
     def start(self) -> None:
         self.running = True
@@ -4583,6 +4799,11 @@ class RosLaserScanMonitor:
                 self._on_scan,
                 10,
             )
+            rear = DUAL_LIDAR_CONFIG.rear
+            self.rear_subscription = ros_thread.node.create_subscription(
+                RosLaserScan, rear.scan_topic,
+                lambda msg: self._record_scan(rear, msg, time.monotonic()), 10,
+            )
             self.sink.put(("log", f"{now_text()} Lidar preview monitor subscribed to {self.topic}."))
             self.sink.put(("lidar_status", f"Waiting for {self.topic}"))
             while self.running:
@@ -4593,10 +4814,58 @@ class RosLaserScanMonitor:
         finally:
             self.sink.put(("lidar_status", "Monitor stopped"))
 
-    def _on_scan(self, msg: RosLaserScan) -> None:
-        if not self.running:
-            return
+    def config_for_sensor(self, sensor: LidarConfig) -> RowFollowerConfig:
+        rear = sensor.role == "rear"
+        return replace(
+            self.row_cfg,
+            sensor_yaw_deg=sensor.sensor_yaw_deg,
+            lidar_yaw_correction_deg=sensor.lidar_yaw_correction_deg,
+            lidar_x_offset_m=sensor.lidar_x_offset_m,
+            lidar_y_offset_m=sensor.lidar_y_offset_m,
+            scan_view_angle_deg=180.0 if rear else 360.0,
+            reflect_x_axis=rear,
+            segmented_pot_boundary_recovery=not rear,
+        )
+
+    def _record_scan(self, sensor: LidarConfig, msg: RosLaserScan, now: float) -> bool:
+        if msg.header.frame_id != sensor.frame_id or not self.running:
+            return False
+        with self.scan_ready:
+            self.recent_scans[sensor.role].append((now, msg))
+            self.scan_ready.notify_all()
+        return True
+
+    def calibration_preview(self, sensor: LidarConfig, cfg: RowFollowerConfig) -> dict[str, Any]:
+        with self.scan_ready:
+            scans = tuple(self.recent_scans[sensor.role])
         now = time.monotonic()
+        for stamp, scan in reversed(scans):
+            if now - stamp > 0.50:
+                break
+            points = raw_scan_to_points(scan, cfg)
+            if len(points) < max(1, cfg.min_points):
+                continue
+            estimate, debug = estimate_row_from_points(points, cfg, cfg.row_width)
+            frame = lidar_preview_frame(scan, cfg, estimate, debug, lateral_view=1.6)
+            if frame["visible_count"]:
+                return {**frame, "live": True, "topic": sensor.scan_topic}
+        return {"live": False, "topic": sensor.scan_topic}
+
+    def collect_calibration_scans(self, role: str) -> list[RosLaserScan]:
+        start = time.monotonic()
+        with self.scan_ready:
+            scans = self.recent_scans[role]
+            self.scan_ready.wait_for(lambda: sum(timestamp >= start for timestamp, _ in scans) >= 10, timeout=2.5)
+            fresh = [scan for timestamp, scan in scans if timestamp >= start]
+        if len(fresh) < 8:
+            raise ValueError("扫描数据不足。请检查所选雷达的实时数据。")
+        return fresh[:10]
+
+    def _on_scan(self, msg: RosLaserScan) -> None:
+        now = time.monotonic()
+        if not self._record_scan(DUAL_LIDAR_CONFIG.front, msg, now):
+            return
+        row_cfg = self.row_cfg
         self.scan_times.append(now)
         if len(self.scan_times) >= 2:
             elapsed = self.scan_times[-1] - self.scan_times[0]
@@ -4606,166 +4875,19 @@ class RosLaserScanMonitor:
             return
         self.last_emit = now
 
-        yaw_correction_deg = self.calibration["lidar_yaw_correction_deg"]
-        sensor_yaw = math.radians(180.0 + yaw_correction_deg)
-        cos_yaw = math.cos(sensor_yaw)
-        sin_yaw = math.sin(sensor_yaw)
-        offset_x = self.calibration["lidar_x_offset_m"]
-        offset_y = self.calibration["lidar_y_offset_m"]
-        min_range = max(float(msg.range_min), 0.05)
-        max_range = min(float(msg.range_max), 6.0)
-        visible_points: list[list[float]] = []
-        valid_count = 0
-        for index, raw_range in enumerate(msg.ranges):
-            distance = float(raw_range)
-            if not math.isfinite(distance) or distance < min_range or distance > max_range:
-                continue
-            valid_count += 1
-            angle = float(msg.angle_min) + index * float(msg.angle_increment)
-            sensor_x = distance * math.cos(angle)
-            sensor_y = distance * math.sin(angle)
-            body_x = cos_yaw * sensor_x - sin_yaw * sensor_y + offset_x
-            body_y = sin_yaw * sensor_x + cos_yaw * sensor_y + offset_y
-            if -0.55 <= body_x <= 1.85 and -2.55 <= body_y <= 2.55:
-                visible_points.append([round(body_x, 4), round(body_y, 4)])
-
-        max_points = 720
-        if len(visible_points) > max_points:
-            step = max(1, math.ceil(len(visible_points) / max_points))
-            visible_points = visible_points[::step][:max_points]
-
-        geometry: dict[str, Any]
         try:
-            estimate, debug = estimate_row(msg, self.row_cfg, self.last_good_row_width)
-
-            def point_list(values: Any, limit: int = 120) -> list[list[float]]:
-                array = np.asarray(values, dtype=np.float64)
-                if array.ndim != 2 or array.shape[1] < 2 or len(array) == 0:
-                    return []
-                if len(array) > limit:
-                    stride = max(1, math.ceil(len(array) / limit))
-                    array = array[::stride][:limit]
-                return [
-                    [round(float(point[0]), 4), round(float(point[1]), 4)]
-                    for point in array
-                    if math.isfinite(float(point[0])) and math.isfinite(float(point[1]))
-                ]
-
-            def line_value(value: Any) -> list[float] | None:
-                if value is None or len(value) < 2:
-                    return None
-                slope = float(value[0])
-                intercept = float(value[1])
-                if not math.isfinite(slope) or not math.isfinite(intercept):
-                    return None
-                return [round(slope, 6), round(intercept, 6)]
-
-            left_line = line_value(estimate.left_line)
-            right_line = line_value(estimate.right_line)
-            center_line = line_value(estimate.center_line)
-            measured_widths: list[float] = []
-            if left_line is not None and right_line is not None:
-                for sample_x in (0.30, 0.60, 0.90, 1.20):
-                    measured_widths.append(
-                        abs(
-                            (left_line[0] * sample_x + left_line[1])
-                            - (right_line[0] * sample_x + right_line[1])
-                        )
-                    )
-            measured_width = (
-                sum(measured_widths) / len(measured_widths)
-                if measured_widths
-                else 0.0
-            )
-            width_valid = bool(
-                measured_widths
-                and all(
-                    self.row_cfg.min_row_width <= width <= self.row_cfg.max_row_width
-                    for width in measured_widths
-                )
-            )
-            # A visible channel requires two independently validated, parallel boundaries.
-            # A one-sided/virtual estimate remains useful to the controller, but must not be
-            # presented in the UI as a measured flower-pot corridor.
-            geometry_found = bool(
-                estimate.left_valid
-                and estimate.right_valid
-                and str(estimate.effective_mode or estimate.mode) == "both_sides"
-                and left_line is not None
-                and right_line is not None
-                and center_line is not None
-                and width_valid
-            )
-            control_accepted = bool(geometry_found and estimate.found)
-            if geometry_found:
-                self.last_good_row_width = measured_width
-            reject_reason = str(estimate.reject_reason or "")
-            if estimate.found and not geometry_found:
-                reject_reason = "not_a_complete_two_side_channel"
-                if not width_valid and measured_widths:
-                    reject_reason = "row_width_out_of_range"
-            geometry = {
-                "found": geometry_found,
-                "control_accepted": control_accepted,
-                "algorithm_found": bool(estimate.found),
-                "mode": str(estimate.mode or estimate.effective_mode or "lost"),
-                "reject_reason": reject_reason,
-                "warning": str(estimate.warning or ""),
-                "row_width_m": round(measured_width, 4) if measured_width > 0.0 else None,
-                "target_row_width_m": self.row_cfg.row_width,
-                "center_y_m": (
-                    round(float(estimate.center_y if control_accepted else estimate.raw_center_y), 4)
-                    if geometry_found
-                    else None
-                ),
-                "heading_deg": (
-                    round(math.degrees(math.atan(float(center_line[0]))), 3)
-                    if geometry_found and center_line is not None
-                    else None
-                ),
-                "left_valid": bool(estimate.left_valid),
-                "right_valid": bool(estimate.right_valid),
-                "left_bins": int(estimate.left_bins),
-                "right_bins": int(estimate.right_bins),
-                "candidate_bins": int(estimate.candidate_bins),
-                "left_line": left_line if geometry_found else None,
-                "right_line": right_line if geometry_found else None,
-                "center_line": center_line if geometry_found else None,
-                "left_points": point_list(debug.left_points) if geometry_found else [],
-                "right_points": point_list(debug.right_points) if geometry_found else [],
-                "center_points": point_list(debug.center_points) if geometry_found else [],
-            }
+            estimate, debug = estimate_row(msg, row_cfg, row_cfg.row_width)
+            frame = lidar_preview_frame(msg, row_cfg, estimate, debug)
         except Exception as exc:
-            geometry = {
-                "found": False,
-                "algorithm_found": False,
-                "mode": "fit_error",
-                "reject_reason": str(exc),
-                "left_line": None,
-                "right_line": None,
-                "center_line": None,
-                "left_points": [],
-                "right_points": [],
-                "center_points": [],
-            }
-        self.sink.put((
-            "lidar_scan",
-            {
-                "topic": self.topic,
-                "frame_id": str(msg.header.frame_id or "laser"),
-                "points": visible_points,
-                "raw_count": len(msg.ranges),
-                "valid_count": valid_count,
-                "visible_count": len(visible_points),
-                "scan_hz": round(self.scan_hz, 1),
-                "received_monotonic": now,
-                "sensor_yaw_deg": 180.0,
-                "yaw_correction_deg": yaw_correction_deg,
-                "offset_x_m": offset_x,
-                "offset_y_m": offset_y,
-                "geometry": geometry,
-            },
-        ))
+            self.sink.put(("lidar_status", f"Scan processing failed: {exc}"))
+            return
+
+        self.sink.put(("lidar_scan", {
+            **frame,
+            "topic": self.topic,
+            "scan_hz": round(self.scan_hz, 1),
+            "received_monotonic": now,
+        }))
 
 
 class RosChassisChargeMonitor:
@@ -5179,6 +5301,85 @@ class WebController:
             SETTINGS_PATH.write_text(json.dumps(self.settings, ensure_ascii=True, indent=2), encoding="utf-8")
             self.can_status = self._query_can_state(str(self.settings.get("can_channel") or "can0"))
             self._log("Settings saved.")
+
+    def lidar_calibration_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {sensor.role: editable_lidar_extrinsics(sensor) for sensor in load_dual_lidar_config().sensors()}
+
+    def _check_lidar_calibration_idle(self) -> None:
+        if self.task_worker is not None or self.pending_action or self.gamepad_control.get("enabled"):
+            raise ValueError("请先停止当前任务和手柄控制，再标定雷达。")
+        if self.vehicle_status.get("feedback_fresh"):
+            motion = self.vehicle_status.get("motion", {})
+            if (abs(motion.get("vx_mps", 0.0)) > 0.01 or abs(motion.get("vy_mps", 0.0)) > 0.01
+                    or abs(motion.get("wz_dps", 0.0)) > 0.5):
+                raise ValueError("车辆仍在运动。请停稳后再标定。")
+
+    def measure_lidar_calibration(self, payload: dict[str, Any]) -> dict[str, Any]:
+        role = payload.get("role")
+        if role not in ("front", "rear"):
+            raise ValueError("请选择前雷达或后雷达。")
+        yaw, lateral = parse_lidar_extrinsics(payload)
+        with self.lock:
+            self._check_lidar_calibration_idle()
+            monitor = self.lidar_monitor
+            if monitor is None or not monitor.running:
+                raise ValueError("雷达监视器未运行。")
+            sensor = getattr(load_dual_lidar_config(), role)
+            cfg = replace(monitor.config_for_sensor(sensor),
+                          lidar_yaw_correction_deg=yaw, lidar_y_offset_m=lateral / 100.0)
+        scans = monitor.collect_calibration_scans(role)
+        yaw, lateral, count = estimate_lidar_extrinsics(scans, cfg)
+        parse_lidar_extrinsics({"yaw_deg": yaw, "lateral_cm": lateral})
+        with self.lock:
+            self._check_lidar_calibration_idle()
+        return {"yaw_deg": yaw, "lateral_cm": lateral, "samples": count}
+
+    def preview_lidar_calibration(self, payload: dict[str, Any]) -> dict[str, Any]:
+        role = payload.get("role")
+        if role not in ("front", "rear"):
+            raise ValueError("请选择前雷达或后雷达。")
+        yaw, lateral = parse_lidar_extrinsics(payload)
+        with self.lock:
+            sensor = getattr(load_dual_lidar_config(), role)
+            monitor = self.lidar_monitor
+            if monitor is None or not monitor.running:
+                return {"live": False, "topic": sensor.scan_topic}
+            cfg = replace(monitor.config_for_sensor(sensor),
+                          lidar_yaw_correction_deg=yaw, lidar_y_offset_m=lateral / 100.0)
+        return monitor.calibration_preview(sensor, cfg)
+
+    def save_lidar_calibration(self, payload: dict[str, Any]) -> dict[str, Any]:
+        role = payload.get("role")
+        if role not in ("front", "rear"):
+            raise ValueError("请选择前雷达或后雷达。")
+        yaw, lateral = parse_lidar_extrinsics(payload)
+        with self.lock:
+            self._check_lidar_calibration_idle()
+            existing = self.lidar_calibration_snapshot()
+            if payload.get("expected") != existing[role]:
+                raise ValueError("外参已更新。请重新打开 Tuning 后再试。")
+            document = json.loads(DUAL_LIDAR_CONFIG_PATH.read_text(encoding="utf-8"))
+            document[role]["lidar_yaw_correction_deg"] = yaw
+            document[role]["lidar_y_offset_m"] = lateral / 100.0
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=DUAL_LIDAR_CONFIG_PATH.parent, delete=False,
+            ) as stream:
+                pending = Path(stream.name)
+                try:
+                    json.dump(document, stream, indent=2)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    pending.chmod(DUAL_LIDAR_CONFIG_PATH.stat().st_mode & 0o777)
+                    config = load_dual_lidar_config(pending)
+                    pending.replace(DUAL_LIDAR_CONFIG_PATH)
+                finally:
+                    pending.unlink(missing_ok=True)
+            if role == "front" and self.lidar_monitor is not None:
+                self.lidar_monitor.row_cfg = self.lidar_monitor.config_for_sensor(config.front)
+            self._log(f"{role.capitalize()} lidar calibration saved: yaw={yaw:g} deg, lateral={lateral:g} cm.")
+            return {sensor.role: editable_lidar_extrinsics(sensor) for sensor in config.sensors()}
 
     def _query_can_state(self, channel: str) -> str:
         channel = str(channel or "").strip() or "can0"
@@ -6653,6 +6854,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/lidar":
             self._send_json(APP.lidar_preview_snapshot())
             return
+        if parsed.path == "/api/lidar/calibration":
+            self._send_json(APP.lidar_calibration_snapshot())
+            return
         if parsed.path == "/api/ota/status":
             self._send_json(APP.ota_snapshot())
             return
@@ -6673,6 +6877,15 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             payload = self._read_json()
+            if self.path == "/api/lidar/calibration/preview":
+                self._send_json(APP.preview_lidar_calibration(payload))
+                return
+            if self.path == "/api/lidar/calibration/measure":
+                self._send_json(APP.measure_lidar_calibration(payload))
+                return
+            if self.path == "/api/lidar/calibration":
+                self._send_json(APP.save_lidar_calibration(payload))
+                return
             if self.path == "/api/settings":
                 APP.save_settings(payload)
                 self._send_json({"ok": True})

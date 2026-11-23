@@ -24,6 +24,8 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from row_geometry import RowFollowerConfig, build_front_row_config
+
 from dual_lidar_config import (
     DualLidarConfig,
     LidarConfig,
@@ -625,6 +627,42 @@ def _local_lidar_drive_settings(config: dict[str, Any], *, reverse: bool, args: 
     return speed, offset, angle
 
 
+def _local_lidar_row_settings(args: argparse.Namespace, front_lidar: LidarConfig) -> dict[str, float | int]:
+    return {
+        "row_width": float(args.lidar_row_width),
+        "vehicle_width": float(args.lidar_vehicle_width),
+        "min_row_width": float(args.lidar_min_row_width),
+        "max_row_width": float(args.lidar_max_row_width),
+        "lookahead_x": float(args.lidar_lookahead_x),
+        "forward_min": float(args.lidar_forward_min),
+        "forward_max": float(args.lidar_forward_max),
+        "lateral_limit": float(args.lidar_lateral_limit),
+        "range_min": float(args.lidar_range_min),
+        "range_max": float(args.lidar_range_max),
+        "bin_size": float(args.lidar_bin_size),
+        "min_points": int(args.lidar_min_points),
+        "min_bins": int(args.lidar_min_bins),
+        "min_line_bins": int(args.lidar_min_line_bins),
+        "min_side_points_per_bin": int(args.lidar_min_side_points_per_bin),
+        "boundary_width_tolerance_m": float(args.lidar_boundary_width_tolerance_m),
+        "center_deadband": float(args.lidar_center_deadband),
+        "left_percentile": float(args.lidar_left_percentile),
+        "right_percentile": float(args.lidar_right_percentile),
+        "front_sensor_yaw_deg": float(front_lidar.sensor_yaw_deg),
+        "front_lidar_yaw_correction_deg": float(front_lidar.lidar_yaw_correction_deg),
+        "front_lidar_x_offset_m": float(front_lidar.lidar_x_offset_m),
+        "front_lidar_y_offset_m": float(front_lidar.lidar_y_offset_m),
+        "safety_margin": float(args.lidar_safety_margin),
+        "center_jump_reject": float(args.lidar_center_jump_reject),
+        "one_side_center_jump_reject": float(args.lidar_one_side_center_jump_reject),
+    }
+
+
+def front_lidar_preview_config(front_lidar: LidarConfig) -> RowFollowerConfig:
+    args = build_parser().parse_args(["autorun", "--db", "", "--mission", ""])
+    return build_front_row_config(argparse.Namespace(**_local_lidar_row_settings(args, front_lidar)))
+
+
 class DirectLocalLidarController:
     def __init__(
         self,
@@ -710,26 +748,8 @@ class DirectLocalLidarController:
         )
         follower_args.heading_conflict_error_y = float(args.lidar_heading_conflict_error_y)
         follower_args.heading_conflict_scale = float(args.lidar_heading_conflict_scale)
-        follower_args.row_width = float(args.lidar_row_width)
-        follower_args.vehicle_width = float(args.lidar_vehicle_width)
-        follower_args.min_row_width = float(args.lidar_min_row_width)
-        follower_args.max_row_width = float(args.lidar_max_row_width)
-        follower_args.lookahead_x = float(args.lidar_lookahead_x)
+        vars(follower_args).update(_local_lidar_row_settings(args, front_lidar))
         follower_args.forward_lookahead_x = float(args.lidar_forward_lookahead_x)
-        follower_args.forward_min = float(args.lidar_forward_min)
-        follower_args.forward_max = float(args.lidar_forward_max)
-        follower_args.lateral_limit = float(args.lidar_lateral_limit)
-        follower_args.range_min = float(args.lidar_range_min)
-        follower_args.range_max = float(args.lidar_range_max)
-        follower_args.bin_size = float(args.lidar_bin_size)
-        follower_args.min_points = int(args.lidar_min_points)
-        follower_args.min_bins = int(args.lidar_min_bins)
-        follower_args.min_line_bins = int(args.lidar_min_line_bins)
-        follower_args.min_side_points_per_bin = int(args.lidar_min_side_points_per_bin)
-        follower_args.boundary_width_tolerance_m = float(args.lidar_boundary_width_tolerance_m)
-        follower_args.center_deadband = float(args.lidar_center_deadband)
-        follower_args.left_percentile = float(args.lidar_left_percentile)
-        follower_args.right_percentile = float(args.lidar_right_percentile)
         follower_args.sensor_yaw_deg = float(args.lidar_sensor_yaw_deg)
         follower_args.lidar_yaw_correction_deg = float(
             calibration.get("lidar_yaw_correction_deg", float(args.lidar_yaw_correction_deg))
@@ -740,10 +760,6 @@ class DirectLocalLidarController:
         follower_args.lidar_y_offset_m = float(
             calibration.get("lidar_y_offset_m", float(args.lidar_y_offset_m))
         )
-        follower_args.front_sensor_yaw_deg = float(front_lidar.sensor_yaw_deg)
-        follower_args.front_lidar_yaw_correction_deg = float(front_lidar.lidar_yaw_correction_deg)
-        follower_args.front_lidar_x_offset_m = float(front_lidar.lidar_x_offset_m)
-        follower_args.front_lidar_y_offset_m = float(front_lidar.lidar_y_offset_m)
         follower_args.front_extrinsics_confirmed = bool(front_lidar.extrinsics_confirmed)
         follower_args.rear_sensor_yaw_deg = float(rear_lidar.sensor_yaw_deg)
         follower_args.rear_lidar_yaw_correction_deg = float(rear_lidar.lidar_yaw_correction_deg)
@@ -754,9 +770,6 @@ class DirectLocalLidarController:
         follower_args.slow_error_y = float(args.lidar_slow_error_y)
         follower_args.stop_error_y = float(args.lidar_stop_error_y)
         follower_args.slow_heading_rad = float(args.lidar_slow_heading_rad)
-        follower_args.safety_margin = float(args.lidar_safety_margin)
-        follower_args.center_jump_reject = float(args.lidar_center_jump_reject)
-        follower_args.one_side_center_jump_reject = float(args.lidar_one_side_center_jump_reject)
         follower_args.center_y_reject_abs = float(args.lidar_center_y_reject_abs)
         follower_args.raw_center_out_of_range = float(args.lidar_raw_center_out_of_range)
         follower_args.one_side_raw_center_out_of_range = float(args.lidar_one_side_raw_center_out_of_range)

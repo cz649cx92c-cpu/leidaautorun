@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from argparse import Namespace
 from dataclasses import dataclass
 
 import numpy as np
@@ -45,6 +46,39 @@ class RowFollowerConfig:
     scan_view_angle_deg: float = 360.0
     reflect_x_axis: bool = False
     segmented_pot_boundary_recovery: bool = False
+
+
+def build_front_row_config(args: Namespace) -> RowFollowerConfig:
+    return RowFollowerConfig(
+        row_width=float(args.row_width),
+        min_row_width=float(args.min_row_width),
+        max_row_width=float(args.max_row_width),
+        lookahead_x=float(args.lookahead_x),
+        forward_min=float(args.forward_min),
+        forward_max=float(args.forward_max),
+        lateral_limit=float(args.lateral_limit),
+        range_min=float(args.range_min),
+        range_max=float(args.range_max),
+        bin_size=float(args.bin_size),
+        min_points=int(args.min_points),
+        min_bins=int(args.min_bins),
+        min_line_bins=int(args.min_line_bins),
+        min_side_points_per_bin=int(args.min_side_points_per_bin),
+        center_deadband=float(args.center_deadband),
+        left_percentile=float(args.left_percentile),
+        right_percentile=float(args.right_percentile),
+        sensor_yaw_deg=float(args.front_sensor_yaw_deg),
+        lidar_yaw_correction_deg=float(args.front_lidar_yaw_correction_deg),
+        lidar_x_offset_m=float(args.front_lidar_x_offset_m),
+        lidar_y_offset_m=float(args.front_lidar_y_offset_m),
+        boundary_max_gap_x=0.45,
+        boundary_width_tolerance_m=float(args.boundary_width_tolerance_m),
+        vehicle_half_width=0.5 * float(args.vehicle_width),
+        safety_margin=float(args.safety_margin),
+        center_jump_reject=float(args.center_jump_reject),
+        one_side_center_jump_reject=float(args.one_side_center_jump_reject),
+        segmented_pot_boundary_recovery=True,
+    )
 
 
 @dataclass

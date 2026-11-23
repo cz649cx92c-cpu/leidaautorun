@@ -26,8 +26,8 @@ from row_geometry import (  # noqa: E402
     ROBOT_FRAME_BACK,
     ROBOT_FRAME_FRONT,
     RowEstimate,
-    RowFollowerConfig,
     blend_line,
+    build_front_row_config,
     detect_pot_station_xs,
     estimate_row,
     raw_scan_to_points,
@@ -501,36 +501,7 @@ class PlantRowFollower(Node):
         self.last_good_mode = ""
         self.last_following_wz_deg = 0.0
         self.send_state = MotionSendState.create()
-        base_row_cfg = RowFollowerConfig(
-            row_width=float(args.row_width),
-            min_row_width=float(args.min_row_width),
-            max_row_width=float(args.max_row_width),
-            lookahead_x=float(args.lookahead_x),
-            forward_min=float(args.forward_min),
-            forward_max=float(args.forward_max),
-            lateral_limit=float(args.lateral_limit),
-            range_min=float(args.range_min),
-            range_max=float(args.range_max),
-            bin_size=float(args.bin_size),
-            min_points=int(args.min_points),
-            min_bins=int(args.min_bins),
-            min_line_bins=int(args.min_line_bins),
-            min_side_points_per_bin=int(args.min_side_points_per_bin),
-            center_deadband=float(args.center_deadband),
-            left_percentile=float(args.left_percentile),
-            right_percentile=float(args.right_percentile),
-            sensor_yaw_deg=float(args.front_sensor_yaw_deg),
-            lidar_yaw_correction_deg=float(args.front_lidar_yaw_correction_deg),
-            lidar_x_offset_m=float(args.front_lidar_x_offset_m),
-            lidar_y_offset_m=float(args.front_lidar_y_offset_m),
-            boundary_max_gap_x=0.45,
-            boundary_width_tolerance_m=float(args.boundary_width_tolerance_m),
-            vehicle_half_width=0.5 * float(args.vehicle_width),
-            safety_margin=float(args.safety_margin),
-            center_jump_reject=float(args.center_jump_reject),
-            one_side_center_jump_reject=float(args.one_side_center_jump_reject),
-            segmented_pot_boundary_recovery=True,
-        )
+        base_row_cfg = build_front_row_config(args)
         self.front_row_cfg = base_row_cfg
         self.rear_row_cfg = replace(
             base_row_cfg,
@@ -769,6 +740,12 @@ class PlantRowFollower(Node):
         self._store_scan("rear", msg)
 
     def _store_scan(self, role: str, msg: LaserScan) -> None:
+        cfg = self.rear_row_cfg if role == "rear" else self.front_row_cfg
+        # Treat an empty or nearly empty scan as missing data. Leave the last
+        # scan, its age and the fresh-scan gate tied to usable returns.
+        if len(raw_scan_to_points(msg, cfg)) < max(1, cfg.min_points):
+            return
+
         became_ready = False
         with self.scan_lock:
             now = time.monotonic()
