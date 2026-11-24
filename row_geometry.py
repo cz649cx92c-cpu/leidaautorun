@@ -45,6 +45,7 @@ class RowFollowerConfig:
     scan_view_center_deg: float = 0.0
     scan_view_angle_deg: float = 360.0
     reflect_x_axis: bool = False
+    mirror_lateral: bool = False
     segmented_pot_boundary_recovery: bool = False
 
 
@@ -71,6 +72,7 @@ def build_front_row_config(args: Namespace) -> RowFollowerConfig:
         lidar_yaw_correction_deg=float(args.front_lidar_yaw_correction_deg),
         lidar_x_offset_m=float(args.front_lidar_x_offset_m),
         lidar_y_offset_m=float(args.front_lidar_y_offset_m),
+        mirror_lateral=getattr(args, "front_mirror_lateral", False),
         boundary_max_gap_x=0.45,
         boundary_width_tolerance_m=float(args.boundary_width_tolerance_m),
         vehicle_half_width=0.5 * float(args.vehicle_width),
@@ -336,6 +338,9 @@ def raw_scan_to_points(scan, cfg: RowFollowerConfig) -> np.ndarray:
     angles = angles[valid]
     x = ranges * np.cos(angles)
     y = ranges * np.sin(angles)
+    # Correct the sensor handedness before applying its mounting yaw and offset.
+    if cfg.mirror_lateral:
+        y = -y
     points = np.column_stack((x, y))
     transformed = transform_lidar_points(
         points,

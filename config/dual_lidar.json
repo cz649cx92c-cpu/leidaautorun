@@ -5,9 +5,10 @@
     "scan_topic": "/front/scan",
     "frame_id": "front_laser",
     "sensor_yaw_deg": 180.0,
-    "lidar_yaw_correction_deg": 0.0,
+    "lidar_yaw_correction_deg": -172.67,
     "lidar_x_offset_m": 0.0,
-    "lidar_y_offset_m": 0.035,
+    "lidar_y_offset_m": -0.0219,
+    "mirror_lateral": true,
     "extrinsics_confirmed": true
   },
   "rear": {
@@ -16,9 +17,10 @@
     "scan_topic": "/rear/scan",
     "frame_id": "rear_laser",
     "sensor_yaw_deg": 180.0,
-    "lidar_yaw_correction_deg": 0.0,
+    "lidar_yaw_correction_deg": 7.0,
     "lidar_x_offset_m": 0.0,
-    "lidar_y_offset_m": 0.0,
+    "lidar_y_offset_m": -0.03,
+    "mirror_lateral": true,
     "extrinsics_confirmed": true
   }
 }

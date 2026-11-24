@@ -3996,14 +3996,16 @@ HTML_PAGE = """<!doctype html>
           setTextContent('lidarTunePreviewStatus', `${params} · 等待有效点云`);
           return;
         }
-        const direction = values.role === 'rear' ? '↑ 车尾' : '↑ 车头';
+        const rearView = values.role === 'rear';
+        const direction = rearView ? '↑ 车头 · ↓ 后方' : '↑ 车头';
         const geometry = frame.geometry;
+        const heading = rearView ? -geometry.heading_deg : geometry.heading_deg;
         const side = geometry.mode === 'left_only' || geometry.mode === 'right_only';
         const fit = geometry.fit_valid
-          ? `${side ? '单侧推定' : '中线已拟合'} · 偏移 ${(geometry.center_y_m * 100).toFixed(1)} cm · 航向 ${geometry.heading_deg.toFixed(1)}°`
+          ? `${side ? '单侧推定' : '中线已拟合'} · 偏移 ${(geometry.center_y_m * 100).toFixed(1)} cm · 航向 ${heading.toFixed(1)}°`
           : '未拟合出有效中线';
         setTextContent('lidarTunePreviewStatus', `${params} · ${direction} · ${fit}`);
-        drawLidarFrame(preview.canvas, frame, performance.now(), true);
+        drawLidarFrame(preview.canvas, frame, performance.now(), values.role);
       } catch (error) {
         if (!preview.panel.hidden && preview.requested === key) {
           preview.canvas.hidden = true;
@@ -4464,7 +4466,9 @@ HTML_PAGE = """<!doctype html>
       window.requestAnimationFrame(drawLidarExample);
     }
 
-    function drawLidarFrame(canvas, lidarFrame, timestamp, tuning=false) {
+    function drawLidarFrame(canvas, lidarFrame, timestamp, tuningRole=null) {
+      const tuning = tuningRole !== null;
+      const rearView = tuningRole === 'rear';
       const ctx = canvas.getContext('2d');
       const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
       const cssWidth = canvas.clientWidth || 900;
@@ -4493,12 +4497,18 @@ HTML_PAGE = """<!doctype html>
       ctx.fillRect(0, 0, w, h);
 
       const footprint = lidarFrame?.footprint_m || [0.22, 0.40, 0.20, 0.20];
-      const [vehicleFrontX, vehicleBackM, vehicleLeftM, vehicleRightM] = footprint;
-      const vehicleRearX = -vehicleBackM;
+      const [trackingFrontM, trackingBackM, vehicleLeftM, vehicleRightM] = footprint;
+      const vehicleFrontX = rearView ? trackingBackM : trackingFrontM;
+      const vehicleRearX = -(rearView ? trackingFrontM : trackingBackM);
       const lidarMountX = Number(lidarFrame?.offset_x_m || 0);
       const lidarMountY = Number(lidarFrame?.offset_y_m || 0);
       const lateralView = tuning ? 1.6 : 2.5;
-      const bounds = { xMin: -0.72, xMax: 1.78, yMin: -lateralView, yMax: lateralView };
+      const bounds = {
+        xMin: rearView ? -1.78 : -0.72,
+        xMax: rearView ? 0.72 : 1.78,
+        yMin: -lateralView,
+        yMax: lateralView,
+      };
       const pad = { left: 44, right: 24, top: 28, bottom: 28 };
       const plotW = w - pad.left - pad.right;
       const plotH = h - pad.top - pad.bottom;
@@ -4510,11 +4520,13 @@ HTML_PAGE = """<!doctype html>
       const usedPlotH = (bounds.xMax - bounds.xMin) * metersToPixels;
       const plotOffsetX = pad.left + (plotW - usedPlotW) / 2;
       const plotOffsetY = pad.top + (plotH - usedPlotH) / 2;
-      const project = (x, y) => ({
+      const projectBody = (x, y) => ({
         // ROS body frame: +Y is vehicle-left, so it belongs on screen-left.
         x: plotOffsetX + (bounds.yMax - y) * metersToPixels,
         y: plotOffsetY + (bounds.xMax - x) * metersToPixels,
       });
+      // Rear tracking has +X toward the tail, while +Y is already vehicle-left.
+      const project = (x, y) => projectBody(rearView ? -x : x, y);
       const linePath = (points) => {
         ctx.beginPath();
         points.forEach((point, index) => {
@@ -4537,16 +4549,17 @@ HTML_PAGE = """<!doctype html>
       ctx.lineWidth = 1;
       ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
       ctx.textBaseline = 'middle';
-      for (let x = -0.6; x <= 1.61; x += 0.2) {
-        const major = Math.abs((x * 10) % 5) < 0.01;
-        const p0 = project(x, bounds.yMin);
-        const p1 = project(x, bounds.yMax);
+      for (let tick = Math.ceil(bounds.xMin * 5); tick <= Math.floor(bounds.xMax * 5); tick += 1) {
+        const x = tick / 5;
+        const major = tick % 5 === 0;
+        const p0 = projectBody(x, bounds.yMin);
+        const p1 = projectBody(x, bounds.yMax);
         ctx.strokeStyle = major ? line : (themeDark ? 'rgba(148,163,184,.08)' : 'rgba(100,116,139,.08)');
         ctx.beginPath();
         ctx.moveTo(p0.x, p0.y);
         ctx.lineTo(p1.x, p1.y);
         ctx.stroke();
-        if (major && x >= 0) {
+        if (major && (rearView ? x <= 0 : x >= 0)) {
           ctx.fillStyle = muted;
           ctx.textAlign = 'right';
           ctx.fillText(x.toFixed(1) + ' m', pad.left - 7, p0.y);
@@ -4555,8 +4568,8 @@ HTML_PAGE = """<!doctype html>
       for (let y = -2.4; y <= 2.41; y += 0.2) {
         if (y < bounds.yMin || y > bounds.yMax) continue;
         const major = Math.abs((y * 10) % 5) < 0.01;
-        const p0 = project(bounds.xMin, y);
-        const p1 = project(bounds.xMax, y);
+        const p0 = projectBody(bounds.xMin, y);
+        const p1 = projectBody(bounds.xMax, y);
         ctx.strokeStyle = major ? line : (themeDark ? 'rgba(148,163,184,.08)' : 'rgba(100,116,139,.08)');
         ctx.beginPath();
         ctx.moveTo(p0.x, p0.y);
@@ -4667,8 +4680,8 @@ HTML_PAGE = """<!doctype html>
         ctx.fillText('No valid channel detected', statusPoint.x, statusPoint.y);
       }
 
-      const vehicleFrontRight = project(vehicleFrontX, -vehicleRightM);
-      const vehicleRearLeft = project(vehicleRearX, vehicleLeftM);
+      const vehicleFrontRight = projectBody(vehicleFrontX, -vehicleRightM);
+      const vehicleRearLeft = projectBody(vehicleRearX, vehicleLeftM);
       const vehicleX = Math.min(vehicleFrontRight.x, vehicleRearLeft.x);
       const vehicleY = Math.min(vehicleFrontRight.y, vehicleRearLeft.y);
       const vehicleW = Math.abs(vehicleRearLeft.x - vehicleFrontRight.x);
@@ -4679,8 +4692,8 @@ HTML_PAGE = """<!doctype html>
       ctx.strokeStyle = themeDark ? '#dbeafe' : '#334155';
       ctx.lineWidth = 1.8;
       ctx.stroke();
-      const vehicleCenter = project((vehicleFrontX + vehicleRearX) / 2, 0);
-      const vehicleNose = project(vehicleFrontX - 0.04, 0);
+      const vehicleCenter = projectBody((vehicleFrontX + vehicleRearX) / 2, 0);
+      const vehicleNose = projectBody(vehicleFrontX - 0.04, 0);
       ctx.strokeStyle = '#0ea5e9';
       ctx.lineWidth = 2.2;
       ctx.beginPath();
@@ -4724,6 +4737,11 @@ HTML_PAGE = """<!doctype html>
       ctx.font = '9.5px ui-sans-serif, system-ui, sans-serif';
       ctx.textAlign = 'left';
       ctx.fillText(tuning ? '车身屏蔽' : 'vehicle 0.40 × 0.62 m', vehicleX + vehicleW + 8, vehicleY + vehicleH - 8);
+      if (rearView) {
+        ctx.fillText('车身左', plotOffsetX, plotOffsetY - 13);
+        ctx.textAlign = 'right';
+        ctx.fillText('车身右', plotOffsetX + usedPlotW, plotOffsetY - 13);
+      }
 
       if (renderChannel) {
         const widthX = forwardMin + 0.88 * (forwardMax - forwardMin);
@@ -4825,6 +4843,7 @@ def lidar_preview_frame(
             ROBOT_FRAME_RIGHT,
         ),
         "yaw_correction_deg": cfg.lidar_yaw_correction_deg,
+        "mirror_lateral": cfg.mirror_lateral,
         "offset_x_m": -cfg.lidar_x_offset_m if rear else cfg.lidar_x_offset_m,
         "offset_y_m": cfg.lidar_y_offset_m,
         "crop_m": (cfg.forward_min, cfg.forward_max, cfg.lateral_limit),
@@ -4908,6 +4927,7 @@ class RosLaserScanMonitor:
             lidar_y_offset_m=sensor.lidar_y_offset_m,
             scan_view_angle_deg=180.0 if rear else 360.0,
             reflect_x_axis=rear,
+            mirror_lateral=sensor.mirror_lateral,
             segmented_pot_boundary_recovery=not rear,
         )
 

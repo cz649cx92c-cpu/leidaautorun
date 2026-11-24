@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
+import math
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -8,7 +11,34 @@ from row_geometry import (
     RowFollowerConfig,
     detect_pot_station_xs,
     estimate_row_from_points,
+    raw_scan_to_points,
 )
+
+
+class ScanExtrinsicsTests(unittest.TestCase):
+    def test_mirror_changes_lateral_sign_before_mounting_transform(self) -> None:
+        scan = SimpleNamespace(
+            angle_min=math.pi / 6,
+            angle_increment=math.pi / 6,
+            ranges=[2.0, 1.0],
+            range_min=0.05,
+            range_max=6.0,
+        )
+        cfg = RowFollowerConfig(
+            sensor_yaw_deg=180.0,
+            lidar_yaw_correction_deg=180.0,
+            lidar_x_offset_m=0.1,
+            lidar_y_offset_m=0.035,
+        )
+        original = raw_scan_to_points(scan, cfg)
+        mirrored = raw_scan_to_points(scan, replace(cfg, mirror_lateral=True))
+        np.testing.assert_allclose(mirrored[:, 0], original[:, 0])
+        np.testing.assert_allclose(mirrored[:, 1], 2 * cfg.lidar_y_offset_m - original[:, 1])
+
+        turned = raw_scan_to_points(
+            scan, replace(cfg, sensor_yaw_deg=90.0, lidar_yaw_correction_deg=0.0, mirror_lateral=True)
+        )
+        np.testing.assert_allclose(turned[0], [1.1, math.sqrt(3) + 0.035])
 
 
 class PairedMidpointCenterlineTests(unittest.TestCase):

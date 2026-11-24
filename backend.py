@@ -627,7 +627,7 @@ def _local_lidar_drive_settings(config: dict[str, Any], *, reverse: bool, args: 
     return speed, offset, angle
 
 
-def _local_lidar_row_settings(args: argparse.Namespace, front_lidar: LidarConfig) -> dict[str, float | int]:
+def _local_lidar_row_settings(args: argparse.Namespace, front_lidar: LidarConfig) -> dict[str, float | int | bool]:
     return {
         "row_width": float(args.lidar_row_width),
         "vehicle_width": float(args.lidar_vehicle_width),
@@ -652,6 +652,7 @@ def _local_lidar_row_settings(args: argparse.Namespace, front_lidar: LidarConfig
         "front_lidar_yaw_correction_deg": float(front_lidar.lidar_yaw_correction_deg),
         "front_lidar_x_offset_m": float(front_lidar.lidar_x_offset_m),
         "front_lidar_y_offset_m": float(front_lidar.lidar_y_offset_m),
+        "front_mirror_lateral": front_lidar.mirror_lateral,
         "safety_margin": float(args.lidar_safety_margin),
         "center_jump_reject": float(args.lidar_center_jump_reject),
         "one_side_center_jump_reject": float(args.lidar_one_side_center_jump_reject),
@@ -765,6 +766,7 @@ class DirectLocalLidarController:
         follower_args.rear_lidar_yaw_correction_deg = float(rear_lidar.lidar_yaw_correction_deg)
         follower_args.rear_lidar_x_offset_m = float(rear_lidar.lidar_x_offset_m)
         follower_args.rear_lidar_y_offset_m = float(rear_lidar.lidar_y_offset_m)
+        follower_args.rear_mirror_lateral = rear_lidar.mirror_lateral
         follower_args.rear_extrinsics_confirmed = bool(rear_lidar.extrinsics_confirmed)
         follower_args.control_deadband_y = float(args.lidar_control_deadband_y)
         follower_args.slow_error_y = float(args.lidar_slow_error_y)
@@ -2250,14 +2252,17 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                                 row_entry_assist.stable_frames = 0
                                 row_entry_assist.alignment_ready = False
                     required_entry_frames = max(1, int(args.lidar_row_entry_stable_frames))
-                    row_entry_max_distance_m = max(
-                        max(0.40, float(args.lidar_row_entry_distance)),
-                        float(args.lidar_row_entry_max_distance),
-                    )
-                    row_entry_safety_stop = bool(
-                        row_entry_progress_m >= row_entry_max_distance_m
-                        and row_entry_assist.stable_frames < required_entry_frames
-                    )
+                    row_entry_max_distance_m = float(args.lidar_row_entry_max_distance)
+                    if row_entry_max_distance_m > 0.0:
+                        row_entry_max_distance_m = max(
+                            0.40,
+                            float(args.lidar_row_entry_distance),
+                            row_entry_max_distance_m,
+                        )
+                        row_entry_safety_stop = (
+                            row_entry_progress_m >= row_entry_max_distance_m
+                            and row_entry_assist.stable_frames < required_entry_frames
+                        )
                     if (
                         row_entry_progress_m >= max(0.40, float(args.lidar_row_entry_distance))
                         and (
@@ -2270,10 +2275,14 @@ def cmd_hybrid_autorun(args: argparse.Namespace) -> int:
                             entry_action = "correcting"
                         else:
                             entry_action = "stopped" if row_entry_safety_stop else "continuing"
+                        distance_limit = (
+                            f"{row_entry_max_distance_m:.2f}m"
+                            if row_entry_max_distance_m > 0.0 else "disabled"
+                        )
                         wait_message = (
                             f"Global row entry {entry_action} until front lidar centerline is aligned: "
                             f"progress={row_entry_progress_m:.2f}m "
-                            f"max_distance={row_entry_max_distance_m:.2f}m "
+                            f"max_distance={distance_limit} "
                             f"frames={row_entry_assist.stable_frames}/{required_entry_frames} "
                             f"alignment_ready={row_entry_assist.alignment_ready} "
                             f"reason={entry_reason}."
@@ -3509,7 +3518,12 @@ def _add_hybrid_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lidar-row-entry-stable-frames", type=int, default=4)
     parser.add_argument("--lidar-row-entry-speed", type=float, default=0.07)
     parser.add_argument("--lidar-row-entry-distance", type=float, default=1.0)
-    parser.add_argument("--lidar-row-entry-max-distance", type=float, default=1.5)
+    parser.add_argument(
+        "--lidar-row-entry-max-distance",
+        type=float,
+        default=0.0,
+        help="Optional distance cap in meters for global row entry while waiting for lidar (0 disables it).",
+    )
     parser.add_argument("--lidar-row-entry-max-wz-deg", type=float, default=1.0)
     parser.add_argument("--lidar-row-entry-correction-max-wz-deg", type=float, default=3.0)
     parser.add_argument("--lidar-row-entry-correction-speed", type=float, default=0.10)

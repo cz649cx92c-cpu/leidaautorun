@@ -25,6 +25,7 @@ class LidarConfig:
     lidar_x_offset_m: float
     lidar_y_offset_m: float
     extrinsics_confirmed: bool
+    mirror_lateral: bool = False
 
     def driver_args(self, driver_bin: Path) -> list[str]:
         return [
@@ -75,6 +76,7 @@ def _parse_sensor(role: str, payload: Any) -> LidarConfig:
         lidar_x_offset_m=float(payload.get("lidar_x_offset_m", 0.0)),
         lidar_y_offset_m=float(payload.get("lidar_y_offset_m", 0.0)),
         extrinsics_confirmed=bool(payload.get("extrinsics_confirmed", False)),
+        mirror_lateral=payload.get("mirror_lateral") is True,
     )
 
 

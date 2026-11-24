@@ -512,6 +512,7 @@ class PlantRowFollower(Node):
             scan_view_center_deg=0.0,
             scan_view_angle_deg=180.0,
             reflect_x_axis=True,
+            mirror_lateral=getattr(args, "rear_mirror_lateral", False),
             segmented_pot_boundary_recovery=False,
         )
         self.row_cfg = self.front_row_cfg
